@@ -1,0 +1,22 @@
+[
+  {
+    "product": "ring",
+    "material": "gold",
+    "price": 1200
+  },
+  {
+    "product": "ring",
+    "material": "silver",
+    "price": 350
+  },
+  {
+    "product": "chain",
+    "material": "gold",
+    "price": 1800
+  },
+  {
+    "product": "earring",
+    "material": "diamond",
+    "price": 2200
+  }
+]

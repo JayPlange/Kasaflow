@@ -1,0 +1,17 @@
+# Never let real secrets end up baked into an image layer
+.env
+
+# Test tooling and test files don't belong in the runtime image
+tests/
+requirements-dev.txt
+pytest.ini
+conftest.py
+.pytest_cache/
+
+# Local junk that shouldn't be sent to the Docker build context at all
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
+*.zip

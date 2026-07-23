@@ -1,0 +1,52 @@
+"""
+Unit tests for services/quote_service.py
+
+generate_quote() composes get_product_price() and
+get_delivery_information(). Rather than re-testing the products file
+here too, we mock those two lower-level functions and just check that
+quote_service wires their outputs together correctly. Each layer tests
+its own responsibility, not the layer below it again.
+"""
+
+from unittest.mock import MagicMock
+
+from services import quote_service
+
+
+def test_generate_quote_returns_combined_quote_when_product_found(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(
+        quote_service,
+        "get_product_price",
+        MagicMock(return_value={"product": "ring", "material": "gold", "price": 1200}),
+    )
+    monkeypatch.setattr(
+        quote_service,
+        "get_delivery_information",
+        MagicMock(return_value={"delivery_time": "2-5 business days", "shipping_cost": 25}),
+    )
+
+    # Act
+    result = quote_service.generate_quote("ring", "gold")
+
+    # Assert
+    assert result == {
+        "product": "ring",
+        "material": "gold",
+        "price": 1200,
+        "delivery": {"delivery_time": "2-5 business days", "shipping_cost": 25},
+    }
+
+
+def test_generate_quote_returns_friendly_message_when_product_missing(monkeypatch):
+    # Arrange: simulate no matching product, like the old bug used to crash on
+    monkeypatch.setattr(quote_service, "get_product_price", MagicMock(return_value=None))
+    delivery_mock = MagicMock()
+    monkeypatch.setattr(quote_service, "get_delivery_information", delivery_mock)
+
+    # Act
+    result = quote_service.generate_quote("bracelet", "platinum")
+
+    # Assert: no crash, friendly message, and delivery info was never even fetched
+    assert result == {"message": "Sorry, we couldn't find that product."}
+    delivery_mock.assert_not_called()

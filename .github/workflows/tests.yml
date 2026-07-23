@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Dummy values, never used to make a real API call. app/config.py fails
+    # fast at import time if these are missing, and several test modules
+    # import app.config transitively -- so CI needs *something* here even
+    # though the fast suite mocks the OpenAI client and never calls out.
+    env:
+      OPENAI_API_KEY: ci-dummy-key-not-real
+      APP_API_KEY: ci-dummy-key-not-real
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        # Deliberately plain "pytest", not --run-regression: conftest.py
+        # skips regression tests unless that flag is passed, so this job
+        # never hits the real OpenAI API and never costs money.
+        run: pytest -v
