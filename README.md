@@ -7,13 +7,13 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white)]()
 [![OpenAI](https://img.shields.io/badge/OpenAI-Responses%20API-black?style=flat&logo=openai&logoColor=white)]()
 [![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED?style=flat&logo=docker&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/tests-51%20passing-brightgreen?style=flat)]()
+[![Tests](https://img.shields.io/badge/tests-66%20passing-brightgreen?style=flat)]()
 
 ---
 
 ## What It Does
 
-KasaFlow takes a customer's free-text message ("how much is a gold ring?", "what've you got in silver?") and turns it into a structured action: a price lookup, delivery info, a combined quote, or a product recommendation. The LLM's only job is deciding *which* tool to call and *what arguments* it needs — it never talks to the customer directly, and it never touches the business logic that actually answers them.
+KasaFlow takes a customer's free-text message ("how much is a gold ring?", "what've you got in silver?", "what's your returns policy?") and turns it into a structured action: a price lookup, delivery info, a combined quote, a product recommendation, or a retrieval-grounded policy answer. The LLM's only job is deciding *which* tool to call and *what arguments* it needs — it never talks to the customer directly, and it never touches the business logic or the policy documents that actually answer them.
 
 That separation is the core design bet: prompts decide intent, Python executes it. If the model hallucinates or drifts, the blast radius is "picked the wrong tool," not "invented a price."
 
@@ -35,10 +35,14 @@ services/
 ├── delivery_tool.py       # get_delivery_information -- static delivery terms
 ├── quote_service.py       # generate_quote -- composes price + delivery into one quote
 ├── recommendation_service.py  # recommend_products -- filters catalogue by material
-└── memory.py              # Per-session context (product/material), keyed by session_id
+├── memory.py              # Per-session context (product/material), keyed by session_id
+├── embeddings_client.py    # Thin OpenAI embeddings wrapper, same retry policy as llm.py
+├── knowledge_base.py       # RAG index: embeds + caches policy docs, retrieves by cosine similarity
+└── policy_tool.py          # answer_policy_question -- the RAG-backed tool
 
 data/products.json         # Product catalogue (deliberately external to app logic)
-tests/                     # 51 tests: unit, integration, and prompt regression
+data/policies.json         # Policy/FAQ documents the RAG tool retrieves from
+tests/                     # 66 tests: unit, integration, and prompt regression
 ```
 
 **Request flow:** `POST /process` → API key + rate-limit check → `route_customer()` → `understand_customer()` asks the LLM which tool to use → `execute_tool()` runs it → structured JSON back to the caller. Every layer only knows about the one below it, so swapping the model, adding a tool, or changing the transport doesn't ripple through the whole system.
@@ -46,7 +50,10 @@ tests/                     # 51 tests: unit, integration, and prompt regression
 ## Key Engineering Decisions
 
 **Tool Registry + Tool Executor, not a big if/else**
-Four tools (`get_product_price`, `get_delivery_information`, `generate_quote`, `recommend_products`) are registered by name in one dict and dispatched generically. Adding a fifth tool means writing the function and registering it — nothing else in the request path changes.
+Five tools (`get_product_price`, `get_delivery_information`, `generate_quote`, `recommend_products`, `answer_policy_question`) are registered by name in one dict and dispatched generically. Adding a sixth tool means writing the function and registering it — nothing else in the request path changes.
+
+**Retrieval, not a bigger prompt**
+Policy questions (returns, warranty, sizing, care, engraving, payment) are answered by `answer_policy_question`, which embeds the customer's question and the six documents in `data/policies.json` with the OpenAI embeddings API, then returns only the document(s) above a similarity threshold. Documents are embedded once and cached in memory, not re-embedded per request. The alternative — pasting every policy into every prompt — would mean the model reads irrelevant policy on every call and still has to pick the right paragraph itself; retrieval means it only ever sees the one that actually answers the question, and a return-policy question genuinely can't get a warranty-policy answer.
 
 **Composite tools reuse, not duplicate, logic**
 `generate_quote` doesn't touch the products file directly — it calls `get_product_price` and `get_delivery_information` and combines the results. The alternative (reimplementing the lookup inside the quote function) would mean two places to fix the same bug.
@@ -72,11 +79,13 @@ The routing layer started as deterministic, rule-based matching (`V1`) and was s
 
 **CI runs tests, not deploys.** `.github/workflows/tests.yml` runs the test suite automatically on push, but there's no deployment pipeline yet — shipping a change still means someone manually building and pushing the container.
 
+**RAG is a flat document set, not a vector database.** `data/policies.json` holds six short policy documents, embedded and compared in memory with plain cosine similarity — appropriate at this scale, but it doesn't chunk long documents and it would need a real vector store (and a re-embedding job when policies change) before the document set grows past a few dozen entries.
+
 ## Testing
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest                        # 51 tests: unit + integration, fast and free
+pytest                        # 66 tests: unit + integration, fast and free
 pytest --run-regression       # + prompt regression tests against the real OpenAI API (costs money)
 ```
 
@@ -100,6 +109,7 @@ Then visit `http://localhost:8000/docs` for the interactive API — use the lock
 |---|---|
 | API | FastAPI, Uvicorn |
 | LLM | OpenAI Responses API (GPT-4.1-mini) |
+| Retrieval | OpenAI embeddings API (`text-embedding-3-small`), in-memory cosine similarity |
 | Validation | Pydantic |
 | Auth / rate limiting | Custom API key dependency, slowapi |
 | Config | python-dotenv, centralized fail-fast settings |
@@ -108,7 +118,7 @@ Then visit `http://localhost:8000/docs` for the interactive API — use the lock
 
 ## Roadmap
 
-Docker ✅ · Auth & rate limiting ✅ · Per-session memory ✅ · Deployment · Observability · Evaluation · Open-source LLM support (Ollama/vLLM) · LangGraph · Distributed session store (Redis) · MCP · Multi-agent workflows · Enterprise RAG
+Docker ✅ · Auth & rate limiting ✅ · Per-session memory ✅ · RAG-backed policy Q&A ✅ · Deployment · Observability · Evaluation · Open-source LLM support (Ollama/vLLM) · LangGraph · Distributed session store (Redis) · Vector database for a larger document set · MCP · Multi-agent workflows
 
 ## Status
 

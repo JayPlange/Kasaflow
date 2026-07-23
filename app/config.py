@@ -35,6 +35,8 @@ class Settings:
     log_level: str
     app_api_key: str
     rate_limit_per_minute: int
+    policies_path: Path
+    embedding_model: str
 
 
 def load_settings() -> Settings:
@@ -66,6 +68,10 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         app_api_key=app_api_key,
         rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "20")),
+        policies_path=Path(
+            os.getenv("POLICIES_PATH", str(BASE_DIR / "data" / "policies.json"))
+        ),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
     )
 
 

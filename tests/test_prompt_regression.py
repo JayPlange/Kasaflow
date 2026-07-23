@@ -42,6 +42,9 @@ CASES = [
     ("what do you have in gold", "recommend_products"),
     ("show me your silver jewellery", "recommend_products"),
     ("what's available in diamond", "recommend_products"),
+    ("what's your returns policy", "answer_policy_question"),
+    ("how do I find my ring size", "answer_policy_question"),
+    ("can I get a ring engraved", "answer_policy_question"),
 ]
 
 

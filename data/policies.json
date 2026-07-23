@@ -1,0 +1,32 @@
+[
+  {
+    "id": "returns_policy",
+    "title": "Returns and refunds",
+    "text": "You can return any unworn item in its original packaging within 30 days of delivery for a full refund. Refunds are issued to the original payment method and usually appear within 5-7 business days of us receiving the item. Engraved or custom-sized pieces cannot be returned unless they arrive faulty."
+  },
+  {
+    "id": "warranty_policy",
+    "title": "Warranty cover",
+    "text": "Every piece is covered for 12 months against manufacturing defects such as a loose setting or a broken clasp. The warranty does not cover normal wear, scratches, or damage caused by impact, chemicals, or improper storage. Contact us with your order number and we will repair or replace the item."
+  },
+  {
+    "id": "ring_sizing",
+    "title": "Ring sizing",
+    "text": "We stock rings in sizes J to Z (UK sizing). If you are unsure of your size, wrap a strip of paper around your finger, mark where it overlaps, measure the length in millimetres, and check it against our sizing chart on the product page. We offer one free resize within 60 days of purchase."
+  },
+  {
+    "id": "jewellery_care",
+    "title": "Caring for your jewellery",
+    "text": "Store pieces separately in a soft pouch away from direct sunlight and moisture. Remove jewellery before swimming, showering, or applying perfume and lotion, since chlorine and chemicals can dull the finish. Clean gently with a soft, dry cloth; avoid ultrasonic cleaners on pieces with pave or delicate settings."
+  },
+  {
+    "id": "custom_engraving",
+    "title": "Custom engraving",
+    "text": "Engraved orders take 5-7 business days to produce before they are dispatched, longer during peak seasons. Please double-check spelling and dates at checkout, as engraved items are made to order and cannot be returned for a change of mind once engraving has begun."
+  },
+  {
+    "id": "payment_methods",
+    "title": "Accepted payment methods",
+    "text": "We accept all major debit and credit cards, along with mobile money for customers ordering from Ghana. Payment is taken in full at checkout; we do not currently offer instalment or buy-now-pay-later plans."
+  }
+]
