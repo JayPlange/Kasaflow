@@ -38,6 +38,22 @@ class Settings:
     policies_path: Path
     embedding_model: str
 
+    # Optional integrations below. Not required at startup like
+    # openai_api_key/app_api_key are -- someone should be able to run and
+    # test the core /process endpoint without WhatsApp, Khaya, or
+    # WooCommerce credentials configured. Each module that actually needs
+    # one of these validates it's present at the point of use, not here.
+    woocommerce_url: str | None
+    woocommerce_consumer_key: str | None
+    woocommerce_consumer_secret: str | None
+
+    khaya_api_key: str | None
+    khaya_api_base: str
+
+    whatsapp_verify_token: str | None
+    whatsapp_access_token: str | None
+    whatsapp_phone_number_id: str | None
+
 
 def load_settings() -> Settings:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -72,6 +88,14 @@ def load_settings() -> Settings:
             os.getenv("POLICIES_PATH", str(BASE_DIR / "data" / "policies.json"))
         ),
         embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        woocommerce_url=os.getenv("WOOCOMMERCE_URL"),
+        woocommerce_consumer_key=os.getenv("WOOCOMMERCE_CONSUMER_KEY"),
+        woocommerce_consumer_secret=os.getenv("WOOCOMMERCE_CONSUMER_SECRET"),
+        khaya_api_key=os.getenv("KHAYA_API_KEY"),
+        khaya_api_base=os.getenv("KHAYA_API_BASE", "https://translation.ghananlp.org"),
+        whatsapp_verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN"),
+        whatsapp_access_token=os.getenv("WHATSAPP_ACCESS_TOKEN"),
+        whatsapp_phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID"),
     )
 
 

@@ -10,6 +10,7 @@ from slowapi.util import get_remote_address
 from app.auth import verify_api_key
 from app.config import settings
 from app.logging_config import configure_logging
+from app.whatsapp_routes import router as whatsapp_router
 from services.router import route_customer
 
 configure_logging()
@@ -23,6 +24,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="KasaFlow", version="0.1.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.include_router(whatsapp_router)
 
 
 class ProcessRequest(BaseModel):

@@ -1,0 +1,100 @@
+"""
+Semantic search over the product catalogue.
+
+Why this exists: get_product_price's original exact-match lookup was
+written against placeholder data ("ring"/"gold", "chain"/"gold") where
+exact match was the whole problem. The real catalogue from
+adomdejeweller.com has specific, individual product names like "Gye
+Nyame White Necklace with Earrings, 30g" -- a customer asking for "a
+gold necklace" will never string-match that, no matter how the LLM
+normalises their message. This mirrors knowledge_base.py's approach
+exactly: embed the catalogue once, embed the query the same way,
+retrieve by cosine similarity. Same reasoning, different documents.
+"""
+
+import json
+import logging
+import math
+from pathlib import Path
+
+from app.config import settings
+from services.embeddings_client import embed_texts
+
+logger = logging.getLogger(__name__)
+
+# Below this similarity, treat it as "nothing in the catalogue matches"
+# rather than confidently returning the least-bad guess. Getting this
+# wrong in the direction of "too eager" means a customer asking for a
+# watch could get quoted a ring's price -- worse than saying "I don't
+# have that."
+_DEFAULT_MIN_SCORE = 0.3
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _searchable_text(entry: dict) -> str:
+    # Category folded in on purpose: "necklace" needs to match products
+    # whose name doesn't literally contain the word "necklace" but whose
+    # category does (e.g. a named piece like "Buzzing Solid Chain...").
+    parts = [entry.get("product", ""), entry.get("category") or "", entry.get("material", "")]
+    return " ".join(p for p in parts if p)
+
+
+class ProductIndex:
+    def __init__(self, products_path: Path):
+        self._products_path = products_path
+        self._entries: list[dict] | None = None
+        self._embeddings: list[list[float]] | None = None
+
+    def _ensure_loaded(self) -> None:
+        if self._entries is not None:
+            return
+
+        try:
+            with open(self._products_path, "r") as file:
+                self._entries = json.load(file)
+        except FileNotFoundError:
+            logger.error("Products file not found at %s", self._products_path)
+            self._entries = []
+        except json.JSONDecodeError as e:
+            logger.error("Products file at %s is not valid JSON: %s", self._products_path, e)
+            self._entries = []
+
+        self._embeddings = (
+            embed_texts([_searchable_text(entry) for entry in self._entries])
+            if self._entries
+            else []
+        )
+
+    def search(self, query: str, top_k: int = 5, min_score: float = _DEFAULT_MIN_SCORE) -> list[dict]:
+        self._ensure_loaded()
+        if not self._entries:
+            return []
+
+        query_embedding = embed_texts([query])[0]
+        scored = [
+            {**entry, "score": _cosine_similarity(query_embedding, entry_embedding)}
+            for entry, entry_embedding in zip(self._entries, self._embeddings)
+        ]
+        scored.sort(key=lambda e: e["score"], reverse=True)
+        return [entry for entry in scored[:top_k] if entry["score"] >= min_score]
+
+    def reload(self) -> None:
+        """Call after woocommerce_sync.py rewrites products.json, so a
+        running process picks up new prices without a restart."""
+        self._entries = None
+        self._embeddings = None
+
+
+_index = ProductIndex(settings.products_path)
+
+
+def get_product_index() -> ProductIndex:
+    return _index

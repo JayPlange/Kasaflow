@@ -1,0 +1,47 @@
+# Fly.io deploy config. Uses the existing Dockerfile exactly as-is --
+# nothing about the multi-stage build, non-root user, or healthcheck
+# needed to change for this.
+#
+# Deploy steps:
+#   1. curl -L https://fly.io/install.sh | sh        (installs flyctl)
+#   2. fly auth login
+#   3. fly launch --no-deploy                         (run once, from this
+#      directory -- it'll detect this file and the Dockerfile, ask to
+#      confirm the app name below, say no to adding a Postgres/Redis db)
+#   4. fly secrets set OPENAI_API_KEY=... APP_API_KEY=... \
+#        WOOCOMMERCE_URL=... WOOCOMMERCE_CONSUMER_KEY=... WOOCOMMERCE_CONSUMER_SECRET=... \
+#        KHAYA_API_KEY=... \
+#        WHATSAPP_VERIFY_TOKEN=... WHATSAPP_ACCESS_TOKEN=... WHATSAPP_PHONE_NUMBER_ID=...
+#      (secrets, not plain env vars -- fly encrypts these, never put real
+#      keys directly in this file or commit them anywhere)
+#   5. fly deploy
+#
+# Once deployed, the app's URL (https://kasaflow.fly.dev or whatever
+# `fly launch` assigns) plus "/webhook/whatsapp" is what goes into Meta's
+# developer console as the webhook callback URL.
+
+app = "kasaflow"
+primary_region = "lhr"  # London -- closest Fly region to Ghana with full service tier
+
+[build]
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[http_service.checks]]
+  # Reuses the same healthcheck the Dockerfile already defines.
+  interval = "30s"
+  timeout = "3s"
+  grace_period = "5s"
+  method = "GET"
+  path = "/"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
