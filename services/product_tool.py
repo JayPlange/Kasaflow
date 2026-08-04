@@ -39,7 +39,17 @@ def get_product_price(product_name: str, material: str):
         product_name,
         material,
     )
-    matches = get_product_index().search(f"{material} {product_name}", top_k=1)
+    # Same "fail gracefully, not raise" rule already applied to the file
+    # errors above -- a price lookup should never take down the whole
+    # customer request just because the embeddings call had a bad day
+    # (network issue, invalid key, OpenAI outage). Worth knowing in logs,
+    # not worth an unhandled exception reaching the customer.
+    try:
+        matches = get_product_index().search(f"{material} {product_name}", top_k=1)
+    except Exception as e:
+        logger.error("Semantic search failed, falling back to no match: %s", e)
+        return None
+
     if matches:
         best = matches[0]
         logger.info(
