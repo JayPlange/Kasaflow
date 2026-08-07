@@ -23,6 +23,7 @@ from fastapi import APIRouter, BackgroundTasks, Request, Response
 from app.config import settings
 from services.response_formatter import format_for_customer
 from services.router import route_customer
+from services.vision_tool import VisionServiceError, describe_product_image
 from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
 from services.whatsapp_client import (
     WhatsAppError,
@@ -97,13 +98,19 @@ def _handle_message(message: dict) -> None:
                 return
 
         elif message_type == "image":
-            # Deliberately not building vision yet -- see tonight's plan.
-            # Acknowledge honestly rather than silently drop the message.
-            send_text_message(
-                from_number,
-                "Got your photo -- someone from the team will take a look and get back to you shortly.",
-            )
-            return
+            image_bytes = download_media(message["image"]["id"])
+            # describe_product_image() turns the photo into the same kind
+            # of short text a typed/transcribed message would produce --
+            # from here on it goes through the exact same
+            # route_customer()/format_for_customer() pipeline as text and
+            # audio, no separate image-matching logic needed.
+            customer_text = describe_product_image(image_bytes)
+            if not customer_text.strip():
+                send_text_message(
+                    from_number,
+                    "I couldn't quite tell what that was from the photo -- mind describing it in words instead?",
+                )
+                return
 
         else:
             logger.info("Unhandled WhatsApp message type: %s", message_type)
@@ -134,7 +141,7 @@ def _handle_message(message: dict) -> None:
         else:
             send_text_message(from_number, reply_text)
 
-    except (VoiceServiceError, WhatsAppError) as e:
+    except (VoiceServiceError, WhatsAppError, VisionServiceError) as e:
         logger.error("Failed to handle message from %s: %s", from_number, e)
     except Exception:
         logger.exception("Unexpected error handling message from %s", from_number)
