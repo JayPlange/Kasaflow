@@ -65,6 +65,72 @@ def test_tool_selection_matches_expected(message, expected_tool):
 
 
 @pytest.mark.regression
+@pytest.mark.parametrize(
+    "message,expected_product_name",
+    [
+        # "sika kyɛn no bo yɛ sɛn" -- "how much is the gold chain".
+        # "kyɛn" is Twi for "chain" -- the catalogue is English-only, so
+        # this must come back translated, not passed through as "kyɛn".
+        # Confirmed failing before the llm.py prompt fix (2026-08-07):
+        # the model returned product_name="kyɛn" verbatim.
+        ("sika kyɛn no bo yɛ sɛn", "chain"),
+    ],
+)
+def test_non_english_product_terms_are_translated(message, expected_product_name):
+    # Arrange: nothing to mock, this is the real thing
+
+    # Act
+    result = understand_customer(message)
+
+    # Assert: the catalogue only has English product names, so a Twi
+    # word passed straight through would never match anything in it.
+    assert result["arguments"].get("product_name", "").strip().lower() == expected_product_name, (
+        f"Expected product_name={expected_product_name!r} translated from Twi, "
+        f"got {result['arguments'].get('product_name')!r}. A non-English value here "
+        "means llm.py's translation instruction stopped working, not necessarily "
+        "a code bug -- verify against the prompt before assuming drift."
+    )
+
+
+@pytest.mark.regression
+def test_message_with_two_distinct_products_returns_both_as_requests():
+    # Arrange: a message that genuinely asks about two different products.
+    # Before the router.py/llm.py fix, only one of these would ever come
+    # back -- the other was silently dropped, not flagged as ambiguous.
+    message = "how much is a gold ring and a silver chain"
+
+    # Act
+    result = understand_customer(message)
+
+    # Assert: both asks present, nothing silently dropped
+    assert "requests" in result, (
+        f"Expected the multi-request shape for a message with two distinct asks, "
+        f"got a single {result.get('tool')!r} instead -- one of the two products "
+        "would be silently dropped downstream."
+    )
+    assert len(result["requests"]) == 2
+    product_names = {r["arguments"].get("product_name", "").lower() for r in result["requests"]}
+    assert product_names == {"ring", "chain"}
+
+
+@pytest.mark.regression
+def test_single_product_message_is_not_split():
+    # Arrange: guard against the model over-splitting a plain single-ask
+    # message into an unnecessary "requests" list.
+    message = "how much is a gold ring"
+
+    # Act
+    result = understand_customer(message)
+
+    # Assert
+    assert "requests" not in result, (
+        f"A single, unambiguous ask was split into {result.get('requests')!r} -- "
+        "should have returned the normal single-tool shape."
+    )
+    assert result["tool"] == "get_product_price"
+
+
+@pytest.mark.regression
 def test_ambiguous_message_fails_gracefully_not_silently_wrong():
     # Arrange: a message with no real intent behind it at all
 

@@ -22,6 +22,20 @@ def route_customer(message: str, session_id: str) -> dict:
         logger.error("Tool selection failed: %s", e)
         return {"error": "I couldn't understand that request. Could you rephrase it?"}
 
+    # understand_customer() only returns "requests" (plural) when the
+    # message genuinely contained more than one distinct ask -- see
+    # llm.py. The single-request path below is completely unchanged
+    # from before that existed, so route_customer()'s original,
+    # documented contract-stable shape is untouched for every message
+    # that doesn't need splitting (still the overwhelming majority).
+    if "requests" in tool_request:
+        results = [_execute_single(req, session_id) for req in tool_request["requests"]]
+        return {"results": results}
+
+    return _execute_single(tool_request, session_id)
+
+
+def _execute_single(tool_request: dict, session_id: str) -> dict:
     # Resolve any "this" / "that one" reference the model couldn't
     # answer from the message alone against what this session last
     # talked about, before the arguments ever reach a tool.

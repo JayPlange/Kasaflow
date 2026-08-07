@@ -16,7 +16,28 @@ themselves at all.
 """
 
 
-def format_for_customer(result: dict) -> str:
+def format_for_customer(result: dict | None) -> str:
+    if result is not None and "results" in result:
+        # router.py's multi-request shape -- a message that contained
+        # more than one distinct ask. Format each sub-result exactly
+        # the same way a single-result reply would be, then present
+        # them as a numbered list so the customer can tell which
+        # answer belongs to which part of what they asked.
+        parts = [format_for_customer(sub_result) for sub_result in result["results"]]
+        if len(parts) == 1:
+            return parts[0]
+        return "\n\n".join(f"{i}. {part}" for i, part in enumerate(parts, start=1))
+
+    if result is None:
+        # get_product_price returns None directly (not an exception) when
+        # nothing matches, including the no-match case after the semantic
+        # search fallback comes back empty. generate_quote already wraps
+        # that into a message for its own callers, but a bare
+        # get_product_price call reaches this function with nothing in
+        # front of it -- same customer-facing message either way, rather
+        # than crashing on `"error" in None`.
+        return "Sorry, we couldn't find that product."
+
     if "error" in result:
         return result["error"]
 

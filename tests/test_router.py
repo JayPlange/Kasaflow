@@ -111,6 +111,64 @@ def test_route_customer_resolves_unknown_material_from_session(monkeypatch):
     assert result["material"] == "gold"
 
 
+def test_route_customer_handles_multiple_requests_in_one_message(monkeypatch):
+    # Arrange: "how much is a gold ring and a silver chain" -- understand_customer
+    # returns the additive "requests" (plural) shape instead of one "tool"/"arguments" pair
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "requests": [
+                {"tool": "get_product_price", "arguments": {"product_name": "ring", "material": "gold"}},
+                {"tool": "get_product_price", "arguments": {"product_name": "chain", "material": "silver"}},
+            ]
+        }),
+    )
+
+    def fake_execute_tool(tool_name, **kwargs):
+        return {"product": kwargs["product_name"], "material": kwargs["material"], "price": 1200}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    result = router.route_customer("how much is a gold ring and a silver chain", "session-multi")
+
+    # Assert: nothing got silently dropped -- both asks come back, in order
+    assert "results" in result
+    assert len(result["results"]) == 2
+    assert result["results"][0] == {"product": "ring", "material": "gold", "price": 1200}
+    assert result["results"][1] == {"product": "chain", "material": "silver", "price": 1200}
+
+
+def test_route_customer_multi_request_one_failure_does_not_drop_the_others(monkeypatch):
+    # Arrange: second sub-request's tool execution blows up
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "requests": [
+                {"tool": "get_product_price", "arguments": {"product_name": "ring", "material": "gold"}},
+                {"tool": "get_product_price", "arguments": {}},
+            ]
+        }),
+    )
+
+    def fake_execute_tool(tool_name, **kwargs):
+        if not kwargs:
+            raise ToolExecutionError("Invalid arguments for tool 'get_product_price'")
+        return {"product": kwargs["product_name"], "material": kwargs["material"], "price": 1200}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    result = router.route_customer("how much is a gold ring and (something malformed)", "session-multi-fail")
+
+    # Assert: the first ask still comes back correctly, the second surfaces
+    # its own error instead of taking down the whole reply
+    assert result["results"][0]["product"] == "ring"
+    assert "error" in result["results"][1]
+
+
 def test_route_customer_keeps_sessions_isolated(monkeypatch):
     # Arrange: two different sessions asking about "unknown" material
     # must never see each other's remembered context

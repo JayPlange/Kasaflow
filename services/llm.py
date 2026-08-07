@@ -1,9 +1,19 @@
 """
 LLM tool-selection layer.
 
-Responsible for exactly one thing: turning a customer message into a
-{"tool": ..., "arguments": {...}} request. It does not execute tools
-and it does not talk to the customer directly (see router.py).
+Responsible for exactly one thing: turning a customer message into
+either a single {"tool": ..., "arguments": {...}} request, or -- when
+the message genuinely contains more than one distinct ask -- a
+{"requests": [{"tool": ..., "arguments": {...}}, ...]} list of them.
+It does not execute tools and it does not talk to the customer
+directly (see router.py).
+
+The multi-request shape is additive, not a replacement: single-intent
+messages (still the overwhelming majority) return exactly the same
+{"tool", "arguments"} shape this always returned, so router.py's
+existing contract-stable single-result path, and everything that
+depends on it, is untouched. "requests" only appears when a message
+actually needs it.
 """
 
 import json
@@ -17,6 +27,13 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=settings.openai_api_key)
+
+# A customer message could in principle list many items -- this caps
+# how many distinct tool calls one message can trigger, so a single
+# WhatsApp message can't fan out into an unbounded number of catalogue
+# lookups / LLM-adjacent tool calls. Matches the existing 5-item cap
+# response_formatter.py already applies when listing recommendations.
+MAX_REQUESTS_PER_MESSAGE = 5
 
 
 class ToolSelectionError(Exception):
@@ -32,6 +49,15 @@ Your job is ONLY to decide:
 
 1. Which tool should be called.
 2. What arguments that tool needs.
+
+Customer messages may arrive in English, Twi, or a mix of both -- many
+come from a transcribed voice note, not typed text. The product
+catalogue itself is English-only, so any product, material, or category
+word you extract must be translated/normalised into its English
+equivalent before you return it, never passed through in the original
+language. For example, a Twi word for a product like "kyɛn" means
+"chain" -- extract `product_name: "chain"`, not `product_name: "kyɛn"`.
+This applies to every argument below, not just product_name.
 
 Available tools:
 
@@ -53,7 +79,10 @@ Use this when the customer wants a full quote (price AND delivery together), not
 4. recommend_products
 Arguments:
 - material
-Use this when the customer asks what's available in a given material, without naming a specific product.
+- category
+Use this when the customer is browsing rather than asking about one named product -- "what rings do you have", "what's available in gold", "show me your necklaces in 18k".
+- `category` is the product type, e.g. "Rings" or "Necklaces". Set to "unknown" if the customer didn't mention a type.
+- `material` is the karat purity, e.g. "18k" or "14k", ONLY if the customer stated a specific karat. Every item this store sells is gold, so if the customer just says "gold" without a karat number, set material to "unknown" -- there's nothing to narrow, it would only exclude items that shouldn't be excluded.
 
 5. answer_policy_question
 Arguments:
@@ -65,10 +94,33 @@ Rules:
 - If the customer asks only for a price, use get_product_price.
 - If the customer asks for delivery/shipping info only, use get_delivery_information.
 - If the customer wants a full quote (price + delivery), use generate_quote.
-- If the customer is browsing by material rather than asking about one item, use recommend_products.
+- If the customer is browsing by product type and/or karat rather than asking about one item, use recommend_products.
 - If the customer is asking about returns, warranty, sizing, care, engraving, or payment methods, use answer_policy_question.
-- If the customer mentions "this", "that one", or similar references, infer the product or material from earlier in THIS message if possible.
-- If a tool needs product_name or material and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
+- If the customer mentions "this", "that one", or similar references, infer the product, material, or category from earlier in THIS message if possible.
+- If a tool needs product_name, material, or category and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
+
+Multiple requests in one message:
+
+A single customer message can genuinely contain more than one distinct
+ask -- two different products ("how much is a gold ring and a silver
+chain"), the same product in more than one karat ("do you have this
+ring in 14k and 18k"), or a product question plus an unrelated policy
+question ("how much is a gold chain, and what's your returns policy").
+When that happens, do NOT pick only one and drop the rest -- return
+EVERY distinct ask as its own entry in a "requests" list instead of a
+single "tool"/"arguments" pair:
+
+{{
+  "requests": [
+    {{"tool": "...", "arguments": {{...}}}},
+    {{"tool": "...", "arguments": {{...}}}}
+  ]
+}}
+
+Only do this when the message actually contains more than one distinct
+ask. A single product with a single price question is still just one
+request in the normal shape -- don't split something that doesn't need
+splitting.
 
 Return ONLY valid JSON. Do not include markdown formatting or commentary.
 
@@ -80,6 +132,41 @@ Example:
     "product_name": "ring",
     "material": "gold"
   }}
+}}
+
+Example (Twi transcript, translated into English before being returned):
+
+Customer said: "sika kyɛn no bo yɛ sɛn" ("how much is the gold chain")
+
+{{
+  "tool": "get_product_price",
+  "arguments": {{
+    "product_name": "chain",
+    "material": "gold"
+  }}
+}}
+
+Example (message contains two distinct asks):
+
+Customer said: "how much is a gold ring and a silver chain"
+
+{{
+  "requests": [
+    {{
+      "tool": "get_product_price",
+      "arguments": {{
+        "product_name": "ring",
+        "material": "gold"
+      }}
+    }},
+    {{
+      "tool": "get_product_price",
+      "arguments": {{
+        "product_name": "chain",
+        "material": "silver"
+      }}
+    }}
+  ]
 }}
 
 Customer:
@@ -140,11 +227,36 @@ def _parse_tool_request(raw_text: str) -> dict:
         logger.error("LLM output was not valid JSON: %s | raw=%r", e, raw_text)
         raise ToolSelectionError("LLM did not return valid JSON") from e
 
+    if "requests" in data:
+        return _validate_multi_request(data)
+
     if "tool" not in data or "arguments" not in data:
         logger.error("LLM output missing required keys: %s", data)
         raise ToolSelectionError(f"LLM response missing 'tool' or 'arguments': {data}")
 
     return data
+
+
+def _validate_multi_request(data: dict) -> dict:
+    requests = data["requests"]
+
+    if not isinstance(requests, list) or not requests:
+        logger.error("LLM 'requests' was not a non-empty list: %s", data)
+        raise ToolSelectionError(f"LLM response's 'requests' must be a non-empty list: {data}")
+
+    for entry in requests:
+        if not isinstance(entry, dict) or "tool" not in entry or "arguments" not in entry:
+            logger.error("LLM 'requests' entry missing 'tool' or 'arguments': %s", entry)
+            raise ToolSelectionError(f"LLM 'requests' entry missing 'tool' or 'arguments': {entry}")
+
+    if len(requests) > MAX_REQUESTS_PER_MESSAGE:
+        logger.warning(
+            "LLM returned %d requests for one message -- truncating to %d",
+            len(requests), MAX_REQUESTS_PER_MESSAGE,
+        )
+        requests = requests[:MAX_REQUESTS_PER_MESSAGE]
+
+    return {"requests": requests}
 
 
 def understand_customer(message: str) -> dict:

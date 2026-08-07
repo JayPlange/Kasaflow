@@ -64,6 +64,71 @@ def test_parse_tool_request_raises_when_keys_missing():
 
 
 # ---------------------------------------------------------------------
+# _parse_tool_request: the additive "requests" (plural) shape for
+# messages that contain more than one distinct ask
+# ---------------------------------------------------------------------
+
+def test_parse_tool_request_handles_multi_request_shape():
+    # Arrange: "how much is a gold ring and a silver chain"
+    raw = (
+        '{"requests": ['
+        '{"tool": "get_product_price", "arguments": {"product_name": "ring", "material": "gold"}},'
+        '{"tool": "get_product_price", "arguments": {"product_name": "chain", "material": "silver"}}'
+        ']}'
+    )
+
+    # Act
+    result = llm._parse_tool_request(raw)
+
+    # Assert
+    assert "requests" in result
+    assert len(result["requests"]) == 2
+    assert result["requests"][0]["arguments"]["product_name"] == "ring"
+    assert result["requests"][1]["arguments"]["product_name"] == "chain"
+
+
+def test_parse_tool_request_raises_when_requests_is_empty():
+    # Arrange: model returned the multi-request shape with nothing in it
+    raw = '{"requests": []}'
+
+    # Act / Assert
+    with pytest.raises(ToolSelectionError):
+        llm._parse_tool_request(raw)
+
+
+def test_parse_tool_request_raises_when_a_request_entry_is_malformed():
+    # Arrange: second entry is missing "arguments"
+    raw = (
+        '{"requests": ['
+        '{"tool": "get_product_price", "arguments": {"product_name": "ring", "material": "gold"}},'
+        '{"tool": "get_delivery_information"}'
+        ']}'
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolSelectionError):
+        llm._parse_tool_request(raw)
+
+
+def test_parse_tool_request_truncates_when_over_the_cap(monkeypatch):
+    # Arrange: more distinct asks than we're willing to fan out to tools for
+    monkeypatch.setattr(llm, "MAX_REQUESTS_PER_MESSAGE", 2)
+    raw = (
+        '{"requests": ['
+        '{"tool": "get_delivery_information", "arguments": {}},'
+        '{"tool": "get_delivery_information", "arguments": {}},'
+        '{"tool": "get_delivery_information", "arguments": {}}'
+        ']}'
+    )
+
+    # Act
+    result = llm._parse_tool_request(raw)
+
+    # Assert: capped, not rejected outright -- answer what we safely can
+    assert len(result["requests"]) == 2
+
+
+# ---------------------------------------------------------------------
 # understand_customer: mocks the OpenAI client entirely
 # ---------------------------------------------------------------------
 
