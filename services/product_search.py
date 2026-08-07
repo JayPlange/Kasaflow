@@ -15,6 +15,7 @@ retrieve by cosine similarity. Same reasoning, different documents.
 import json
 import logging
 import math
+import re
 from pathlib import Path
 
 from app.config import settings
@@ -28,6 +29,8 @@ logger = logging.getLogger(__name__)
 # watch could get quoted a ring's price -- worse than saying "I don't
 # have that."
 _DEFAULT_MIN_SCORE = 0.3
+
+_WORD_RE = re.compile(r"[a-zA-Z]+")
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -45,6 +48,28 @@ def _searchable_text(entry: dict) -> str:
     # category does (e.g. a named piece like "Buzzing Solid Chain...").
     parts = [entry.get("product", ""), entry.get("category") or "", entry.get("material", "")]
     return " ".join(p for p in parts if p)
+
+
+def _keyword_overlap(query: str, product_name: str) -> int:
+    """How many of the query's words literally appear in this product's
+    name (substring-tolerant both ways, so "bracelet" still counts
+    against "Bracelets" without needing real stemming).
+
+    Why this exists: cosine similarity alone put a generic product
+    ("Golden Necklace, 10g") ahead of a literal, more specific match
+    ("Chain Gold Necklace, 50g") for the query "gold chain" -- a real,
+    measured near-tie (0.5977 vs 0.5867) that the wrong side won. A
+    customer who says "chain" and means it should out-rank a product
+    that merely sounds similar in embedding space but doesn't actually
+    say "chain" anywhere in its name.
+    """
+    query_words = set(_WORD_RE.findall(query.lower()))
+    name_words = set(_WORD_RE.findall(product_name.lower()))
+    return sum(
+        1
+        for qw in query_words
+        if any(qw in nw or nw in qw for nw in name_words)
+    )
 
 
 class ProductIndex:
@@ -80,11 +105,24 @@ class ProductIndex:
 
         query_embedding = embed_texts([query])[0]
         scored = [
-            {**entry, "score": _cosine_similarity(query_embedding, entry_embedding)}
+            {
+                **entry,
+                "score": _cosine_similarity(query_embedding, entry_embedding),
+                "_keyword_overlap": _keyword_overlap(query, entry.get("product", "")),
+            }
             for entry, entry_embedding in zip(self._entries, self._embeddings)
         ]
-        scored.sort(key=lambda e: e["score"], reverse=True)
-        return [entry for entry in scored[:top_k] if entry["score"] >= min_score]
+        # Literal keyword overlap decides first, cosine similarity breaks
+        # ties within the same overlap count. This deliberately overrides
+        # embedding rank when a candidate actually contains a word the
+        # customer used and another, higher-cosine candidate doesn't --
+        # see _keyword_overlap's docstring for the measured case that
+        # motivated this.
+        scored.sort(key=lambda e: (e["_keyword_overlap"], e["score"]), reverse=True)
+        filtered = [entry for entry in scored[:top_k] if entry["score"] >= min_score]
+        for entry in filtered:
+            entry.pop("_keyword_overlap", None)
+        return filtered
 
     def reload(self) -> None:
         """Call after woocommerce_sync.py rewrites products.json, so a

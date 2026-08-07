@@ -18,22 +18,45 @@ logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=settings.openai_api_key)
 
+# OpenAI's embeddings endpoint hard-rejects an `input` array longer than
+# 2048 entries (a single request, regardless of token count). Fine
+# against the placeholder catalogue (4 entries) or a small policy doc
+# set, but the real adomdejeweller.com catalogue is 3,918 products --
+# comfortably over the limit -- so a single unbatched call to this
+# function against the real catalogue fails outright with a 400. Chunk
+# every call so this function stays correct regardless of how large the
+# caller's input list is, rather than pushing that limit onto every caller.
+_MAX_BATCH_SIZE = 2048
+
 
 class EmbeddingError(Exception):
     """Raised when the embeddings API cannot be reached or returns something unusable."""
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of texts in one request, preserving input order.
+    """Embed a list of texts, preserving input order.
+
+    Transparently splits into <=2048-item batches (OpenAI's per-request
+    array limit) and concatenates the results in the original order, so
+    callers never need to know or care how large their input list is.
+    """
+    if not texts:
+        return []
+
+    embeddings: list[list[float]] = []
+    for start in range(0, len(texts), _MAX_BATCH_SIZE):
+        embeddings.extend(_embed_batch(texts[start : start + _MAX_BATCH_SIZE]))
+    return embeddings
+
+
+def _embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a single batch (already <=2048 items) in one request.
 
     Same retry philosophy as llm.py's _call_llm: transient network/timeout
     errors are worth retrying, auth or bad-request errors are not -- they
     will fail identically on the next attempt, so retrying just burns
     time and money.
     """
-    if not texts:
-        return []
-
     last_error: Exception | None = None
     total_attempts = settings.llm_max_retries + 1
 
