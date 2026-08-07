@@ -38,6 +38,53 @@ def test_generate_quote_returns_combined_quote_when_product_found(monkeypatch):
     }
 
 
+def test_generate_quote_includes_image_url_when_product_has_one(monkeypatch):
+    # Arrange: real WooCommerce products carry a photo, the placeholder
+    # catalogue never did -- this is the shape a real product looks like
+    monkeypatch.setattr(
+        quote_service,
+        "get_product_price",
+        MagicMock(return_value={
+            "product": "ring",
+            "material": "gold",
+            "price": 1200,
+            "image_url": "https://adomdejeweller.com/wp-content/uploads/ring.jpg",
+        }),
+    )
+    monkeypatch.setattr(
+        quote_service,
+        "get_delivery_information",
+        MagicMock(return_value={"delivery_time": "2-5 business days", "shipping_cost": 25}),
+    )
+
+    # Act
+    result = quote_service.generate_quote("ring", "gold")
+
+    # Assert
+    assert result["image_url"] == "https://adomdejeweller.com/wp-content/uploads/ring.jpg"
+
+
+def test_generate_quote_omits_image_url_when_product_has_none(monkeypatch):
+    # Arrange: matches the old placeholder catalogue's shape -- no
+    # image_url key at all, not even an empty string
+    monkeypatch.setattr(
+        quote_service,
+        "get_product_price",
+        MagicMock(return_value={"product": "ring", "material": "gold", "price": 1200}),
+    )
+    monkeypatch.setattr(
+        quote_service,
+        "get_delivery_information",
+        MagicMock(return_value={"delivery_time": "2-5 business days", "shipping_cost": 25}),
+    )
+
+    # Act
+    result = quote_service.generate_quote("ring", "gold")
+
+    # Assert: the dict's shape is exactly what it was before image_url existed
+    assert "image_url" not in result
+
+
 def test_generate_quote_returns_friendly_message_when_product_missing(monkeypatch):
     # Arrange: simulate no matching product, like the old bug used to crash on
     monkeypatch.setattr(quote_service, "get_product_price", MagicMock(return_value=None))

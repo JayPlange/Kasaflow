@@ -24,7 +24,13 @@ from app.config import settings
 from services.response_formatter import format_for_customer
 from services.router import route_customer
 from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
-from services.whatsapp_client import WhatsAppError, download_media, send_audio_message, send_text_message
+from services.whatsapp_client import (
+    WhatsAppError,
+    download_media,
+    send_audio_message,
+    send_image_message,
+    send_text_message,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -105,6 +111,12 @@ def _handle_message(message: dict) -> None:
 
         result = route_customer(customer_text, session_id=from_number)
         reply_text = format_for_customer(result)
+        # get_product_price/generate_quote's shapes carry image_url when
+        # the matched product has one; result can also be a bare list
+        # (recommendations) or None (no match at all), neither of which
+        # has a single photo to attach, so only single-product results
+        # get an image reply.
+        image_url = result.get("image_url") if isinstance(result, dict) else None
 
         if message_type == "audio":
             try:
@@ -112,6 +124,12 @@ def _handle_message(message: dict) -> None:
                 send_audio_message(from_number, audio_reply)
             except VoiceServiceError as e:
                 logger.warning("TTS reply failed, falling back to text: %s", e)
+                send_text_message(from_number, reply_text)
+        elif image_url:
+            try:
+                send_image_message(from_number, image_url, caption=reply_text)
+            except WhatsAppError as e:
+                logger.warning("Image reply failed, falling back to text: %s", e)
                 send_text_message(from_number, reply_text)
         else:
             send_text_message(from_number, reply_text)

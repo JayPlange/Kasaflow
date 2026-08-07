@@ -86,6 +86,31 @@ def send_text_message(to: str, body: str) -> None:
     )
 
 
+def send_image_message(to: str, image_url: str, caption: str | None = None) -> None:
+    """Sends an image by URL directly -- unlike send_audio_message, this
+    doesn't need the upload-then-send two-step, because WhatsApp will
+    fetch a publicly reachable `link` itself. Every image URL this gets
+    called with comes from the synced WooCommerce catalogue (real
+    product photos already hosted on adomdejeweller.com), so a public
+    link is always what's available here."""
+    _require_whatsapp_config()
+
+    image_payload: dict = {"link": image_url}
+    if caption:
+        image_payload["caption"] = caption
+
+    _post_with_retry(
+        f"{_base_url()}/messages",
+        headers=_headers(),
+        json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "image",
+            "image": image_payload,
+        },
+    )
+
+
 def send_audio_message(to: str, audio_bytes: bytes, mime_type: str = "audio/mpeg") -> None:
     """Uploads the audio as media first (WhatsApp requires a media ID,
     not a raw attachment, for outbound messages), then sends it."""

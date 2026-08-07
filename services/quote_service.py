@@ -20,9 +20,15 @@ def generate_quote(product_name: str, material: str) -> dict:
         logger.info("No quote generated: no match for %s / %s", product_name, material)
         return {"message": "Sorry, we couldn't find that product."}
 
-    return {
+    quote = {
         "product": product["product"],
         "material": product["material"],
         "price": product["price"],
         "delivery": get_delivery_information(),
     }
+    # Only added when the product actually has one -- keeps this dict's
+    # shape unchanged for the placeholder catalogue (no image_url field
+    # at all) and for anything already asserting the old exact shape.
+    if product.get("image_url"):
+        quote["image_url"] = product["image_url"]
+    return quote
