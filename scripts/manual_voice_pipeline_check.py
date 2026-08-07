@@ -11,6 +11,11 @@ Run from the repo root:
 import sys
 from pathlib import Path
 
+# Scripts in this folder are run as `python scripts/foo.py`, which puts
+# only this folder on sys.path, not the repo root -- add it explicitly
+# so `from services...`/`from app...` resolve regardless of cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from dotenv import load_dotenv
 
 load_dotenv()
