@@ -129,7 +129,14 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
             return f"- *{name}*: *GH₵{low:,.2f}* -- available in {options}"
         # Same small handful of variants, but not all the same price --
         # can't collapse to one line without hiding a real price difference.
-        sub_lines = "\n".join(f"   * {v['material']}: *GH₵{v['price']:,.2f}*" for v in variants)
+        # Sub-bullet uses "-", never "*" -- WhatsApp only has one meaning
+        # for "*" (bold), no separate bullet-list markdown, so a "*"
+        # bullet marker on the same line as a bolded *GH₵...* price
+        # collides: the parser pairs the bullet's "*" with the price's
+        # opening "*" instead of the price's own closing one, leaving a
+        # stray unbolded "*" dangling at the end of the line (confirmed
+        # live, 2026-08-12).
+        sub_lines = "\n".join(f"   - {v['material']}: *GH₵{v['price']:,.2f}*" for v in variants)
         return f"- *{name}*:\n{sub_lines}"
 
     # Only call it "karat" variance if it actually varies within this set

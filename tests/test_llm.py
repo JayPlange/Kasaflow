@@ -161,14 +161,14 @@ def test_understand_customer_returns_parsed_tool_request(monkeypatch):
 # ---------------------------------------------------------------------
 
 def test_prompt_tells_the_model_nothing_is_pending_by_default():
-    prompt = llm._build_prompt("yh", pending_order=None)
+    prompt = llm._build_prompt("yh", pending_order=None, order_draft=None)
     assert "does NOT currently have any pending order" in prompt
     assert "Do not use confirm_order" in prompt
 
 
 def test_prompt_describes_a_real_pending_order():
     pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
-    prompt = llm._build_prompt("yh", pending_order=pending)
+    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None)
     assert "pending order awaiting confirmation" in prompt
     assert "2 x 18k Ring" in prompt
     assert "2,425.00" in prompt
@@ -189,6 +189,63 @@ def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypa
     # Assert: the actual prompt sent to the model reflects the pending order
     sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
     assert "1 x 18k Ring" in sent_prompt
+
+
+# ---------------------------------------------------------------------
+# order-draft context: a bare "2" or a bare address is unresolvable
+# without knowing an order is already in progress -- see
+# _order_draft_state_line()'s docstring
+# ---------------------------------------------------------------------
+
+def test_prompt_omits_the_order_draft_section_when_nothing_in_progress():
+    prompt = llm._build_prompt("2", pending_order=None, order_draft=None)
+    assert "order in progress" not in prompt
+
+
+def test_prompt_describes_a_partial_order_draft():
+    draft = {
+        "product_name": "Custom Leaf White Gold Necklace, 20g",
+        "material": "14k",
+        "quantity": None,
+        "delivery_address": None,
+        "delivery_option": None,
+    }
+    prompt = llm._build_prompt("2", pending_order=None, order_draft=draft)
+    assert "order in progress" in prompt
+    assert "product=Custom Leaf White Gold Necklace, 20g" in prompt
+    assert "material/karat=14k" in prompt
+    assert "Still missing: quantity, delivery address, delivery option" in prompt
+
+
+def test_prompt_omits_order_draft_section_once_everything_is_known():
+    # Nothing left for a short reply to be answering -- propose_order
+    # itself is the next step, not another round of "what's missing".
+    draft = {
+        "product_name": "Ring", "material": "18k", "quantity": 2,
+        "delivery_address": "Accra", "delivery_option": "accra_rider",
+    }
+    prompt = llm._build_prompt("2", pending_order=None, order_draft=draft)
+    assert "order in progress" not in prompt
+
+
+def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatch):
+    # Arrange
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "propose_order", "arguments": {}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+    draft = {
+        "product_name": "Ring", "material": "18k", "quantity": None,
+        "delivery_address": None, "delivery_option": None,
+    }
+
+    # Act
+    llm.understand_customer("2", order_draft=draft)
+
+    # Assert
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "product=Ring" in sent_prompt
 
 
 def test_understand_customer_rejects_empty_message():

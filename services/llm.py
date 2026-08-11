@@ -189,6 +189,8 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {pending_order_state}
 
+{order_draft_state}
+
 Customer:
 {message}
 """
@@ -226,14 +228,60 @@ def _pending_order_state_line(pending_order: dict | None) -> str:
     )
 
 
-def _build_prompt(message: str, pending_order: dict | None) -> str:
-    return _PROMPT_TEMPLATE.format(
-        message=message,
-        pending_order_state=_pending_order_state_line(pending_order),
+_ORDER_DRAFT_LABELS = {
+    "product_name": "product",
+    "material": "material/karat",
+    "quantity": "quantity",
+    "delivery_address": "delivery address",
+    "delivery_option": "delivery option (accra_rider / kumasi_rider / international)",
+}
+
+
+def _order_draft_state_line(order_draft: dict | None) -> str:
+    """Describes an order already in progress for this session, so a
+    short reply like a bare number or a bare address can be recognised
+    as continuing it.
+
+    Exists for the same reason as _pending_order_state_line() above, one
+    step earlier in the flow: once propose_order has asked "How many
+    would you like?", the customer's next message is often just "2" --
+    with no conversation history, the model has no way to know that's
+    an answer to a question it can't see, and would sometimes route it
+    to a completely different tool instead of continuing the order
+    (confirmed live, 2026-08-12). get_order_draft() in memory.py builds
+    this from whatever's already been remembered."""
+    if not order_draft:
+        return ""
+
+    known = [f"{_ORDER_DRAFT_LABELS[key]}={value}" for key, value in order_draft.items() if value]
+    missing = [_ORDER_DRAFT_LABELS[key] for key, value in order_draft.items() if not value]
+    if not missing:
+        # Everything's already known -- nothing left for a short reply
+        # to be answering, so there's nothing useful to say here.
+        return ""
+
+    known_text = ", ".join(known) if known else "nothing yet"
+    missing_text = ", ".join(missing)
+    return (
+        f"This customer already has an order in progress. Known so far: {known_text}. "
+        f"Still missing: {missing_text}. If their current message is short and only makes "
+        f"sense as answering one of the missing pieces (a bare number for quantity, a bare "
+        f"address, \"Accra\"/\"Kumasi\"/\"ship it\"/\"outside Ghana\" for delivery option), "
+        f"treat it as continuing this order: use propose_order, keep every already-known "
+        f"value exactly as given above, and fill in the new piece from their message. Don't "
+        f"ask them to repeat anything already known, and don't restart with a different tool."
     )
 
 
-def _call_llm(message: str, pending_order: dict | None) -> str:
+def _build_prompt(message: str, pending_order: dict | None, order_draft: dict | None) -> str:
+    return _PROMPT_TEMPLATE.format(
+        message=message,
+        pending_order_state=_pending_order_state_line(pending_order),
+        order_draft_state=_order_draft_state_line(order_draft),
+    )
+
+
+def _call_llm(message: str, pending_order: dict | None, order_draft: dict | None) -> str:
     """Call the model with retries on transient failures only.
 
     Auth errors, bad requests, etc. (APIError) are not retried — retrying
@@ -246,7 +294,7 @@ def _call_llm(message: str, pending_order: dict | None) -> str:
         try:
             response = client.responses.create(
                 model=settings.openai_model,
-                input=_build_prompt(message, pending_order),
+                input=_build_prompt(message, pending_order, order_draft),
                 timeout=settings.llm_timeout_seconds,
             )
             return response.output_text
@@ -314,15 +362,21 @@ def _validate_multi_request(data: dict) -> dict:
     return {"requests": requests}
 
 
-def understand_customer(message: str, pending_order: dict | None = None) -> dict:
+def understand_customer(
+    message: str, pending_order: dict | None = None, order_draft: dict | None = None
+) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
     -- see _pending_order_state_line()'s docstring for why this needs to
-    be passed in explicitly rather than left for the model to infer."""
+    be passed in explicitly rather than left for the model to infer.
+
+    order_draft is the equivalent one step earlier -- an order that's
+    been started but not yet fully priced (see memory.get_order_draft()
+    and _order_draft_state_line())."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
-    raw_text = _call_llm(message, pending_order)
+    raw_text = _call_llm(message, pending_order, order_draft)
     logger.info("Raw LLM output: %s", raw_text)
 
     return _parse_tool_request(raw_text)

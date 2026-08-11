@@ -7,7 +7,7 @@ customer sees when something goes wrong upstream.
 import logging
 
 from services.llm import ToolSelectionError, understand_customer
-from services.memory import fill_missing_context, remember_context
+from services.memory import fill_missing_context, get_order_draft, remember_context
 from services.order_tool import get_pending_order_summary
 from services.tool_executor import ToolExecutionError, execute_tool
 
@@ -55,7 +55,13 @@ def route_customer(message: str, session_id: str) -> dict:
         # pending to confirm -- see llm.py's _pending_order_state_line()
         # for why a bare "yh"/"yeah" is unresolvable without it.
         pending_order = get_pending_order_summary(session_id)
-        tool_request = understand_customer(message, pending_order=pending_order)
+        # One step earlier in the same problem: an order that's been
+        # started (propose_order asked "how many?") but isn't priced
+        # yet. Only relevant while there's no full pending_order --
+        # once a proposal exists, that's the active state, not the
+        # draft that led to it. See llm.py's _order_draft_state_line().
+        order_draft = None if pending_order else get_order_draft(session_id)
+        tool_request = understand_customer(message, pending_order=pending_order, order_draft=order_draft)
     except ValueError as e:
         return {"error": str(e)}
     except ToolSelectionError as e:

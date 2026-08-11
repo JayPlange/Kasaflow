@@ -66,14 +66,25 @@ _store = SessionStore()
 
 # Arguments worth remembering across turns within the same session, so
 # "how much is shipping for that one" can resolve without the customer
-# repeating themselves. Not every tool takes all four, callers only
+# repeating themselves. Not every tool takes all of these, callers only
 # fill and save whichever keys are actually present in that tool's
 # arguments. "category" lets a follow-up like "what about in 14k?"
 # after "what rings do you have" remember "Rings" without repeating it.
 # "delivery_option" means a customer who already said "deliver to Accra"
 # earlier in the conversation doesn't have to repeat it when they get to
-# actually placing the order.
-_REMEMBERED_KEYS = ("product_name", "material", "category", "delivery_option")
+# actually placing the order. "quantity" and "delivery_address" close a
+# real gap propose_order's own clarifying questions ("How many would
+# you like?", "What address?") otherwise fell into: without these two
+# remembered too, a customer's bare "2" or bare address in reply never
+# stuck, and the next turn re-asked the same question forever (confirmed
+# live, 2026-08-12) -- see get_order_draft() below for the other half of
+# this fix.
+_REMEMBERED_KEYS = ("product_name", "material", "category", "delivery_option", "quantity", "delivery_address")
+
+# Which of the remembered keys matter for an in-progress order, and the
+# words used to describe each to the LLM (see get_order_draft() and
+# llm.py's _order_draft_state_line()).
+_ORDER_DRAFT_KEYS = ("product_name", "material", "quantity", "delivery_address", "delivery_option")
 
 
 def _is_unknown(value) -> bool:
@@ -104,11 +115,44 @@ def fill_missing_context(session_id: str, arguments: dict) -> dict:
 
 
 def remember_context(session_id: str, arguments: dict) -> None:
-    """Persist any resolved (non-"unknown") arguments for later turns in this session."""
+    """Persist any resolved (non-"unknown") arguments for later turns in this session.
+
+    Deliberately not gated on `isinstance(value, str)` -- quantity comes
+    back from the LLM as a real JSON number (an int), not a string, and
+    the old `isinstance(value, str)` check silently dropped it every
+    time, which is exactly why quantity never used to survive to the
+    next turn. Only skips a key that's genuinely absent from this call's
+    arguments (a different tool that doesn't take it) or explicitly
+    "unknown" -- never overwrites a real remembered value with a
+    stale/missing one.
+    """
     for key in _REMEMBERED_KEYS:
-        value = arguments.get(key)
-        if isinstance(value, str) and not _is_unknown(value):
+        if key not in arguments:
+            continue
+        value = arguments[key]
+        if not _is_unknown(value):
             _store.set(session_id, key, value)
+
+
+def get_order_draft(session_id: str) -> dict | None:
+    """Snapshot of this session's remembered order-relevant slots.
+
+    Exists for llm.py's prompt (_order_draft_state_line()): the model
+    otherwise sees only the customer's current message, no conversation
+    history, so once propose_order has asked "How many would you like?"
+    a bare "2" in reply is unresolvable on its own -- the model has no
+    way to know that's an answer to a question it can't see. Handing it
+    this snapshot lets it recognise a short reply as continuing an order
+    already in progress, rather than guessing at a different tool
+    entirely (confirmed live, 2026-08-12: it did guess wrong).
+
+    Returns None when nothing order-relevant has been given yet, so the
+    prompt can skip this section entirely for a fresh conversation.
+    """
+    draft = {key: _store.get(session_id, key) for key in _ORDER_DRAFT_KEYS}
+    if not any(value is not None for value in draft.values()):
+        return None
+    return draft
 
 
 def get_session_store() -> SessionStore:

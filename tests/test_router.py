@@ -258,8 +258,14 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
     # Act
     router.route_customer("yh", "session-with-pending-order")
 
-    # Assert
-    understand.assert_called_once_with("yh", pending_order={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0})
+    # Assert: order_draft is None here -- once a full proposal exists,
+    # that's the active state, not the draft that led to it (see
+    # router.py's route_customer())
+    understand.assert_called_once_with(
+        "yh",
+        pending_order={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0},
+        order_draft=None,
+    )
 
 
 def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
@@ -271,7 +277,36 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
     router.route_customer("how much is a gold ring?", "session-fresh")
 
     # Assert
-    understand.assert_called_once_with("how much is a gold ring?", pending_order=None)
+    understand.assert_called_once_with("how much is a gold ring?", pending_order=None, order_draft=None)
+
+
+def test_route_customer_passes_order_draft_state_when_an_order_is_in_progress(monkeypatch):
+    # Arrange: propose_order already asked "how many?" earlier in this
+    # session (product_name/material got remembered, quantity didn't
+    # exist yet) -- a bare "2" now must be recognised as continuing it.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "propose_order", "arguments": {}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"error": "What address should this be delivered to?"}))
+    monkeypatch.setattr(router, "get_pending_order_summary", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        router,
+        "get_order_draft",
+        MagicMock(return_value={
+            "product_name": "Ring", "material": "18k", "quantity": None,
+            "delivery_address": None, "delivery_option": None,
+        }),
+    )
+
+    # Act
+    router.route_customer("2", "session-mid-order")
+
+    # Assert
+    from services import router as router_module
+    call_kwargs = router_module.understand_customer.call_args.kwargs
+    assert call_kwargs["order_draft"]["product_name"] == "Ring"
 
 
 def test_route_customer_injects_session_id_for_order_tools(monkeypatch):

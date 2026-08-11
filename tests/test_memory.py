@@ -7,7 +7,7 @@ sessions stay isolated from each other and that entries expire, which is
 the exact bug the old shared-dict version had.
 """
 
-from services.memory import SessionStore, fill_missing_context, remember_context
+from services.memory import SessionStore, fill_missing_context, get_order_draft, remember_context
 
 
 # ---------------------------------------------------------------------
@@ -121,6 +121,72 @@ def test_delivery_option_round_trips_across_turns(monkeypatch):
     result = fill_missing_context("session-1", {"product_name": "ring", "delivery_option": "unknown"})
 
     assert result["delivery_option"] == "accra_rider"
+
+
+def test_remember_context_stores_a_non_string_quantity(monkeypatch):
+    # The LLM returns quantity as a real JSON number, not a string --
+    # the old `isinstance(value, str)` gate in remember_context silently
+    # dropped it every time, so a customer's "2" never survived to the
+    # next turn (confirmed live, 2026-08-12; this is the actual root
+    # cause of that bug).
+    from services import memory
+    store = SessionStore()
+    monkeypatch.setattr(memory, "_store", store)
+
+    remember_context("session-1", {"product_name": "ring", "quantity": 2})
+
+    assert store.get("session-1", "quantity") == 2
+
+
+def test_remember_context_does_not_clear_a_remembered_value_when_key_is_absent(monkeypatch):
+    # A tool call that doesn't take `delivery_address` at all (e.g. a
+    # plain price lookup) must not wipe out an address remembered from
+    # an earlier turn -- only an explicit "unknown" should ever clear it.
+    from services import memory
+    store = SessionStore()
+    store.set("session-1", "delivery_address", "12 Cantonments Road, Accra")
+    monkeypatch.setattr(memory, "_store", store)
+
+    remember_context("session-1", {"product_name": "ring", "material": "gold"})
+
+    assert store.get("session-1", "delivery_address") == "12 Cantonments Road, Accra"
+
+
+def test_delivery_address_round_trips_across_turns(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    remember_context("session-1", {"delivery_address": "12 Cantonments Road, Accra"})
+    result = fill_missing_context("session-1", {"delivery_address": "unknown"})
+
+    assert result["delivery_address"] == "12 Cantonments Road, Accra"
+
+
+# ---------------------------------------------------------------------
+# get_order_draft
+# ---------------------------------------------------------------------
+
+def test_get_order_draft_returns_none_when_nothing_given_yet():
+    assert get_order_draft("session-never-seen") is None
+
+
+def test_get_order_draft_reflects_partial_progress(monkeypatch):
+    # "I'd like to place an order" -> propose_order asked "how many?" --
+    # this is what the prompt needs to recognise the customer's next
+    # bare "2" as continuing that, not starting something new.
+    from services import memory
+    store = SessionStore()
+    monkeypatch.setattr(memory, "_store", store)
+
+    remember_context("session-1", {"product_name": "Custom Leaf White Gold Necklace, 20g", "material": "14k"})
+
+    draft = get_order_draft("session-1")
+
+    assert draft["product_name"] == "Custom Leaf White Gold Necklace, 20g"
+    assert draft["material"] == "14k"
+    assert draft["quantity"] is None
+    assert draft["delivery_address"] is None
+    assert draft["delivery_option"] is None
 
 
 def test_context_round_trips_across_two_simulated_turns(monkeypatch):

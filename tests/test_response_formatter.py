@@ -144,6 +144,31 @@ def test_formats_recommendations_summarises_a_large_variant_set_as_a_range():
     assert "5 options" in formatted
 
 
+def test_formats_recommendations_never_leaves_a_dangling_asterisk():
+    # Broad regression guard across every recommendation-group shape --
+    # single variant, small same-price set, small different-price set
+    # (the sub-bullet branch that actually broke), and a large
+    # summarised set. Every bold marker must be a real pair.
+    scenarios = [
+        [{"product": "Solo Ring", "material": "18k", "price": 1000.0}],
+        [
+            {"product": "Same Price Ring", "material": f"US {s}", "price": 500.0}
+            for s in ["8", "8.5", "9"]
+        ],
+        [
+            {"product": "Diff Price Ring", "material": f"{s}g", "price": p}
+            for s, p in [("5", 100.0), ("8", 200.0)]
+        ],
+        [
+            {"product": "Big Set Ring", "material": f"18 / Women US {s} (21.4 mm)", "price": p}
+            for s, p in [("8", 100.0), ("8.5", 150.0), ("9", 200.0), ("9.5", 250.0), ("13", 300.0)]
+        ],
+    ]
+    for items in scenarios:
+        formatted = format_for_customer({"recommendations": items})
+        assert formatted.count("*") % 2 == 0, f"dangling asterisk for {items[0]['product']!r}: {formatted!r}"
+
+
 def test_formats_recommendations_diversifies_across_categories():
     # data/products.json lists every Necklaces row before any Rings row --
     # an unfiltered browse must not silently show 4 necklaces and zero
@@ -198,6 +223,15 @@ def test_formats_recommendations_keeps_variants_with_different_prices_separate()
     # a genuine price difference from the customer
     assert "6,303.00" in formatted
     assert "8,595.00" in formatted
+    # The sub-bullet marker must never be "*" -- WhatsApp only has one
+    # meaning for that character (bold), so a "*" bullet on the same
+    # line as a bolded *GH₵...* price causes the parser to pair the
+    # bullet with the price's opening asterisk, leaking a stray
+    # unbolded "*" at the end of the line (confirmed live, 2026-08-12).
+    # An even count of "*" is a cheap, general guard against exactly
+    # this class of bug recurring in any branch.
+    assert formatted.count("*") % 2 == 0
+    assert "\n   * " not in formatted
 
 
 # ---------------------------------------------------------------------
