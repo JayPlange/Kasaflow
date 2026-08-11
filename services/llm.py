@@ -65,6 +65,7 @@ Available tools:
 Arguments:
 - product_name
 - material
+Use this when the customer names ONE specific product -- whether they're asking its price, asking to see a photo/picture of it, or both. Its result always includes the product's image when one exists, so it's also the right tool for "send me a photo of the [named item]" / "can I see that necklace", not just price questions. Only use recommend_products instead when the customer is browsing a type/category rather than naming one specific item.
 
 2. get_delivery_information
 Arguments:
@@ -108,6 +109,7 @@ Use this ONLY when the customer is clearly confirming an order that was already 
 Rules:
 
 - If the customer asks only for a price, use get_product_price.
+- If the customer asks to see a photo/picture of one specific, named product, use get_product_price (its result carries the image) -- even if they never mention price and even if that product was only just recommended to them a moment ago. Do not use recommend_products for this; that returns a browse-style list, not one item's photo.
 - If the customer asks for delivery/shipping info only, use get_delivery_information.
 - If the customer wants a full quote (price + delivery), use generate_quote.
 - If the customer is browsing by product type and/or karat rather than asking about one item, use recommend_products.

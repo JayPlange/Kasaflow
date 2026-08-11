@@ -99,7 +99,31 @@ def propose_order(
     for any of those isn't something this system can price on its own.
     total is product cost only; a human finalises delivery after
     confirm_order() hands the order off (see that function's staff
-    notification)."""
+    notification).
+
+    Argument checks run in this order deliberately: product/material
+    first, then quantity/address/delivery_option, then the actual
+    product lookup last. A customer who says "place an order" with no
+    item named at all still has product_name="unknown" -- without this
+    check first, they'd be walked through "how many?" then "what
+    address?" for a product that was never identified, only to hit a
+    context-free "couldn't find that product" at the very end (confirmed
+    live, 2026-08-12: a customer answered quantity and address in full
+    before the system finally admitted it never knew what they were
+    ordering). A human salesperson asks "what would you like to order?"
+    before anything else -- this makes the code do the same, while still
+    only paying for the real product lookup once everything else checks
+    out (see the quantity/address/delivery_option tests in
+    test_order_tool.py, which rely on the lookup never being reached for
+    those failures)."""
+
+    product_stripped = str(product_name).strip() if product_name else ""
+    if not product_stripped or product_stripped.lower() == "unknown":
+        return {"error": "Sure -- which item would you like to order?"}
+
+    material_stripped = str(material).strip() if material else ""
+    if not material_stripped or material_stripped.lower() == "unknown":
+        return {"error": "What karat would you like that in?"}
 
     quantity_int = _parse_quantity(quantity)
     if quantity_int is None:

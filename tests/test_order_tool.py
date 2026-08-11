@@ -109,6 +109,39 @@ def test_propose_order_stores_pending_order_in_session(monkeypatch, fresh_sessio
     assert stored["product"] == "Ring"
 
 
+@pytest.mark.parametrize("product_name", ["", "   ", "unknown", "UNKNOWN", None])
+def test_propose_order_rejects_missing_product_name(monkeypatch, product_name):
+    # Arrange: "place an order" with no item named yet -- this must be
+    # asked first, before quantity/address/delivery_option, or the
+    # customer gets walked through irrelevant questions for a product
+    # that was never identified (confirmed live, 2026-08-12).
+    lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
+
+    # Act
+    result = order_tool.propose_order(product_name, "18k", 1, "Accra", "accra_rider", "session-1")
+
+    # Assert
+    assert "error" in result
+    assert "which item" in result["error"].lower()
+    lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("material", ["", "   ", "unknown", "UNKNOWN", None])
+def test_propose_order_rejects_missing_material(monkeypatch, material):
+    # Arrange: a named product but no stated karat -- must ask rather
+    # than let the semantic-search fallback silently guess one (and
+    # possibly quote/order the wrong price).
+    lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
+
+    # Act
+    result = order_tool.propose_order("ring", material, 1, "Accra", "accra_rider", "session-1")
+
+    # Assert
+    assert "error" in result
+    assert "karat" in result["error"].lower()
+    lookup.assert_not_called()
+
+
 @pytest.mark.parametrize("quantity", ["unknown", "zero", 0, -1, None])
 def test_propose_order_rejects_invalid_quantity(monkeypatch, quantity):
     # Arrange: product lookup should never even be reached
