@@ -248,6 +248,34 @@ def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatc
     assert "product=Ring" in sent_prompt
 
 
+# ---------------------------------------------------------------------
+# converse -- the eighth outcome, for purely conversational messages
+# that need no business tool (see llm.py's tool 8 description)
+# ---------------------------------------------------------------------
+
+def test_prompt_includes_converse_tool_guidance():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "8. converse" in prompt
+    assert "reply" in prompt
+    assert "NOT_FOUND" not in prompt  # guardrail language stays out of the prompt itself
+
+
+def test_understand_customer_parses_a_converse_response(monkeypatch):
+    # Arrange
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "converse", "arguments": {"reply": "Hey! How can I help you today?"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    result = llm.understand_customer("hey")
+
+    # Assert
+    assert result["tool"] == "converse"
+    assert result["arguments"]["reply"] == "Hey! How can I help you today?"
+
+
 def test_understand_customer_rejects_empty_message():
     # Arrange: no mocking needed, this should fail before ever touching the client
 

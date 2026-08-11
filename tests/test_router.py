@@ -336,6 +336,68 @@ def test_route_customer_injects_session_id_for_order_tools(monkeypatch):
     assert captured_calls[0]["session_id"] == "session-order-1"
 
 
+# ---------------------------------------------------------------------
+# converse -- purely conversational messages that need no business tool
+# (see llm.py's tool 8 description and router.py's _CONVERSATION_TOOL)
+# ---------------------------------------------------------------------
+
+def test_route_customer_returns_converse_reply_directly(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "converse", "arguments": {"reply": "Hey! 👋 How can I help you today?"}}),
+    )
+    execute_tool = MagicMock()
+    monkeypatch.setattr(router, "execute_tool", execute_tool)
+
+    # Act
+    result = router.route_customer("hey", "session-1")
+
+    # Assert: no detour through the tool registry at all -- there's no
+    # business logic behind converse to execute
+    assert result == {"conversation_reply": "Hey! 👋 How can I help you today?"}
+    execute_tool.assert_not_called()
+
+
+def test_route_customer_converse_does_not_touch_session_memory(monkeypatch):
+    # Arrange: a converse reply must never be mistaken for a business
+    # argument (product, material, delivery address, ...) worth
+    # remembering, and must never read/overwrite anything already
+    # remembered for an order in progress
+    from services.memory import get_session_store
+    get_session_store().set("session-mid-chat", "product_name", "Ring")
+
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "converse", "arguments": {"reply": "Haha, fair enough!"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock())
+
+    # Act
+    router.route_customer("lol okay", "session-mid-chat")
+
+    # Assert: the remembered product from earlier in the order survives untouched
+    assert get_session_store().get("session-mid-chat", "product_name") == "Ring"
+
+
+def test_route_customer_converse_falls_back_when_llm_omits_a_reply(monkeypatch):
+    # Arrange: defensive only -- the model is instructed to always supply
+    # a reply for converse (see llm.py), this covers it not doing so
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "converse", "arguments": {}}),
+    )
+
+    # Act
+    result = router.route_customer("hey", "session-1")
+
+    # Assert: still a real, sendable reply, not a blank message
+    assert result["conversation_reply"]
+
+
 def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypatch):
     # Arrange: guard against the injection being accidentally widened to
     # every tool, which would break the five that don't accept session_id

@@ -17,6 +17,13 @@ def test_formats_error_shape():
     assert format_for_customer({"error": "Something went wrong."}) == "Something went wrong."
 
 
+def test_formats_conversation_reply_shape():
+    # router.py's converse shape -- the LLM already wrote the reply
+    # itself, passed straight through untouched, not reformatted.
+    result = {"conversation_reply": "Hey! How can I help you today?"}
+    assert format_for_customer(result) == "Hey! How can I help you today?"
+
+
 def test_formats_policy_answer_shape():
     result = {"answer": "Returns are accepted within 14 days."}
     assert format_for_customer(result) == "Returns are accepted within 14 days."

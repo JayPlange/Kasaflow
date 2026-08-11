@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 # the other five would raise inside tool_executor.py's TypeError handler.
 _SESSION_AWARE_TOOLS = {"propose_order", "confirm_order"}
 
+# converse (services/llm.py) isn't a real registered tool -- there's no
+# deterministic business logic behind it, no lookup, nothing to execute.
+# The LLM writes the actual customer-facing reply itself as part of the
+# same tool-selection call, precisely because there's no business fact
+# involved that a tool would need to ground it in. Handled entirely here,
+# before execute_tool()/tool_registry.py ever see it: registering it as a
+# "tool" that just echoes back its own argument would be a pointless
+# round-trip through machinery built for looking things up, and would
+# wrongly make it eligible for fill_missing_context()/remember_context()
+# below, which exist to resolve/save business arguments (product,
+# material, delivery address, ...) -- a converse reply has none of those,
+# and a stray "reply" key must never leak into or overwrite that state.
+_CONVERSATION_TOOL = "converse"
+_CONVERSATION_FALLBACK_REPLY = "Hey! How can I help you today?"
+
 
 def _found_nothing(result: dict | None) -> bool:
     """True when a tool ran successfully but didn't actually find what
@@ -82,6 +97,9 @@ def route_customer(message: str, session_id: str) -> dict:
 
 
 def _execute_single(tool_request: dict, session_id: str) -> dict:
+    if tool_request["tool"] == _CONVERSATION_TOOL:
+        return _handle_conversation(tool_request["arguments"])
+
     # Resolve any "this" / "that one" reference the model couldn't
     # answer from the message alone against what this session last
     # talked about, before the arguments ever reach a tool.
@@ -103,3 +121,14 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
         remember_context(session_id, arguments)
 
     return result
+
+
+def _handle_conversation(arguments: dict) -> dict:
+    # Defensive only: the LLM is instructed to always write a real reply
+    # for converse (see llm.py's tool 8 description) since there's no
+    # deterministic fallback that could construct one -- an empty/missing
+    # reply here means the model didn't follow that, not a real business
+    # state to recover from, so a generic greeting is the only sane default.
+    reply = arguments.get("reply") if isinstance(arguments, dict) else None
+    reply = str(reply).strip() if reply else ""
+    return {"conversation_reply": reply or _CONVERSATION_FALLBACK_REPLY}

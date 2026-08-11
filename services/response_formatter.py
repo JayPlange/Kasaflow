@@ -186,6 +186,13 @@ def format_for_customer(result: dict | None) -> str:
     if "error" in result:
         return result["error"]
 
+    if "conversation_reply" in result:
+        # router.py's converse shape -- the LLM already wrote the actual
+        # customer-facing reply itself (see llm.py's tool 8 description),
+        # since there's no business fact here for a deterministic template
+        # to ground. Passed straight through, not reformatted.
+        return result["conversation_reply"]
+
     if "proposal" in result:
         # order_tool.propose_order()'s shape -- a priced, not-yet-placed
         # order awaiting the customer's explicit confirmation. total is
