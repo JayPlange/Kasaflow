@@ -184,16 +184,53 @@ Customer said: "how much is a gold ring and a silver chain"
   ]
 }}
 
+{pending_order_state}
+
 Customer:
 {message}
 """
 
 
-def _build_prompt(message: str) -> str:
-    return _PROMPT_TEMPLATE.format(message=message)
+def _pending_order_state_line(pending_order: dict | None) -> str:
+    """Describes whether this session currently has an order awaiting
+    confirmation, for the confirm_order guidance above.
+
+    Exists because understand_customer() otherwise only ever sees the
+    customer's current message in isolation -- no conversation history,
+    no memory of what this assistant itself last asked. A bare "yh"/
+    "yeah" is genuinely ambiguous with zero context: it could confirm a
+    real pending order, or it could just as easily be agreeing to "want
+    me to show you a photo?" from a browsing reply that never proposed
+    an order at all. Without this line the model has no way to tell
+    those apart and would sometimes guess confirm_order regardless of
+    whether anything was actually pending (confirmed live -- see
+    services/order_tool.py's confirm_order() decline message, which
+    exists specifically to handle that guess coming back wrong)."""
+    if pending_order:
+        return (
+            f"This customer currently has a pending order awaiting confirmation: "
+            f"{pending_order['quantity']} x {pending_order['material']} {pending_order['product']}, "
+            f"total GH₵{pending_order['total']:,.2f}. If their message clearly confirms this "
+            f"(\"yes\", \"confirm\", \"go ahead\", \"yh\", \"ok place it\"), use confirm_order."
+        )
+    return (
+        "This customer does NOT currently have any pending order awaiting confirmation. "
+        "Do not use confirm_order for this message, even if it sounds like a bare "
+        "agreement (\"yh\", \"yeah\", \"ok\", \"sure\") -- there is nothing for them to be "
+        "confirming right now, so treat a bare agreement as being about whatever was "
+        "actually offered (seeing a photo, narrowing down a choice, or similar), not "
+        "as placing an order."
+    )
 
 
-def _call_llm(message: str) -> str:
+def _build_prompt(message: str, pending_order: dict | None) -> str:
+    return _PROMPT_TEMPLATE.format(
+        message=message,
+        pending_order_state=_pending_order_state_line(pending_order),
+    )
+
+
+def _call_llm(message: str, pending_order: dict | None) -> str:
     """Call the model with retries on transient failures only.
 
     Auth errors, bad requests, etc. (APIError) are not retried — retrying
@@ -206,7 +243,7 @@ def _call_llm(message: str) -> str:
         try:
             response = client.responses.create(
                 model=settings.openai_model,
-                input=_build_prompt(message),
+                input=_build_prompt(message, pending_order),
                 timeout=settings.llm_timeout_seconds,
             )
             return response.output_text
@@ -274,11 +311,15 @@ def _validate_multi_request(data: dict) -> dict:
     return {"requests": requests}
 
 
-def understand_customer(message: str) -> dict:
+def understand_customer(message: str, pending_order: dict | None = None) -> dict:
+    """pending_order, when provided, is router.py's read of this
+    session's pending proposal (see order_tool.get_pending_order_summary)
+    -- see _pending_order_state_line()'s docstring for why this needs to
+    be passed in explicitly rather than left for the model to infer."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
-    raw_text = _call_llm(message)
+    raw_text = _call_llm(message, pending_order)
     logger.info("Raw LLM output: %s", raw_text)
 
     return _parse_tool_request(raw_text)

@@ -1,0 +1,26 @@
+# simulate_inbound_message.py
+import requests
+
+payload = {
+    "entry": [
+        {
+            "changes": [
+                {
+                    "value": {
+                        "messages": [
+                            {
+                                "from": "233509764406",
+                                "type": "text",
+                                "text": {"body": "how much is a gold ring"},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ]
+}
+
+response = requests.post("http://localhost:8000/webhook/whatsapp", json=payload, timeout=10)
+print("Status:", response.status_code)
+print("Body:", response.json())

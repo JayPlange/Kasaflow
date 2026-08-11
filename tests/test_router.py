@@ -239,6 +239,41 @@ def test_route_customer_does_not_remember_a_product_price_lookup_that_found_noth
     assert get_session_store().get("session-empty-product", "product_name") is None
 
 
+def test_route_customer_passes_pending_order_state_to_understand_customer(monkeypatch):
+    # Arrange: a proposal already exists for this session (propose_order
+    # really ran earlier) -- understand_customer must be told about it so
+    # a follow-up "yh" can be correctly resolved to confirm_order instead
+    # of guessing blind (see llm.py's _pending_order_state_line()).
+    from services import order_tool
+
+    understand = MagicMock(return_value={"tool": "confirm_order", "arguments": {}})
+    monkeypatch.setattr(router, "understand_customer", understand)
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"order_confirmation": {}}))
+    monkeypatch.setattr(
+        router,
+        "get_pending_order_summary",
+        MagicMock(return_value={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0}),
+    )
+
+    # Act
+    router.route_customer("yh", "session-with-pending-order")
+
+    # Assert
+    understand.assert_called_once_with("yh", pending_order={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0})
+
+
+def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
+    understand = MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "ring", "material": "gold"}})
+    monkeypatch.setattr(router, "understand_customer", understand)
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"product": "ring", "material": "gold", "price": 1200}))
+
+    # Act: no pending order was ever proposed for this fresh session
+    router.route_customer("how much is a gold ring?", "session-fresh")
+
+    # Assert
+    understand.assert_called_once_with("how much is a gold ring?", pending_order=None)
+
+
 def test_route_customer_injects_session_id_for_order_tools(monkeypatch):
     # Arrange: propose_order needs to know which customer's session it's
     # acting on, but that's never something the LLM returns -- see

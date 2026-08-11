@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KasaFlow — Adom De Jeweller</title>
+<style>
+  :root {
+    --bg: #f5f3ef;
+    --panel: #ffffff;
+    --ink: #1c1b19;
+    --ink-soft: #6b6862;
+    --ink-faint: #9a968d;
+    --line: rgba(28,27,25,0.08);
+    --accent: #8a6d3b;
+    --accent-soft: #f1e9db;
+    --bubble-user: #1c1b19;
+    --bubble-user-ink: #f5f3ef;
+    --bubble-ai: #ffffff;
+    --radius-lg: 22px;
+    --radius-md: 16px;
+    --shadow: 0 1px 2px rgba(28,27,25,0.04), 0 8px 24px rgba(28,27,25,0.06);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+  .shell {
+    max-width: 460px;
+    margin: 0 auto;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+  }
+
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 18px 20px 14px;
+    background: rgba(245,243,239,0.85);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  .avatar {
+    width: 42px; height: 42px; border-radius: 50%;
+    background: #ffffff;
+    border: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .avatar img { width: 100%; height: 100%; object-fit: contain; padding: 5px; }
+  .header-text { flex: 1; min-width: 0; }
+  .header-title { font-size: 15.5px; font-weight: 600; margin: 0; letter-spacing: -0.1px; }
+  .header-sub {
+    margin: 1px 0 0; font-size: 12.5px; color: var(--ink-soft);
+    display: flex; align-items: center; gap: 5px;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #35a854; flex-shrink: 0; }
+
+  .lang-toggle {
+    display: flex; background: var(--panel); border-radius: 999px;
+    padding: 3px; gap: 2px; border: 1px solid var(--line);
+  }
+  .lang-btn {
+    border: none; background: transparent; padding: 6px 12px;
+    font-size: 12.5px; font-weight: 500; color: var(--ink-soft);
+    border-radius: 999px; cursor: pointer; transition: all 0.2s ease;
+    font-family: inherit;
+  }
+  .lang-btn.active { background: var(--ink); color: #fff; }
+
+  .thread {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 16px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .row { display: flex; flex-direction: column; max-width: 82%; animation: rise 0.28s ease; }
+  .row.mine { align-self: flex-end; align-items: flex-end; }
+  .row.theirs { align-self: flex-start; align-items: flex-start; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+  .bubble {
+    border-radius: var(--radius-md);
+    padding: 11px 15px;
+    font-size: 14.5px;
+    line-height: 1.5;
+    box-shadow: var(--shadow);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+  }
+  .mine .bubble { background: var(--bubble-user); color: var(--bubble-user-ink); border-bottom-right-radius: 4px; }
+  .theirs .bubble { background: var(--bubble-ai); color: var(--ink); border-bottom-left-radius: 4px; }
+
+  .meta-line {
+    font-size: 11px; color: var(--ink-faint); margin: 5px 3px 0;
+    font-style: italic;
+  }
+
+  .img-bubble {
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: var(--bubble-ai);
+    box-shadow: var(--shadow);
+    border-bottom-left-radius: 4px;
+    max-width: 240px;
+  }
+  .img-bubble img { display: block; width: 100%; height: 170px; object-fit: cover; background: #eee; }
+  .img-bubble .cap { padding: 10px 14px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; }
+
+  .card-scroll {
+    align-self: flex-start;
+    display: flex; gap: 10px; overflow-x: auto;
+    max-width: 100%; padding: 2px 2px 6px;
+    animation: rise 0.28s ease;
+  }
+  .product-card {
+    flex-shrink: 0; width: 128px;
+    background: var(--bubble-ai); border-radius: var(--radius-md);
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .product-card img { display: block; width: 100%; height: 96px; object-fit: cover; background: #eee; }
+  .pc-name { margin: 8px 10px 2px; font-size: 12px; line-height: 1.35; font-weight: 500; }
+  .pc-price { margin: 0 10px 10px; font-size: 11.5px; color: var(--ink-soft); }
+
+  .voice-bubble {
+    display: flex; align-items: center; gap: 10px;
+    border-radius: 999px;
+    padding: 9px 16px 9px 10px;
+    box-shadow: var(--shadow);
+    min-width: 168px;
+  }
+  .mine .voice-bubble { background: var(--bubble-user); color: var(--bubble-user-ink); }
+  .theirs .voice-bubble { background: var(--bubble-ai); color: var(--ink); }
+  .play-btn {
+    width: 30px; height: 30px; border-radius: 50%; border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    background: var(--accent); color: #fff;
+  }
+  .mine .play-btn { background: rgba(245,243,239,0.18); }
+  .wave { display: flex; align-items: center; gap: 2.5px; height: 18px; flex: 1; }
+  .wave span { width: 2.5px; border-radius: 2px; background: currentColor; opacity: 0.55; }
+  .voice-time { font-size: 11.5px; opacity: 0.7; flex-shrink: 0; }
+
+  .typing {
+    align-self: flex-start; display: flex; align-items: center; gap: 8px;
+    background: var(--bubble-ai); border-radius: var(--radius-md);
+    border-bottom-left-radius: 4px; padding: 11px 16px; box-shadow: var(--shadow);
+    max-width: 82%;
+  }
+  .typing-text { font-size: 13.5px; color: var(--ink-soft); font-style: italic; }
+  .typing-dots { display: flex; gap: 4px; flex-shrink: 0; }
+  .typing-dots span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint);
+    animation: bounce 1.2s infinite ease-in-out;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-4px); opacity: 1; } }
+
+  .presenter-toggle {
+    width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--line);
+    background: var(--panel); cursor: pointer; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; color: var(--ink-soft);
+  }
+  .presenter-toggle.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+
+  .insight {
+    margin: 4px 16px 0;
+    background: var(--panel);
+    border: 1px dashed var(--ink-faint);
+    border-radius: var(--radius-md);
+    padding: 10px 14px;
+    font-size: 11.5px;
+    color: var(--ink-soft);
+    display: none;
+  }
+  .insight.show { display: block; animation: rise 0.25s ease; }
+  .insight b { color: var(--ink); font-weight: 600; }
+  .insight .insight-label {
+    display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--ink-faint); margin-bottom: 6px; font-weight: 600;
+  }
+
+  .composer {
+    padding: 12px 16px 18px;
+    background: rgba(245,243,239,0.9);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid var(--line);
+  }
+  .composer-row { display: flex; align-items: center; gap: 8px; }
+  .text-field {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 10px 16px;
+    font-size: 14.5px;
+    color: var(--ink);
+    font-family: inherit;
+  }
+  .text-field:focus { outline: none; border-color: var(--accent); }
+  .icon-btn {
+    width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    transition: transform 0.15s ease, background 0.15s ease;
+  }
+  .icon-btn:active { transform: scale(0.92); }
+  .mic-btn { background: var(--ink); color: #fff; }
+  .mic-btn.recording { background: #d64545; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(214,69,69,0.4); } 50% { box-shadow: 0 0 0 9px rgba(214,69,69,0); } }
+  .send-btn { background: var(--accent); color: #fff; }
+  .rec-indicator {
+    display: none; align-items: center; gap: 8px; padding: 4px 6px 10px;
+    font-size: 12.5px; color: #d64545; font-weight: 500;
+  }
+  .rec-indicator.show { display: flex; }
+  .rec-dot { width: 7px; height: 7px; border-radius: 50%; background: #d64545; animation: pulse 1.2s infinite; }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <div class="header">
+    <div class="avatar"><img src="https://adomdejeweller.com/wp-content/uploads/2025/08/adjj.png" alt="Adom De Jeweller"></div>
+    <div class="header-text">
+      <p class="header-title">Adom De Jeweller</p>
+      <p class="header-sub"><span class="dot"></span>KasaFlow</p>
+    </div>
+    <div class="lang-toggle">
+      <button class="lang-btn active" data-lang="twi">Twi</button>
+      <button class="lang-btn" data-lang="english">English</button>
+    </div>
+    <button class="presenter-toggle" id="presenterToggle" aria-label="Toggle presenter view" title="Presenter view (not visible to customers)">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0H5a2 2 0 0 1-2-2v-4m6 6h10a2 2 0 0 0 2-2v-4"/></svg>
+    </button>
+  </div>
+
+  <div class="thread" id="thread"></div>
+
+  <div class="insight" id="insight"></div>
+
+  <div class="composer">
+    <div class="rec-indicator" id="recIndicator"><span class="rec-dot"></span><span id="recTime">Recording · 0:00</span></div>
+    <div class="composer-row">
+      <input class="text-field" id="textInput" type="text" placeholder="Message Adom De Jeweller" autocomplete="off">
+      <button class="icon-btn mic-btn" id="micBtn" aria-label="Record voice note">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+      </button>
+      <button class="icon-btn send-btn" id="sendBtn" aria-label="Send message">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+const thread = document.getElementById('thread');
+const textInput = document.getElementById('textInput');
+const micBtn = document.getElementById('micBtn');
+const sendBtn = document.getElementById('sendBtn');
+const insight = document.getElementById('insight');
+const recIndicator = document.getElementById('recIndicator');
+const recTime = document.getElementById('recTime');
+const langBtns = document.querySelectorAll('.lang-btn');
+const presenterToggle = document.getElementById('presenterToggle');
+
+let sessionId = null;
+let language = 'twi';
+let mediaRecorder = null;
+let audioChunks = [];
+let recordStart = null;
+let recordTimer = null;
+let presenterMode = false;
+let lastInsightHtml = '';
+
+const THINKING_LINES = [
+  'Hmm, let me check that for you...',
+  'One moment, checking our stock...',
+  'Let me have a look...',
+  'Kindly hold on a second...',
+];
+
+langBtns.forEach(btn => btn.addEventListener('click', () => {
+  langBtns.forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  language = btn.dataset.lang;
+}));
+
+presenterToggle.addEventListener('click', () => {
+  presenterMode = !presenterMode;
+  presenterToggle.classList.toggle('active', presenterMode);
+  insight.classList.toggle('show', presenterMode && !!lastInsightHtml);
+});
+
+function randWave(n) {
+  let out = '';
+  for (let i = 0; i < n; i++) out += `<span style="height:${6 + Math.round(Math.random()*12)}px"></span>`;
+  return out;
+}
+
+function scrollDown() { thread.scrollTop = thread.scrollHeight; }
+
+function addTextRow(mine, text) {
+  const row = document.createElement('div');
+  row.className = 'row ' + (mine ? 'mine' : 'theirs');
+  row.innerHTML = `<div class="bubble"></div>`;
+  row.querySelector('.bubble').textContent = text;
+  thread.appendChild(row);
+  scrollDown();
+  return row;
+}
+
+function addCardsRow(cards) {
+  const row = document.createElement('div');
+  row.className = 'card-scroll';
+  row.innerHTML = cards.map(c => `
+    <div class="product-card">
+      <img src="${c.image_url}" alt="${c.product}">
+      <p class="pc-name"></p>
+      <p class="pc-price"></p>
+    </div>
+  `).join('');
+  const cardEls = row.querySelectorAll('.product-card');
+  cards.forEach((c, i) => {
+    cardEls[i].querySelector('.pc-name').textContent = c.product;
+    cardEls[i].querySelector('.pc-price').textContent = c.price_label;
+  });
+  thread.appendChild(row);
+  scrollDown();
+}
+
+function addImageRow(imageUrl, caption) {
+  const row = document.createElement('div');
+  row.className = 'row theirs';
+  row.innerHTML = `
+    <div class="img-bubble">
+      <img src="${imageUrl}" alt="Product photo">
+      <div class="cap"></div>
+    </div>`;
+  row.querySelector('.cap').textContent = caption;
+  thread.appendChild(row);
+  scrollDown();
+}
+
+function addVoiceRow(mine, audioSrc, label) {
+  const row = document.createElement('div');
+  row.className = 'row ' + (mine ? 'mine' : 'theirs');
+  const id = 'audio-' + Math.random().toString(36).slice(2);
+  row.innerHTML = `
+    <div class="voice-bubble">
+      <button class="play-btn" data-audio="${id}">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+      <div class="wave">${randWave(16)}</div>
+      <span class="voice-time">0:0${Math.floor(Math.random()*5)+3}</span>
+    </div>
+    <audio id="${id}" src="${audioSrc}" style="display:none"></audio>
+  `;
+  thread.appendChild(row);
+  const btn = row.querySelector('.play-btn');
+  const audioEl = row.querySelector('audio');
+  btn.addEventListener('click', () => {
+    if (audioEl.paused) { audioEl.play(); btn.innerHTML = pauseIcon(); }
+    else { audioEl.pause(); btn.innerHTML = playIcon(); }
+  });
+  audioEl.addEventListener('ended', () => { btn.innerHTML = playIcon(); });
+  scrollDown();
+  if (label) {
+    const cap = document.createElement('p');
+    cap.className = 'meta-line';
+    cap.style.alignSelf = mine ? 'flex-end' : 'flex-start';
+    cap.textContent = label;
+    thread.appendChild(cap);
+  }
+}
+
+function playIcon() { return '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'; }
+function pauseIcon() { return '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>'; }
+
+function showTyping() {
+  const row = document.createElement('div');
+  row.className = 'typing';
+  row.id = 'typingRow';
+  const line = THINKING_LINES[Math.floor(Math.random() * THINKING_LINES.length)];
+  row.innerHTML = `<span class="typing-text"></span><span class="typing-dots"><span></span><span></span><span></span></span>`;
+  row.querySelector('.typing-text').textContent = line;
+  thread.appendChild(row);
+  scrollDown();
+}
+function hideTyping() {
+  const row = document.getElementById('typingRow');
+  if (row) row.remove();
+}
+
+function showInsight(tool, extra) {
+  lastInsightHtml = `<span class="insight-label">Presenter view &middot; customers never see this</span>tool selected: <b>${tool}</b>${extra ? ' &nbsp;·&nbsp; ' + extra : ''}`;
+  insight.innerHTML = lastInsightHtml;
+  insight.classList.toggle('show', presenterMode);
+}
+
+async function sendToServer({ text, audioBlob }) {
+  const form = new FormData();
+  if (sessionId) form.append('session_id', sessionId);
+  form.append('language', language);
+  form.append('voice_reply', audioBlob ? 'true' : 'false');
+  if (text) form.append('text', text);
+  if (audioBlob) form.append('audio', audioBlob, 'note.webm');
+
+  showTyping();
+  try {
+    const res = await fetch('/demo/message', { method: 'POST', body: form });
+    const data = await res.json();
+    hideTyping();
+
+    if (data.error) { addTextRow(false, data.error); return; }
+
+    sessionId = data.session_id;
+    if (data.transcript && audioBlob) {
+      const lastRow = thread.querySelectorAll('.row.mine');
+      const last = lastRow[lastRow.length - 1];
+      if (last) {
+        const cap = document.createElement('p');
+        cap.className = 'meta-line';
+        cap.textContent = '"' + data.transcript + '"';
+        last.after(cap);
+      }
+    }
+
+    if (data.image_url) {
+      addImageRow(data.image_url, data.reply_text);
+    } else {
+      addTextRow(false, data.reply_text);
+      if (data.cards && data.cards.length) addCardsRow(data.cards);
+    }
+
+    if (data.reply_audio_base64) {
+      addVoiceRow(false, 'data:audio/mpeg;base64,' + data.reply_audio_base64, language === 'twi' ? 'Reply spoken in Twi' : 'Reply spoken back');
+    }
+
+    showInsight(data.image_url ? 'get_product_price' : 'route_customer', 'session ' + sessionId.slice(0, 8));
+  } catch (e) {
+    hideTyping();
+    addTextRow(false, 'Connection error — is the KasaFlow server running?');
+  }
+}
+
+sendBtn.addEventListener('click', () => {
+  const val = textInput.value.trim();
+  if (!val) return;
+  addTextRow(true, val);
+  textInput.value = '';
+  sendToServer({ text: val });
+});
+textInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendBtn.click(); });
+
+micBtn.addEventListener('click', async () => {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      micBtn.classList.remove('recording');
+      recIndicator.classList.remove('show');
+      clearInterval(recordTimer);
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      const url = URL.createObjectURL(blob);
+      addVoiceRow(true, url, language === 'twi' ? 'Twi voice note' : 'Voice note');
+      sendToServer({ audioBlob: blob });
+    };
+    mediaRecorder.start();
+    micBtn.classList.add('recording');
+    recIndicator.classList.add('show');
+    recordStart = Date.now();
+    recordTimer = setInterval(() => {
+      const s = Math.floor((Date.now() - recordStart) / 1000);
+      recTime.textContent = `Recording · 0:${String(s).padStart(2,'0')}`;
+    }, 200);
+  } catch (e) {
+    addTextRow(false, "Couldn't access the microphone — check browser permissions.");
+  }
+});
+
+addTextRow(false, "Akwaaba! Ask me about a ring, chain, or anything in the catalogue — type or send a voice note.");
+</script>
+</body>
+</html>

@@ -172,6 +172,48 @@ def test_propose_order_returns_error_when_product_missing_woocommerce_id(monkeyp
 
 
 # ---------------------------------------------------------------------
+# get_pending_order_summary
+# ---------------------------------------------------------------------
+
+def test_get_pending_order_summary_returns_none_when_nothing_pending():
+    assert order_tool.get_pending_order_summary("session-never-seen") is None
+
+
+def test_get_pending_order_summary_reflects_a_proposed_order(monkeypatch):
+    # Arrange
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+    _mock_delivery(monkeypatch)
+    order_tool.propose_order("ring", "18k", 2, "Accra", "session-1")
+
+    # Act
+    summary = order_tool.get_pending_order_summary("session-1")
+
+    # Assert: this is what router.py hands the LLM so it actually knows
+    # there's something to confirm, rather than guessing blind -- see
+    # llm.py's _pending_order_state_line()
+    assert summary == {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
+
+
+def test_get_pending_order_summary_clears_after_confirmation(monkeypatch):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    _mock_post(monkeypatch, order_id=555)
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+    _mock_delivery(monkeypatch)
+    order_tool.propose_order("ring", "18k", 1, "Accra", "session-1")
+    order_tool.confirm_order("session-1")
+
+    # Act / Assert: nothing left pending once it's gone through
+    assert order_tool.get_pending_order_summary("session-1") is None
+
+
+# ---------------------------------------------------------------------
 # confirm_order
 # ---------------------------------------------------------------------
 
@@ -179,8 +221,10 @@ def test_confirm_order_returns_error_when_nothing_pending():
     # Act
     result = order_tool.confirm_order("session-never-seen")
 
-    # Assert
-    assert "nothing to confirm" in result["error"].lower()
+    # Assert: open-ended, not "want a quote?" -- this also fires for a
+    # bare "yh" that was never about an order at all (see the message's
+    # own comment in order_tool.py for why)
+    assert "anything pending to confirm" in result["error"].lower()
 
 
 def test_confirm_order_creates_order_and_clears_pending_state(monkeypatch, fresh_session_store):

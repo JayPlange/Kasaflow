@@ -8,6 +8,7 @@ import logging
 
 from services.llm import ToolSelectionError, understand_customer
 from services.memory import fill_missing_context, remember_context
+from services.order_tool import get_pending_order_summary
 from services.tool_executor import ToolExecutionError, execute_tool
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,11 @@ def _found_nothing(result: dict | None) -> bool:
 
 def route_customer(message: str, session_id: str) -> dict:
     try:
-        tool_request = understand_customer(message)
+        # Tells the LLM whether this session actually has anything
+        # pending to confirm -- see llm.py's _pending_order_state_line()
+        # for why a bare "yh"/"yeah" is unresolvable without it.
+        pending_order = get_pending_order_summary(session_id)
+        tool_request = understand_customer(message, pending_order=pending_order)
     except ValueError as e:
         return {"error": str(e)}
     except ToolSelectionError as e:

@@ -24,10 +24,13 @@ import logging
 import subprocess
 import uuid
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
+import requests
 from fastapi import APIRouter, File, Form, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
+from app.config import settings
 from services.response_formatter import _group_by_product, _select_diverse_groups, format_for_customer
 from services.router import route_customer
 from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
@@ -43,6 +46,60 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _DASHBOARD_HTML_PATH = Path(__file__).parent / "demo_dashboard.html"
+
+# Product photos come straight from the live WooCommerce site
+# (data/products.json's image_url, see woocommerce_sync.py). Browsers
+# embedding those URLs directly send this dashboard's localhost origin
+# as the Referer -- many WordPress hosts (this one included, confirmed
+# by images silently failing to render in the dashboard while the same
+# URLs load fine when the site itself is browsed directly) reject
+# cross-origin image requests as hotlinking. Fetching server-side and
+# streaming the bytes back sidesteps that: the request to
+# adomdejeweller.com now comes from this server, not the customer's
+# browser, so there's no foreign Referer to reject.
+_ALLOWED_IMAGE_HOST = urlparse(settings.woocommerce_url).hostname if settings.woocommerce_url else None
+
+
+def _proxied_image_url(original_url: str | None) -> str | None:
+    if not original_url:
+        return None
+    return f"/demo/image-proxy?url={quote(original_url, safe='')}"
+
+
+@router.get("/demo/image-proxy")
+def image_proxy(url: str):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return Response(status_code=400)
+    # Restrict to the store's own image host -- this route is
+    # unauthenticated (see module docstring), so without this check it
+    # would be an open image-fetching proxy for anyone who can reach the
+    # dev server, not just a hotlink workaround for our own catalogue.
+    if _ALLOWED_IMAGE_HOST and parsed.hostname != _ALLOWED_IMAGE_HOST:
+        logger.warning("Refused to proxy image from disallowed host: %s", parsed.hostname)
+        return Response(status_code=400)
+
+    try:
+        upstream = requests.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; KasaFlowDemo/1.0)",
+                # Send the store's own origin as the referer, the one
+                # thing a genuine on-site image request would always
+                # have and a hotlinked one wouldn't.
+                "Referer": f"https://{parsed.hostname}/",
+            },
+        )
+        upstream.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.warning("Image proxy fetch failed for %s: %s", url, e)
+        return Response(status_code=502)
+
+    return Response(
+        content=upstream.content,
+        media_type=upstream.headers.get("content-type", "image/jpeg"),
+    )
 
 
 def _convert_to_wav(raw_bytes: bytes) -> bytes:
@@ -85,7 +142,7 @@ def _build_recommendation_cards(result: dict) -> list[dict]:
         price_label = f"GH₵{low:,.2f}" if low == high else f"GH₵{low:,.2f}-GH₵{high:,.2f}"
         cards.append({
             "product": name,
-            "image_url": with_photo.get("image_url"),
+            "image_url": _proxied_image_url(with_photo.get("image_url")),
             "price_label": price_label,
         })
     return [c for c in cards if c["image_url"]]
@@ -126,7 +183,7 @@ async def demo_message(
 
     result = route_customer(customer_text, session_id=session_id)
     reply_text = format_for_customer(result)
-    image_url = result.get("image_url") if isinstance(result, dict) else None
+    image_url = _proxied_image_url(result.get("image_url")) if isinstance(result, dict) else None
     cards = _build_recommendation_cards(result) if isinstance(result, dict) and "recommendations" in result else []
 
     reply_audio_base64 = None

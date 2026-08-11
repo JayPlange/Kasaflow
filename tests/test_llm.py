@@ -154,6 +154,43 @@ def test_understand_customer_returns_parsed_tool_request(monkeypatch):
     fake_client.responses.create.assert_called_once()
 
 
+# ---------------------------------------------------------------------
+# pending-order context: a bare "yh"/"yeah" is unresolvable without
+# knowing whether this session actually has anything to confirm -- see
+# _pending_order_state_line()'s docstring
+# ---------------------------------------------------------------------
+
+def test_prompt_tells_the_model_nothing_is_pending_by_default():
+    prompt = llm._build_prompt("yh", pending_order=None)
+    assert "does NOT currently have any pending order" in prompt
+    assert "Do not use confirm_order" in prompt
+
+
+def test_prompt_describes_a_real_pending_order():
+    pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
+    prompt = llm._build_prompt("yh", pending_order=pending)
+    assert "pending order awaiting confirmation" in prompt
+    assert "2 x 18k Ring" in prompt
+    assert "2,425.00" in prompt
+
+
+def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypatch):
+    # Arrange
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "confirm_order", "arguments": {}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+    pending = {"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0}
+
+    # Act
+    llm.understand_customer("yh", pending_order=pending)
+
+    # Assert: the actual prompt sent to the model reflects the pending order
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "1 x 18k Ring" in sent_prompt
+
+
 def test_understand_customer_rejects_empty_message():
     # Arrange: no mocking needed, this should fail before ever touching the client
 

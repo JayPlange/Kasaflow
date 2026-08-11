@@ -9,6 +9,7 @@ from slowapi.util import get_remote_address
 
 from app.auth import verify_api_key
 from app.config import settings
+from app.demo_routes import router as demo_router
 from app.logging_config import configure_logging
 from app.whatsapp_routes import router as whatsapp_router
 from services.router import route_customer
@@ -25,6 +26,9 @@ app = FastAPI(title="KasaFlow", version="0.1.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(whatsapp_router)
+# Local demo dashboard only -- unauthenticated by design, see
+# demo_routes.py's module docstring. Never expose this publicly as-is.
+app.include_router(demo_router)
 
 
 class ProcessRequest(BaseModel):

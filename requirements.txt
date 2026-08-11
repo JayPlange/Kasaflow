@@ -5,3 +5,4 @@ python-dotenv==1.0.1
 pydantic==2.12.5
 slowapi==0.1.9
 requests==2.32.3
+python-multipart==0.0.20

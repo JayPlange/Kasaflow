@@ -139,6 +139,26 @@ def propose_order(
     return {"proposal": proposal}
 
 
+def get_pending_order_summary(session_id: str) -> dict | None:
+    """Read-only peek at this session's pending proposal, if any.
+
+    Used by router.py to hand the LLM's tool-selection prompt (see
+    llm.py's _pending_order_state_line()) an actual answer to "does this
+    customer have anything to confirm right now", rather than leaving it
+    to guess blind from a bare "yh"/"yeah" with no conversation history.
+    Read-only and side-effect free -- never mutates session state, only
+    the confirm_order flow above does that."""
+    pending = _store.get(session_id, _PENDING_ORDER_KEY)
+    if pending is None:
+        return None
+    return {
+        "product": pending["product"],
+        "material": pending["material"],
+        "quantity": pending["quantity"],
+        "total": pending["total"],
+    }
+
+
 def confirm_order(session_id: str) -> dict:
     """Create the real WooCommerce order for whatever propose_order()
     last stored against this session. Does nothing, and asks nothing,
@@ -154,7 +174,16 @@ def confirm_order(session_id: str) -> dict:
             # cause). Resend the same confirmation rather than "nothing
             # to confirm", which would read as if their order vanished.
             return {"order_confirmation": last}
-        return {"error": "There's nothing to confirm right now -- want a quote first?"}
+        # Deliberately open-ended, not "want a quote?" -- this also fires
+        # when a customer says a bare "yh"/"yeah" in reply to something
+        # that was never an order proposal at all (see llm.py's
+        # confirm_order guidance: it has no visibility into what this
+        # assistant last asked, only the customer's current message), so
+        # assuming they meant a quote specifically would often be wrong.
+        return {
+            "error": "Hmm, I don't have anything pending to confirm right now -- "
+            "were you looking to go ahead with one of the pieces we discussed?"
+        }
 
     if pending.get("status") == "submitting":
         # A previous confirm_order call for this exact proposal is still
