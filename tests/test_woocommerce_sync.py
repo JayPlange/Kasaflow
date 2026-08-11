@@ -9,7 +9,32 @@ shaping WooCommerce's response into a catalogue entry, not the HTTP call
 itself.
 """
 
+from dataclasses import replace
+
+import pytest
+
 from services import woocommerce_sync
+
+
+@pytest.fixture(autouse=True)
+def woocommerce_config(monkeypatch):
+    """build_catalogue() calls _require_woocommerce_config() before
+    fetching anything, same gate order_tool.py has for its own settings
+    (see tests/test_order_tool.py's _woocommerce_settings()). CI has no
+    real WooCommerce credentials in its env, so without this every test
+    here fails on that check before it ever reaches the mocked fetch --
+    caught by CI, not by a local run against a .env that already has
+    real sync credentials set."""
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "settings",
+        replace(
+            woocommerce_sync.settings,
+            woocommerce_url="https://adomdejeweller.com",
+            woocommerce_consumer_key="ck_test",
+            woocommerce_consumer_secret="cs_test",
+        ),
+    )
 
 
 def test_build_catalogue_captures_simple_product_id(monkeypatch):
