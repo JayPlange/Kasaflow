@@ -45,7 +45,16 @@ def get_product_price(product_name: str, material: str):
     # (network issue, invalid key, OpenAI outage). Worth knowing in logs,
     # not worth an unhandled exception reaching the customer.
     try:
-        matches = get_product_index().search(f"{material} {product_name}", top_k=1)
+        # min_keyword_overlap=1: cosine similarity alone isn't a strict
+        # enough bar for a made-up or unstocked product -- "unicorn
+        # pendant" scored above the default 0.3 similarity threshold
+        # against a real necklace (confirmed live, 2026-08-12) purely
+        # because both sit in the same "gold jewellery" embedding
+        # neighbourhood, with zero words in common. Requiring the query
+        # to share at least one literal word with the matched product's
+        # name is a much stronger signal that this is a genuine match,
+        # not two unrelated things that happen to embed nearby.
+        matches = get_product_index().search(f"{material} {product_name}", top_k=1, min_keyword_overlap=1)
     except Exception as e:
         logger.error("Semantic search failed, falling back to no match: %s", e)
         return None

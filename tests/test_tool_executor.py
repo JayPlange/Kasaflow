@@ -19,8 +19,11 @@ def test_execute_tool_runs_known_tool_successfully():
     # Act
     result = execute_tool("get_delivery_information")
 
-    # Assert
-    assert result["delivery_time"] == "2-5 business days"
+    # Assert: lists the real delivery options, not an invented cost/time
+    # (see delivery_tool.py's module docstring)
+    assert {option["key"] for option in result["delivery_options"]} == {
+        "accra_rider", "kumasi_rider", "international",
+    }
 
 
 def test_execute_tool_returns_error_dict_for_unknown_tool():

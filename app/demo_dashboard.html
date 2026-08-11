@@ -121,6 +121,12 @@
   }
   .img-bubble img { display: block; width: 100%; height: 170px; object-fit: cover; background: #eee; }
   .img-bubble .cap { padding: 10px 14px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word; }
+  .img-bubble .img-fallback { height: 170px; }
+  .product-card .img-fallback { height: 96px; }
+  .img-fallback {
+    display: flex; align-items: center; justify-content: center;
+    background: #eee; color: var(--ink-soft); font-size: 12px; text-align: center; padding: 8px;
+  }
 
   .card-scroll {
     align-self: flex-start;
@@ -316,11 +322,26 @@ function randWave(n) {
 
 function scrollDown() { thread.scrollTop = thread.scrollHeight; }
 
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// KasaFlow's replies use WhatsApp's own bold syntax -- a single
+// asterisk pair, e.g. "*GH₵1,200.00*" -- around the headline fact of
+// each line (see response_formatter.py's module docstring). Escape
+// first, then turn *word* into <strong>word</strong> so the dashboard
+// actually renders it as bold rather than showing literal asterisks,
+// matching what a customer would see in the real WhatsApp app.
+function renderFormattedText(text) {
+  const escaped = escapeHtml(text);
+  return escaped.replace(/\*([^*\n]+?)\*/g, '<strong>$1</strong>');
+}
+
 function addTextRow(mine, text) {
   const row = document.createElement('div');
   row.className = 'row ' + (mine ? 'mine' : 'theirs');
   row.innerHTML = `<div class="bubble"></div>`;
-  row.querySelector('.bubble').textContent = text;
+  row.querySelector('.bubble').innerHTML = renderFormattedText(text);
   thread.appendChild(row);
   scrollDown();
   return row;
@@ -340,6 +361,19 @@ function addCardsRow(cards) {
   cards.forEach((c, i) => {
     cardEls[i].querySelector('.pc-name').textContent = c.product;
     cardEls[i].querySelector('.pc-price').textContent = c.price_label;
+    // A failed image (proxy 400/502, or a server that hasn't picked up
+    // the /demo/image-proxy route yet) should be visibly a failure, not
+    // a blank gap that reads as "nothing happened" -- log the actual
+    // failing URL so it shows up in DevTools' console/Network tab
+    // instead of needing to guess.
+    const img = cardEls[i].querySelector('img');
+    img.addEventListener('error', () => {
+      console.warn('Product photo failed to load:', img.src);
+      img.replaceWith(Object.assign(document.createElement('div'), {
+        className: 'img-fallback',
+        textContent: 'Photo unavailable',
+      }));
+    }, { once: true });
   });
   thread.appendChild(row);
   scrollDown();
@@ -353,7 +387,15 @@ function addImageRow(imageUrl, caption) {
       <img src="${imageUrl}" alt="Product photo">
       <div class="cap"></div>
     </div>`;
-  row.querySelector('.cap').textContent = caption;
+  const img = row.querySelector('img');
+  img.addEventListener('error', () => {
+    console.warn('Product photo failed to load:', img.src);
+    img.replaceWith(Object.assign(document.createElement('div'), {
+      className: 'img-fallback',
+      textContent: 'Photo unavailable',
+    }));
+  }, { once: true });
+  row.querySelector('.cap').innerHTML = renderFormattedText(caption);
   thread.appendChild(row);
   scrollDown();
 }

@@ -64,6 +64,15 @@ class Settings:
     whatsapp_access_token: str | None
     whatsapp_phone_number_id: str | None
 
+    # The rider coordinator's WhatsApp number -- delivery isn't priced or
+    # scheduled automatically (see services/delivery_tool.py's module
+    # docstring), so once a customer confirms an order, a human needs to
+    # actually be told about it to arrange the rider/shipping. Optional,
+    # like the integrations above: confirm_order() logs a warning and
+    # still completes the order if this isn't set, rather than blocking
+    # a real sale on a notification channel not being configured yet.
+    staff_notification_phone: str | None
+
 
 def load_settings() -> Settings:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -108,6 +117,7 @@ def load_settings() -> Settings:
         whatsapp_verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN"),
         whatsapp_access_token=os.getenv("WHATSAPP_ACCESS_TOKEN"),
         whatsapp_phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID"),
+        staff_notification_phone=os.getenv("STAFF_NOTIFICATION_PHONE"),
     )
 
 

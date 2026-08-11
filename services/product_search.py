@@ -98,7 +98,13 @@ class ProductIndex:
             else []
         )
 
-    def search(self, query: str, top_k: int = 5, min_score: float = _DEFAULT_MIN_SCORE) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_score: float = _DEFAULT_MIN_SCORE,
+        min_keyword_overlap: int = 0,
+    ) -> list[dict]:
         self._ensure_loaded()
         if not self._entries:
             return []
@@ -119,7 +125,11 @@ class ProductIndex:
         # see _keyword_overlap's docstring for the measured case that
         # motivated this.
         scored.sort(key=lambda e: (e["_keyword_overlap"], e["score"]), reverse=True)
-        filtered = [entry for entry in scored[:top_k] if entry["score"] >= min_score]
+        filtered = [
+            entry
+            for entry in scored[:top_k]
+            if entry["score"] >= min_score and entry["_keyword_overlap"] >= min_keyword_overlap
+        ]
         for entry in filtered:
             entry.pop("_keyword_overlap", None)
         return filtered

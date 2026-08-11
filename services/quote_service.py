@@ -24,7 +24,10 @@ def generate_quote(product_name: str, material: str) -> dict:
         "product": product["product"],
         "material": product["material"],
         "price": product["price"],
-        "delivery": get_delivery_information(),
+        # A flat list of real delivery choices, not a computed
+        # cost/time -- see delivery_tool.py's module docstring for why
+        # this composite quote can't include a shipping figure.
+        "delivery_options": get_delivery_information()["delivery_options"],
     }
     # Only added when the product actually has one -- keeps this dict's
     # shape unchanged for the placeholder catalogue (no image_url field

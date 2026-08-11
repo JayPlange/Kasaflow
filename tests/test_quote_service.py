@@ -12,6 +12,12 @@ from unittest.mock import MagicMock
 
 from services import quote_service
 
+_DELIVERY_OPTIONS = [
+    {"key": "accra_rider", "label": "rider delivery within Accra"},
+    {"key": "kumasi_rider", "label": "rider delivery within Kumasi"},
+    {"key": "international", "label": "shipping outside Ghana"},
+]
+
 
 def test_generate_quote_returns_combined_quote_when_product_found(monkeypatch):
     # Arrange
@@ -23,18 +29,19 @@ def test_generate_quote_returns_combined_quote_when_product_found(monkeypatch):
     monkeypatch.setattr(
         quote_service,
         "get_delivery_information",
-        MagicMock(return_value={"delivery_time": "2-5 business days", "shipping_cost": 25}),
+        MagicMock(return_value={"delivery_options": _DELIVERY_OPTIONS}),
     )
 
     # Act
     result = quote_service.generate_quote("ring", "gold")
 
-    # Assert
+    # Assert: real delivery choices, not an invented cost/time (see
+    # delivery_tool.py's module docstring)
     assert result == {
         "product": "ring",
         "material": "gold",
         "price": 1200,
-        "delivery": {"delivery_time": "2-5 business days", "shipping_cost": 25},
+        "delivery_options": _DELIVERY_OPTIONS,
     }
 
 
@@ -54,7 +61,7 @@ def test_generate_quote_includes_image_url_when_product_has_one(monkeypatch):
     monkeypatch.setattr(
         quote_service,
         "get_delivery_information",
-        MagicMock(return_value={"delivery_time": "2-5 business days", "shipping_cost": 25}),
+        MagicMock(return_value={"delivery_options": _DELIVERY_OPTIONS}),
     )
 
     # Act
@@ -75,7 +82,7 @@ def test_generate_quote_omits_image_url_when_product_has_none(monkeypatch):
     monkeypatch.setattr(
         quote_service,
         "get_delivery_information",
-        MagicMock(return_value={"delivery_time": "2-5 business days", "shipping_cost": 25}),
+        MagicMock(return_value={"delivery_options": _DELIVERY_OPTIONS}),
     )
 
     # Act

@@ -69,12 +69,13 @@ Arguments:
 2. get_delivery_information
 Arguments:
 - none
+Use this when the customer asks generically about delivery/shipping ("how does delivery work", "do you ship abroad") without asking about a specific product's price. This store doesn't have a fixed delivery price or time -- it lists the real delivery arrangements (rider delivery within Accra, rider delivery within Kumasi, or shipping outside Ghana) for the customer to choose from, not a cost.
 
 3. generate_quote
 Arguments:
 - product_name
 - material
-Use this when the customer wants a full quote (price AND delivery together), not just a price.
+Use this when the customer wants a product's price AND to know about delivery together, not just a price. Same as get_delivery_information above, this returns the real delivery choices, not a fixed cost/time.
 
 4. recommend_products
 Arguments:
@@ -95,7 +96,9 @@ Arguments:
 - material
 - quantity
 - delivery_address
-Use this when the customer clearly wants to PLACE an order, not just ask a price or a quote, and has given enough detail to price it. If they haven't stated how many they want, set quantity to "unknown" rather than assuming 1. If they haven't given a delivery address yet, set delivery_address to "unknown" -- never invent either one. This never actually creates the order; it only prices it and shows the customer a proposal to confirm.
+- delivery_option
+Use this when the customer clearly wants to PLACE an order, not just ask a price or a quote, and has given enough detail to price it. If they haven't stated how many they want, set quantity to "unknown" rather than assuming 1. If they haven't given a delivery address yet, set delivery_address to "unknown" -- never invent either one.
+`delivery_option` must be one of this store's three real delivery arrangements: "accra_rider" (rider delivery within Accra), "kumasi_rider" (rider delivery within Kumasi), or "international" (shipping outside Ghana). Infer it from the delivery address or an explicit statement -- "deliver to Accra"/an Accra address means "accra_rider"; "Kumasi" means "kumasi_rider"; anywhere outside Ghana, or an explicit "ship it"/"I'm not in Ghana", means "international". Set to "unknown" if you genuinely can't tell. This store doesn't price delivery automatically -- a human arranges the actual rider/shipping after the order is placed -- so this only needs to capture which of the three arrangements the customer wants, not a cost or time. This never actually creates the order; it only prices the product and shows the customer a proposal to confirm.
 
 7. confirm_order
 Arguments:

@@ -109,6 +109,57 @@ def test_search_filters_out_scores_below_min_score(monkeypatch, tmp_path):
     assert results == []
 
 
+def test_search_filters_out_high_cosine_matches_with_no_keyword_overlap_when_required(monkeypatch, tmp_path):
+    # Arrange: a made-up product ("unicorn pendant") that happens to sit
+    # close to a real necklace in embedding space (both are "gold
+    # jewellery") despite sharing zero literal words -- confirmed live,
+    # 2026-08-12: this exact shape of false-positive quoted a customer
+    # a real necklace's price for a product that doesn't exist.
+    entries = [{"product": "The 12 Custom Symbolized Gold Necklace, 3g", "category": "Necklaces", "material": "18k", "price": 3300}]
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(entries))
+    monkeypatch.setattr(product_search, "settings", _settings_with_products_path(fake_file))
+
+    vectors = {
+        "The 12 Custom Symbolized Gold Necklace, 3g Necklaces 18k": [1.0, 0.0],
+        "unknown unicorn pendant": [0.95, 0.312],  # cosine ~0.95 -- comfortably above the 0.3 threshold
+    }
+    monkeypatch.setattr(product_search, "embed_texts", _fake_embed_from(vectors))
+
+    index = ProductIndex(fake_file)
+
+    # Act: without requiring overlap, the high cosine score alone would match
+    loose = index.search("unknown unicorn pendant")
+    assert loose != []
+
+    # Assert: requiring at least one shared word correctly rejects it --
+    # "unicorn"/"pendant" appear nowhere in the matched product's name
+    strict = index.search("unknown unicorn pendant", min_keyword_overlap=1)
+    assert strict == []
+
+
+def test_search_keeps_a_match_with_keyword_overlap_when_required(monkeypatch, tmp_path):
+    entries = [{"product": "Twin Chain, 15g", "category": "Necklaces", "material": "14k", "price": 22000}]
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(entries))
+    monkeypatch.setattr(product_search, "settings", _settings_with_products_path(fake_file))
+
+    vectors = {
+        "Twin Chain, 15g Necklaces 14k": [1.0, 0.0],
+        "gold chain": [1.0, 0.0],
+    }
+    monkeypatch.setattr(product_search, "embed_texts", _fake_embed_from(vectors))
+
+    index = ProductIndex(fake_file)
+
+    # Act
+    results = index.search("gold chain", min_keyword_overlap=1)
+
+    # Assert: "chain" is a literal word in "Twin Chain, 15g" -- must survive
+    assert len(results) == 1
+    assert results[0]["product"] == "Twin Chain, 15g"
+
+
 def test_search_respects_top_k(monkeypatch):
     entries = [
         {"product": f"Ring {i}", "category": "Rings", "material": "18k", "price": 100}

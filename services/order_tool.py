@@ -69,9 +69,10 @@ import uuid
 import requests
 
 from app.config import settings
-from services.delivery_tool import get_delivery_information
+from services.delivery_tool import delivery_option_label, delivery_options_phrase, is_valid_delivery_option
 from services.memory import get_session_store
 from services.product_tool import get_product_price
+from services.whatsapp_client import WhatsAppError, send_text_message
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +87,19 @@ def propose_order(
     material: str,
     quantity,
     delivery_address: str,
+    delivery_option: str,
     session_id: str,
 ) -> dict:
     """Price a specific order and hold it against this session, pending
-    the customer's explicit confirmation. Never writes to WooCommerce."""
+    the customer's explicit confirmation. Never writes to WooCommerce.
+
+    Deliberately doesn't add a delivery cost to the total -- see
+    delivery_tool.py's module docstring: this business delivers by rider
+    from Accra/Kumasi or ships internationally, and the real cost/timing
+    for any of those isn't something this system can price on its own.
+    total is product cost only; a human finalises delivery after
+    confirm_order() hands the order off (see that function's staff
+    notification)."""
 
     quantity_int = _parse_quantity(quantity)
     if quantity_int is None:
@@ -98,6 +108,10 @@ def propose_order(
     address_stripped = str(delivery_address).strip() if delivery_address else ""
     if not address_stripped or address_stripped.lower() == "unknown":
         return {"error": "What address should this be delivered to?"}
+
+    delivery_key = str(delivery_option).strip().lower() if delivery_option else ""
+    if not is_valid_delivery_option(delivery_key):
+        return {"error": f"Would you like {delivery_options_phrase()}?"}
 
     product = get_product_price(product_name, material)
     if not product:
@@ -116,9 +130,7 @@ def propose_order(
         )
         return {"error": "Sorry, I can't take orders for that item right now."}
 
-    delivery = get_delivery_information()
     subtotal = product["price"] * quantity_int
-    total = subtotal + delivery["shipping_cost"]
 
     proposal = {
         "token": str(uuid.uuid4()),
@@ -130,9 +142,10 @@ def propose_order(
         "unit_price": product["price"],
         "quantity": quantity_int,
         "subtotal": subtotal,
-        "delivery": delivery,
-        "total": total,
+        "total": subtotal,
         "delivery_address": delivery_address,
+        "delivery_option": delivery_key,
+        "delivery_option_label": delivery_option_label(delivery_key),
     }
 
     _store.set(session_id, _PENDING_ORDER_KEY, proposal)
@@ -235,10 +248,44 @@ def _finalize_confirmation(session_id: str, pending: dict, order_id) -> dict:
         "order_id": order_id,
         "total": pending["total"],
         "delivery_address": pending["delivery_address"],
+        "delivery_option_label": pending.get("delivery_option_label"),
     }
     _store.set(session_id, _LAST_CONFIRMED_KEY, confirmation)
     _store.set(session_id, _PENDING_ORDER_KEY, None)
+    _notify_staff_of_new_order(session_id, pending, order_id)
     return {"order_confirmation": confirmation}
+
+
+def _notify_staff_of_new_order(session_id: str, pending: dict, order_id) -> None:
+    """Delivery isn't automated (see delivery_tool.py) -- a human has to
+    actually see this order and its chosen delivery option to arrange
+    the rider or shipping. Best-effort and non-fatal, on purpose: the
+    order has already been created in WooCommerce by the time this
+    runs, so a failed notification is a real problem worth logging
+    loudly, but it must never turn into a failure the customer sees for
+    an order that, from their side, genuinely went through."""
+    if not settings.staff_notification_phone:
+        logger.warning(
+            "STAFF_NOTIFICATION_PHONE not configured -- order #%s was created but no "
+            "rider coordinator was notified. Set it in .env so deliveries actually get "
+            "arranged.",
+            order_id,
+        )
+        return
+
+    label = pending.get("delivery_option_label") or pending.get("delivery_option") or "not specified"
+    message = (
+        f"New KasaFlow order #{order_id} -- please arrange delivery.\n"
+        f"{pending['quantity']} x {pending['material']} {pending['product']}\n"
+        f"Delivery: {label}\n"
+        f"Address: {pending['delivery_address']}\n"
+        f"Customer WhatsApp: {session_id}\n"
+        f"Product total: GH₵{pending['total']:,.2f} (delivery cost to be arranged separately)"
+    )
+    try:
+        send_text_message(settings.staff_notification_phone, message)
+    except WhatsAppError as e:
+        logger.error("Failed to notify staff about order #%s: %s", order_id, e)
 
 
 def _find_existing_order_by_token(token: str) -> dict | None:
@@ -304,6 +351,7 @@ def _create_woocommerce_order(pending: dict) -> dict:
     if pending.get("variation_id"):
         line_item["variation_id"] = pending["variation_id"]
 
+    delivery_label = pending.get("delivery_option_label") or pending.get("delivery_option") or "not specified"
     payload = {
         # "on-hold" = WooCommerce's own "awaiting payment" status. Never
         # "processing"/"completed" here -- see module docstring, nothing
@@ -311,12 +359,24 @@ def _create_woocommerce_order(pending: dict) -> dict:
         "status": "on-hold",
         "line_items": [line_item],
         "shipping": {"address_1": pending["delivery_address"]},
-        "customer_note": f"Placed via KasaFlow WhatsApp assistant. Reference: {pending['token']}",
+        # Delivery isn't priced/arranged automatically (see
+        # delivery_tool.py) -- the chosen option is written onto the
+        # order itself, not just sent as a one-off WhatsApp ping (see
+        # _notify_staff_of_new_order()), so it's still visible to
+        # whoever looks at the order in WooCommerce later, not only to
+        # whoever happened to see the notification when it arrived.
+        "customer_note": (
+            f"Placed via KasaFlow WhatsApp assistant. Reference: {pending['token']}. "
+            f"Delivery: {delivery_label}."
+        ),
         # Structured, purpose-built lookup key -- _find_existing_order_by_token()
         # currently searches customer_note (more certain to work with
         # WooCommerce's default search), but this is the more robust key
         # to switch to once that's verified against a real store.
-        "meta_data": [{"key": "kasaflow_order_token", "value": pending["token"]}],
+        "meta_data": [
+            {"key": "kasaflow_order_token", "value": pending["token"]},
+            {"key": "kasaflow_delivery_option", "value": pending.get("delivery_option") or ""},
+        ],
     }
 
     auth = (settings.woocommerce_orders_consumer_key, settings.woocommerce_orders_consumer_secret)

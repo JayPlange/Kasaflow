@@ -31,14 +31,6 @@ def _mock_product_lookup(monkeypatch, product=None):
     return fake
 
 
-def _mock_delivery(monkeypatch, delivery_time="2-5 business days", shipping_cost=25):
-    monkeypatch.setattr(
-        order_tool,
-        "get_delivery_information",
-        MagicMock(return_value={"delivery_time": delivery_time, "shipping_cost": shipping_cost}),
-    )
-
-
 def _woocommerce_settings(monkeypatch, **overrides):
     defaults = dict(
         woocommerce_url="https://adomdejeweller.com",
@@ -68,20 +60,22 @@ def test_propose_order_returns_priced_proposal(monkeypatch):
         monkeypatch,
         {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
     )
-    _mock_delivery(monkeypatch)
 
     # Act
-    result = order_tool.propose_order("ring", "18k", 2, "12 Cantonments Road, Accra", "session-1")
+    result = order_tool.propose_order("ring", "18k", 2, "12 Cantonments Road, Accra", "accra_rider", "session-1")
 
-    # Assert
+    # Assert: total is product cost only -- delivery isn't priced
+    # automatically (see order_tool.propose_order()'s docstring)
     proposal = result["proposal"]
     assert proposal["product"] == "Ring"
     assert proposal["quantity"] == 2
     assert proposal["subtotal"] == 2400.0
-    assert proposal["total"] == 2425.0  # subtotal + GH₵25 shipping
+    assert proposal["total"] == 2400.0
     assert proposal["product_id"] == 42
     assert proposal["variation_id"] is None
     assert proposal["status"] == "pending"
+    assert proposal["delivery_option"] == "accra_rider"
+    assert proposal["delivery_option_label"] == "rider delivery within Accra"
     assert "token" in proposal
 
 
@@ -91,10 +85,9 @@ def test_propose_order_carries_variation_id_when_present(monkeypatch):
         monkeypatch,
         {"id": 42, "variation_id": 99, "product": "Ring", "material": "18k", "price": 1200.0},
     )
-    _mock_delivery(monkeypatch)
 
     # Act
-    result = order_tool.propose_order("ring", "18k", 1, "Accra", "session-1")
+    result = order_tool.propose_order("ring", "18k", 1, "Accra", "accra_rider", "session-1")
 
     # Assert
     assert result["proposal"]["variation_id"] == 99
@@ -106,10 +99,9 @@ def test_propose_order_stores_pending_order_in_session(monkeypatch, fresh_sessio
         monkeypatch,
         {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
     )
-    _mock_delivery(monkeypatch)
 
     # Act
-    order_tool.propose_order("ring", "18k", 1, "Accra", "session-1")
+    order_tool.propose_order("ring", "18k", 1, "Accra", "accra_rider", "session-1")
 
     # Assert
     stored = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
@@ -123,7 +115,7 @@ def test_propose_order_rejects_invalid_quantity(monkeypatch, quantity):
     lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
 
     # Act
-    result = order_tool.propose_order("ring", "18k", quantity, "Accra", "session-1")
+    result = order_tool.propose_order("ring", "18k", quantity, "Accra", "accra_rider", "session-1")
 
     # Assert
     assert "error" in result
@@ -136,10 +128,28 @@ def test_propose_order_rejects_missing_delivery_address(monkeypatch, address):
     lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
 
     # Act
-    result = order_tool.propose_order("ring", "18k", 1, address, "session-1")
+    result = order_tool.propose_order("ring", "18k", 1, address, "accra_rider", "session-1")
 
     # Assert
     assert "error" in result
+    lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("delivery_option", ["", "   ", "unknown", "UNKNOWN", None, "accra", "lagos"])
+def test_propose_order_rejects_missing_or_invalid_delivery_option(monkeypatch, delivery_option):
+    # Arrange: product lookup should never even be reached -- this is
+    # asked before we bother looking anything up, same as quantity/address
+    lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
+
+    # Act
+    result = order_tool.propose_order("ring", "18k", 1, "Accra", delivery_option, "session-1")
+
+    # Assert: asks using the real option labels, doesn't invent its own wording
+    assert "error" in result
+    assert "rider delivery within Accra" in result["error"]
+    assert "rider delivery within Kumasi" in result["error"]
+    assert "shipping outside Ghana" in result["error"]
+    assert "or shipping outside Ghana" in result["error"]  # not a bare comma list
     lookup.assert_not_called()
 
 
@@ -148,7 +158,7 @@ def test_propose_order_returns_error_when_product_not_found(monkeypatch):
     _mock_product_lookup(monkeypatch, None)
 
     # Act
-    result = order_tool.propose_order("bracelet", "platinum", 1, "Accra", "session-1")
+    result = order_tool.propose_order("bracelet", "platinum", 1, "Accra", "accra_rider", "session-1")
 
     # Assert
     assert "couldn't find" in result["error"].lower()
@@ -161,10 +171,9 @@ def test_propose_order_returns_error_when_product_missing_woocommerce_id(monkeyp
         monkeypatch,
         {"product": "Ring", "material": "18k", "price": 1200.0},  # no "id"
     )
-    _mock_delivery(monkeypatch)
 
     # Act
-    result = order_tool.propose_order("ring", "18k", 1, "Accra", "session-1")
+    result = order_tool.propose_order("ring", "18k", 1, "Accra", "accra_rider", "session-1")
 
     # Assert: fails now, with a clear reason, rather than letting the
     # customer confirm an order that can never actually be created
@@ -185,16 +194,15 @@ def test_get_pending_order_summary_reflects_a_proposed_order(monkeypatch):
         monkeypatch,
         {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
     )
-    _mock_delivery(monkeypatch)
-    order_tool.propose_order("ring", "18k", 2, "Accra", "session-1")
+    order_tool.propose_order("ring", "18k", 2, "Accra", "accra_rider", "session-1")
 
     # Act
     summary = order_tool.get_pending_order_summary("session-1")
 
     # Assert: this is what router.py hands the LLM so it actually knows
     # there's something to confirm, rather than guessing blind -- see
-    # llm.py's _pending_order_state_line()
-    assert summary == {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
+    # llm.py's _pending_order_state_line(). total is product cost only.
+    assert summary == {"product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0}
 
 
 def test_get_pending_order_summary_clears_after_confirmation(monkeypatch):
@@ -205,8 +213,7 @@ def test_get_pending_order_summary_clears_after_confirmation(monkeypatch):
         monkeypatch,
         {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
     )
-    _mock_delivery(monkeypatch)
-    order_tool.propose_order("ring", "18k", 1, "Accra", "session-1")
+    order_tool.propose_order("ring", "18k", 1, "Accra", "accra_rider", "session-1")
     order_tool.confirm_order("session-1")
 
     # Act / Assert: nothing left pending once it's gone through
@@ -242,8 +249,10 @@ def test_confirm_order_creates_order_and_clears_pending_state(monkeypatch, fresh
             "product": "Ring",
             "material": "18k",
             "quantity": 2,
-            "total": 2425.0,
+            "total": 2400.0,
             "delivery_address": "Accra",
+            "delivery_option": "accra_rider",
+            "delivery_option_label": "rider delivery within Accra",
         },
     )
 
@@ -255,9 +264,15 @@ def test_confirm_order_creates_order_and_clears_pending_state(monkeypatch, fresh
     _, kwargs = fake_post.call_args
     assert kwargs["json"]["status"] == "on-hold"
     assert kwargs["json"]["line_items"] == [{"product_id": 42, "quantity": 2}]
+    # The chosen delivery option is written onto the order itself (see
+    # order_tool.py's confirm_order() docstring), not just sent as a
+    # one-off notification -- so it's still visible if that fails
+    assert "rider delivery within Accra" in kwargs["json"]["customer_note"]
+    assert {"key": "kasaflow_delivery_option", "value": "accra_rider"} in kwargs["json"]["meta_data"]
 
     # Assert: customer-facing result and session state
     assert result["order_confirmation"]["order_id"] == 555
+    assert result["order_confirmation"]["delivery_option_label"] == "rider delivery within Accra"
     assert fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY) is None
     assert fresh_session_store.get("session-1", order_tool._LAST_CONFIRMED_KEY)["order_id"] == 555
 
@@ -430,7 +445,8 @@ def test_create_order_payload_includes_token_in_meta_data(monkeypatch, fresh_ses
     fresh_session_store.set(
         "session-1", order_tool._PENDING_ORDER_KEY,
         {"token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
-         "product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0, "delivery_address": "Accra"},
+         "product": "Ring", "material": "18k", "quantity": 1, "total": 1200.0, "delivery_address": "Accra",
+         "delivery_option": "accra_rider", "delivery_option_label": "rider delivery within Accra"},
     )
 
     # Act
@@ -438,7 +454,26 @@ def test_create_order_payload_includes_token_in_meta_data(monkeypatch, fresh_ses
 
     # Assert: a structured, purpose-built lookup key, not just free text
     _, kwargs = fake_post.call_args
-    assert kwargs["json"]["meta_data"] == [{"key": "kasaflow_order_token", "value": "abc-123"}]
+    assert {"key": "kasaflow_order_token", "value": "abc-123"} in kwargs["json"]["meta_data"]
+
+
+def test_create_order_payload_gracefully_handles_a_missing_delivery_option(monkeypatch, fresh_session_store):
+    # Arrange: defensive -- shouldn't happen given propose_order() always
+    # validates it first, but a payload built from a hand-constructed
+    # pending order (as these tests do) must not crash if it's absent
+    _woocommerce_settings(monkeypatch)
+    fake_post = _mock_post(monkeypatch)
+    fresh_session_store.set(
+        "session-1", order_tool._PENDING_ORDER_KEY,
+        {"token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+         "product": "Ring", "material": "18k", "quantity": 1, "total": 1200.0, "delivery_address": "Accra"},
+    )
+
+    # Act
+    result = order_tool.confirm_order("session-1")
+
+    # Assert: no crash, order still goes through
+    assert "order_confirmation" in result
 
 
 def test_confirm_order_raises_clear_error_when_orders_config_missing(monkeypatch, fresh_session_store):
@@ -465,3 +500,95 @@ def test_confirm_order_raises_clear_error_when_orders_config_missing(monkeypatch
     # Assert: fails cleanly before ever attempting the request
     assert "error" in result
     fake_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# staff notification -- delivery isn't automated (see delivery_tool.py),
+# so confirm_order() has to actually tell a human once an order goes
+# through, or nothing ever gets delivered.
+# ---------------------------------------------------------------------
+
+def _pending_order(**overrides):
+    base = {
+        "token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+        "product": "Ring", "material": "18k", "quantity": 1, "total": 1200.0,
+        "delivery_address": "12 Cantonments Road, Accra",
+        "delivery_option": "accra_rider", "delivery_option_label": "rider delivery within Accra",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_confirm_order_notifies_staff_when_phone_is_configured(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch, staff_notification_phone="233509764406")
+    _mock_post(monkeypatch, order_id=555)
+    fresh_session_store.set("session-233500000000", order_tool._PENDING_ORDER_KEY, _pending_order())
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    order_tool.confirm_order("session-233500000000")
+
+    # Assert: staff got pinged with the order id, delivery choice, and
+    # a way to reach the customer back
+    send_mock.assert_called_once()
+    to, body = send_mock.call_args[0]
+    assert to == "233509764406"
+    assert "555" in body
+    assert "rider delivery within Accra" in body
+    assert "session-233500000000" in body
+
+
+def test_confirm_order_warns_but_still_succeeds_when_staff_phone_not_configured(monkeypatch, fresh_session_store, caplog):
+    # Arrange: no staff_notification_phone set at all
+    _woocommerce_settings(monkeypatch)
+    _mock_post(monkeypatch, order_id=555)
+    fresh_session_store.set("session-1", order_tool._PENDING_ORDER_KEY, _pending_order())
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    result = order_tool.confirm_order("session-1")
+
+    # Assert: the customer's order still succeeds -- a missing
+    # notification channel is a config gap, not the customer's problem
+    assert result["order_confirmation"]["order_id"] == 555
+    send_mock.assert_not_called()
+
+
+def test_confirm_order_succeeds_even_when_staff_notification_fails(monkeypatch, fresh_session_store):
+    # Arrange: staff is configured, but the WhatsApp send itself fails
+    # (rate limit, bad token, whatever) -- this must be best-effort,
+    # never allowed to take down an order that already went through
+    _woocommerce_settings(monkeypatch, staff_notification_phone="233509764406")
+    _mock_post(monkeypatch, order_id=555)
+    fresh_session_store.set("session-1", order_tool._PENDING_ORDER_KEY, _pending_order())
+    monkeypatch.setattr(
+        order_tool, "send_text_message",
+        MagicMock(side_effect=order_tool.WhatsAppError("rate limited")),
+    )
+
+    # Act
+    result = order_tool.confirm_order("session-1")
+
+    # Assert: customer still gets a clean confirmation
+    assert result["order_confirmation"]["order_id"] == 555
+
+
+def test_confirm_order_does_not_renotify_staff_on_a_duplicate_confirm(monkeypatch, fresh_session_store):
+    # Arrange: the order already went through -- this is the "resend the
+    # same confirmation" path, not a fresh one, so staff shouldn't get
+    # pinged again for the same order
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 555, "total": 1200.0, "delivery_address": "Accra", "delivery_option_label": "rider delivery within Accra"},
+    )
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    order_tool.confirm_order("session-1")
+
+    # Assert
+    send_mock.assert_not_called()

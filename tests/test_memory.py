@@ -111,6 +111,18 @@ def test_remember_context_only_stores_resolved_values(monkeypatch):
     assert store.get("session-1", "material") is None
 
 
+def test_delivery_option_round_trips_across_turns(monkeypatch):
+    # A customer who already said "deliver to Accra" earlier shouldn't
+    # have to repeat it when they get to actually placing the order.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    remember_context("session-1", {"product_name": "ring", "delivery_option": "accra_rider"})
+    result = fill_missing_context("session-1", {"product_name": "ring", "delivery_option": "unknown"})
+
+    assert result["delivery_option"] == "accra_rider"
+
+
 def test_context_round_trips_across_two_simulated_turns(monkeypatch):
     # Arrange: turn one resolves and remembers gold; turn two arrives
     # with "unknown" and should recover it from the session

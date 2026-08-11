@@ -66,11 +66,14 @@ _store = SessionStore()
 
 # Arguments worth remembering across turns within the same session, so
 # "how much is shipping for that one" can resolve without the customer
-# repeating themselves. Not every tool takes all three, callers only
+# repeating themselves. Not every tool takes all four, callers only
 # fill and save whichever keys are actually present in that tool's
 # arguments. "category" lets a follow-up like "what about in 14k?"
 # after "what rings do you have" remember "Rings" without repeating it.
-_REMEMBERED_KEYS = ("product_name", "material", "category")
+# "delivery_option" means a customer who already said "deliver to Accra"
+# earlier in the conversation doesn't have to repeat it when they get to
+# actually placing the order.
+_REMEMBERED_KEYS = ("product_name", "material", "category", "delivery_option")
 
 
 def _is_unknown(value) -> bool:

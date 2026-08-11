@@ -32,7 +32,7 @@ services/
 ├── tool_registry.py       # Maps tool names -> functions
 ├── tool_executor.py       # Calls the selected tool, normalizes failures
 ├── product_tool.py        # get_product_price -- deterministic JSON lookup
-├── delivery_tool.py       # get_delivery_information -- static delivery terms
+├── delivery_tool.py       # get_delivery_information -- lists real delivery options (rider/shipping), not a price -- a human arranges the actual delivery
 ├── quote_service.py       # generate_quote -- composes price + delivery into one quote
 ├── recommendation_service.py  # recommend_products -- filters catalogue by material
 ├── memory.py              # Per-session context (product/material), keyed by session_id

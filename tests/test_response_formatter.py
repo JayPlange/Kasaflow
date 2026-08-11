@@ -26,17 +26,46 @@ def test_formats_price_only_shape():
     result = {"product": "Ring", "material": "gold", "price": 1200.0}
     formatted = format_for_customer(result)
     assert "Ring" in formatted and "gold" in formatted and "1,200.00" in formatted
+    # The headline fact (the price) is bolded WhatsApp-style; the
+    # trailing question is supporting text, left plain.
+    assert "*GH₵1,200.00*" in formatted
+    assert "Want to know about delivery too?" in formatted
+    assert "*Want to know about delivery too?*" not in formatted
 
 
-def test_formats_price_and_delivery_shape():
+def test_formats_price_and_delivery_options_shape():
+    # generate_quote's shape -- real delivery choices, not an invented
+    # cost/time (see delivery_tool.py's module docstring)
     result = {
         "product": "Ring",
         "material": "gold",
         "price": 1200.0,
-        "delivery": {"delivery_time": "2-3 days", "shipping_cost": 20},
+        "delivery_options": [
+            {"key": "accra_rider", "label": "rider delivery within Accra"},
+            {"key": "kumasi_rider", "label": "rider delivery within Kumasi"},
+            {"key": "international", "label": "shipping outside Ghana"},
+        ],
     }
     formatted = format_for_customer(result)
-    assert "2-3 days" in formatted and "1,200.00" in formatted
+    assert "1,200.00" in formatted
+    assert "*GH₵1,200.00*" in formatted
+    assert "rider delivery within Accra" in formatted
+    assert "rider delivery within Kumasi" in formatted
+    assert "shipping outside Ghana" in formatted
+
+
+def test_formats_bare_delivery_options_shape():
+    # get_delivery_information()'s shape -- a customer asking generically
+    # about delivery, with no product/price involved
+    result = {
+        "delivery_options": [
+            {"key": "accra_rider", "label": "rider delivery within Accra"},
+            {"key": "international", "label": "shipping outside Ghana"},
+        ]
+    }
+    formatted = format_for_customer(result)
+    assert "rider delivery within Accra" in formatted
+    assert "shipping outside Ghana" in formatted
 
 
 def test_formats_empty_recommendations():
@@ -92,6 +121,11 @@ def test_formats_recommendations_lists_a_small_same_price_variant_set():
     for size in ["US 8", "US 8.5", "US 9"]:
         assert size in formatted
     assert formatted.count("20,628.00") == 1
+    # Product name and price are the headline, bolded; the "available
+    # in ..." sizes are supporting detail, left plain
+    assert "*Minimal White Stone Gold Ring, 1g*" in formatted
+    assert "*GH₵20,628.00*" in formatted
+    assert "*available in" not in formatted
 
 
 def test_formats_recommendations_summarises_a_large_variant_set_as_a_range():
@@ -194,6 +228,8 @@ def test_formats_multi_entry_results_list_as_numbered_replies():
 
 
 def test_formats_order_proposal_shape():
+    # total is product cost only -- no invented delivery cost, see
+    # order_tool.propose_order()'s docstring
     result = {
         "proposal": {
             "quantity": 2,
@@ -201,29 +237,36 @@ def test_formats_order_proposal_shape():
             "product": "Ring",
             "subtotal": 2400.0,
             "delivery_address": "12 Cantonments Road, Accra",
-            "delivery": {"delivery_time": "2-5 business days", "shipping_cost": 25},
-            "total": 2425.0,
+            "delivery_option": "accra_rider",
+            "delivery_option_label": "rider delivery within Accra",
+            "total": 2400.0,
         }
     }
     formatted = format_for_customer(result)
     assert "2 x 18k Ring" in formatted
     assert "2,400.00" in formatted
-    assert "2,425.00" in formatted
     assert "CONFIRM" in formatted
+    assert "*2 x 18k Ring*" in formatted
+    assert "*GH₵2,400.00*" in formatted
+    assert "rider delivery within Accra" in formatted
 
 
 def test_formats_order_confirmation_shape():
     result = {
         "order_confirmation": {
             "order_id": 555,
-            "total": 2425.0,
+            "total": 2400.0,
             "delivery_address": "12 Cantonments Road, Accra",
+            "delivery_option_label": "rider delivery within Accra",
         }
     }
     formatted = format_for_customer(result)
     assert "555" in formatted
-    assert "2,425.00" in formatted
+    assert "2,400.00" in formatted
     assert "Cantonments" in formatted
+    assert "*order #555*" in formatted
+    assert "*GH₵2,400.00*" in formatted
+    assert "rider delivery within Accra" in formatted
 
 
 def test_formats_multi_entry_results_list_when_one_entry_errored():

@@ -1,16 +1,56 @@
-from services.delivery_tool import get_delivery_information
+from services.delivery_tool import (
+    DELIVERY_OPTIONS,
+    delivery_option_label,
+    delivery_options_phrase,
+    get_delivery_information,
+    is_valid_delivery_option,
+)
 
 
-def test_get_delivery_information_returns_expected_shape():
+def test_get_delivery_information_lists_the_real_options():
     # Arrange: nothing to set up, this tool takes no arguments
 
     # Act
     result = get_delivery_information()
 
-    # Assert: even a "boring" hardcoded tool deserves a test -- this one
-    # protects you the day someone renames a key and every caller downstream
-    # silently breaks (e.g. router.py expects "delivery_time" specifically).
-    assert result == {
-        "delivery_time": "2-5 business days",
-        "shipping_cost": 25,
-    }
+    # Assert: no invented price/time -- just the real choices a customer
+    # actually has (see delivery_tool.py's module docstring for why
+    # there's no fixed rate to quote)
+    assert result == {"delivery_options": DELIVERY_OPTIONS}
+    keys = {option["key"] for option in result["delivery_options"]}
+    assert keys == {"accra_rider", "kumasi_rider", "international"}
+
+
+def test_is_valid_delivery_option_accepts_real_keys():
+    for option in DELIVERY_OPTIONS:
+        assert is_valid_delivery_option(option["key"])
+
+
+def test_is_valid_delivery_option_rejects_anything_else():
+    assert not is_valid_delivery_option("unknown")
+    assert not is_valid_delivery_option(None)
+    assert not is_valid_delivery_option("accra")  # close, but not the real key
+
+
+def test_delivery_option_label_returns_the_display_text():
+    assert delivery_option_label("accra_rider") == "rider delivery within Accra"
+
+
+def test_delivery_option_label_returns_none_for_an_invalid_key():
+    assert delivery_option_label("nonsense") is None
+
+
+def test_delivery_options_phrase_uses_an_oxford_comma_and_or():
+    # The one place this exact wording is built -- order_tool.py's
+    # clarifying question and response_formatter.py's replies both use
+    # this, so a missing "or" here would show up in both places at once.
+    phrase = delivery_options_phrase()
+    assert phrase == (
+        "rider delivery within Accra, rider delivery within Kumasi, "
+        "or shipping outside Ghana"
+    )
+
+
+def test_delivery_options_phrase_handles_a_single_option():
+    phrase = delivery_options_phrase([{"key": "accra_rider", "label": "rider delivery within Accra"}])
+    assert phrase == "rider delivery within Accra"

@@ -19,16 +19,31 @@ form-letter bot -- but every word still traces back to a real field in
 the tool's result. Warmth is in phrasing and structure only, never in
 inventing a claim (a size, a price, a delivery estimate) the tool
 didn't actually return.
+
+Bold markers use WhatsApp's own formatting syntax -- a single asterisk
+pair, e.g. `*GH₵1,200.00*` -- not markdown's `**double asterisk**`,
+which WhatsApp displays as literal asterisks rather than bold text.
+Only ever wrapped around the headline fact of a line (a product name, a
+price, an order number): the point a customer scanning quickly needs,
+kept visually separate from the advisory clause that follows it (see
+_format_recommendation_group -- this is what "the responses should
+bolden the first points" was asking for).
 """
 
 
 import re
+
+from services.delivery_tool import delivery_options_phrase
 
 # Matches the karat digits at the start of any of the catalogue's real
 # material formats -- same pattern as recommendation_service.py's own
 # _extract_karat, duplicated rather than imported since this file is
 # meant to stay a standalone, deletable formatting layer (see module
 # docstring) with no dependency on how a tool produced its result.
+# (delivery_options_phrase() above is the one exception -- it's the
+# single source of truth for the exact delivery-option wording, shared
+# with order_tool.py's clarifying question, so the two can't drift out
+# of sync with each other.)
 _KARAT_RE = re.compile(r"^\s*(\d+)\s*k?\b", re.IGNORECASE)
 
 
@@ -103,7 +118,7 @@ _MAX_VARIANTS_LISTED = 3
 def _format_recommendation_group(name: str, variants: list[dict]) -> str:
     if len(variants) == 1:
         v = variants[0]
-        return f"- {name} ({v['material']}): GH₵{v['price']:,.2f}"
+        return f"- *{name}* ({v['material']}): *GH₵{v['price']:,.2f}*"
 
     prices = [v["price"] for v in variants]
     low, high = min(prices), max(prices)
@@ -111,11 +126,11 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
     if len(variants) <= _MAX_VARIANTS_LISTED:
         if low == high:
             options = ", ".join(v["material"] for v in variants)
-            return f"- {name}: GH₵{low:,.2f} -- available in {options}"
+            return f"- *{name}*: *GH₵{low:,.2f}* -- available in {options}"
         # Same small handful of variants, but not all the same price --
         # can't collapse to one line without hiding a real price difference.
-        sub_lines = "\n".join(f"   * {v['material']}: GH₵{v['price']:,.2f}" for v in variants)
-        return f"- {name}:\n{sub_lines}"
+        sub_lines = "\n".join(f"   * {v['material']}: *GH₵{v['price']:,.2f}*" for v in variants)
+        return f"- *{name}*:\n{sub_lines}"
 
     # Only call it "karat" variance if it actually varies within this set
     # -- if the customer already stated a karat (recommend_products
@@ -129,12 +144,12 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
 
     if low == high:
         return (
-            f"- {name}: GH₵{low:,.2f} -- comes in {len(variants)} {unit}, "
+            f"- *{name}*: *GH₵{low:,.2f}* -- comes in {len(variants)} {unit}, "
             f"just tell me which you'd like and I'll confirm it"
         )
     qualifier = "karat/size" if varies_by_karat else "size"
     return (
-        f"- {name}: GH₵{low:,.2f}-GH₵{high:,.2f} depending on {qualifier} "
+        f"- *{name}*: *GH₵{low:,.2f}-GH₵{high:,.2f}* depending on {qualifier} "
         f"({len(variants)} options) -- tell me your {ask} and I'll get you the exact price"
     )
 
@@ -166,24 +181,32 @@ def format_for_customer(result: dict | None) -> str:
 
     if "proposal" in result:
         # order_tool.propose_order()'s shape -- a priced, not-yet-placed
-        # order awaiting the customer's explicit confirmation.
+        # order awaiting the customer's explicit confirmation. total is
+        # product cost only -- delivery isn't priced automatically, see
+        # delivery_tool.py's module docstring, so this deliberately
+        # doesn't claim a delivery cost/time it doesn't actually have.
         p = result["proposal"]
+        delivery_label = p.get("delivery_option_label") or "the delivery option you chose"
         return (
-            f"Lovely choice -- {p['quantity']} x {p['material']} {p['product']} comes to "
-            f"GH₵{p['subtotal']:,.2f}. Delivery to {p['delivery_address']} takes "
-            f"{p['delivery']['delivery_time']} (GH₵{p['delivery']['shipping_cost']} shipping), "
-            f"so you're looking at GH₵{p['total']:,.2f} in total. "
+            f"Lovely choice -- *{p['quantity']} x {p['material']} {p['product']}* comes to "
+            f"*GH₵{p['total']:,.2f}*. Delivery to {p['delivery_address']} via {delivery_label} -- "
+            f"our team will confirm the exact delivery cost and timing with you directly. "
             f"Just reply CONFIRM and I'll get that placed for you."
         )
 
     if "order_confirmation" in result:
         # order_tool.confirm_order()'s shape -- the order now exists in
         # WooCommerce (status "on-hold": created, payment not yet
-        # collected -- see order_tool.py's module docstring).
+        # collected -- see order_tool.py's module docstring). The order
+        # itself has also been handed to a human to arrange delivery
+        # (see confirm_order()'s staff notification) -- say so, rather
+        # than implying delivery is already sorted.
         c = result["order_confirmation"]
+        delivery_label = c.get("delivery_option_label") or "your chosen delivery option"
         return (
-            f"All set -- order #{c['order_id']} is confirmed for GH₵{c['total']:,.2f}, "
-            f"delivering to {c['delivery_address']}. I'll follow up shortly about payment."
+            f"All set -- *order #{c['order_id']}* is confirmed for *GH₵{c['total']:,.2f}*, "
+            f"delivering to {c['delivery_address']} via {delivery_label}. Our team will be in "
+            f"touch shortly to arrange the delivery and payment."
         )
 
     if "answer" in result:
@@ -222,19 +245,23 @@ def format_for_customer(result: dict | None) -> str:
             + "\n\nWant me to tell you more about any of these, show you a photo, or narrow it down by size or karat?"
         )
 
-    if "price" in result and "delivery" in result:
-        delivery = result["delivery"]
+    if "price" in result and "delivery_options" in result:
+        # generate_quote's shape -- price plus the real delivery choices
+        # (not a cost/time, see delivery_tool.py's module docstring).
+        options_phrase = delivery_options_phrase(result["delivery_options"])
         return (
-            f"Good news -- the {result['material']} {result['product']} is GH₵{result['price']:,.2f}. "
-            f"Delivery takes about {delivery['delivery_time']}, with GH₵{delivery['shipping_cost']} shipping. "
-            f"Want to go ahead with this one?"
+            f"Good news -- the {result['material']} {result['product']} is "
+            f"*GH₵{result['price']:,.2f}*. For delivery, would you like {options_phrase}?"
         )
 
     if "price" in result:
-        return f"The {result['material']} {result['product']} is GH₵{result['price']:,.2f}. Want to know about delivery too?"
+        return f"The {result['material']} {result['product']} is *GH₵{result['price']:,.2f}*. Want to know about delivery too?"
 
-    if "delivery_time" in result:
-        return f"Delivery usually takes {result['delivery_time']}, with shipping at GH₵{result['shipping_cost']}."
+    if "delivery_options" in result:
+        # get_delivery_information()'s bare shape -- a customer asking
+        # generically "what are your delivery options".
+        options_phrase = delivery_options_phrase(result["delivery_options"])
+        return f"We deliver a couple of ways: {options_phrase}. Which works for you?"
 
     # Unknown shape -- surface something rather than send nothing, but
     # this branch being hit means a new tool was added without updating
