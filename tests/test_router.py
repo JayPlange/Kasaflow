@@ -194,3 +194,53 @@ def test_route_customer_keeps_sessions_isolated(monkeypatch):
     # Assert: each session only ever sees its own remembered material
     assert result_a["material"] == "gold"
     assert result_b["material"] == "silver"
+
+
+def test_route_customer_injects_session_id_for_order_tools(monkeypatch):
+    # Arrange: propose_order needs to know which customer's session it's
+    # acting on, but that's never something the LLM returns -- see
+    # router.py's _SESSION_AWARE_TOOLS
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "propose_order",
+            "arguments": {"product_name": "ring", "material": "gold", "quantity": 1, "delivery_address": "Accra"},
+        }),
+    )
+    captured_calls = []
+
+    def fake_execute_tool(tool_name, **kwargs):
+        captured_calls.append(kwargs)
+        return {"proposal": {}}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    router.route_customer("I'll take a gold ring, deliver to Accra", "session-order-1")
+
+    # Assert
+    assert captured_calls[0]["session_id"] == "session-order-1"
+
+
+def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypatch):
+    # Arrange: guard against the injection being accidentally widened to
+    # every tool, which would break the five that don't accept session_id
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "ring", "material": "gold"}}),
+    )
+    captured_calls = []
+
+    def fake_execute_tool(tool_name, **kwargs):
+        captured_calls.append(kwargs)
+        return {"product": "ring", "material": "gold", "price": 1200}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    router.route_customer("how much is a gold ring?", "session-1")
+
+    # Assert
+    assert "session_id" not in captured_calls[0]

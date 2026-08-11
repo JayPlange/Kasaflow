@@ -47,6 +47,16 @@ class Settings:
     woocommerce_consumer_key: str | None
     woocommerce_consumer_secret: str | None
 
+    # Deliberately separate from the sync key above. The sync key is
+    # read-only and runs unattended on a schedule (see
+    # services/woocommerce_sync.py) -- giving it write access just to
+    # support order creation would mean a bug in an unattended cron job
+    # could create/modify real orders. This key is scoped Read/Write in
+    # WooCommerce admin and is only ever used from the live, per-request
+    # order path in services/order_tool.py.
+    woocommerce_orders_consumer_key: str | None
+    woocommerce_orders_consumer_secret: str | None
+
     khaya_api_key: str | None
     khaya_api_base: str
 
@@ -91,6 +101,8 @@ def load_settings() -> Settings:
         woocommerce_url=os.getenv("WOOCOMMERCE_URL"),
         woocommerce_consumer_key=os.getenv("WOOCOMMERCE_CONSUMER_KEY"),
         woocommerce_consumer_secret=os.getenv("WOOCOMMERCE_CONSUMER_SECRET"),
+        woocommerce_orders_consumer_key=os.getenv("WOOCOMMERCE_ORDERS_CONSUMER_KEY"),
+        woocommerce_orders_consumer_secret=os.getenv("WOOCOMMERCE_ORDERS_CONSUMER_SECRET"),
         khaya_api_key=os.getenv("KHAYA_API_KEY"),
         khaya_api_base=os.getenv("KHAYA_API_BASE", "https://translation-api.ghananlp.org"),
         whatsapp_verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN"),

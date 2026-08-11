@@ -150,6 +150,12 @@ def build_catalogue() -> list[dict]:
     for product in raw_products:
         image_url = _product_image_url(product)
         base_entry = {
+            # WooCommerce's own numeric product ID. Not shown to
+            # customers -- kept so services/order_tool.py can create a
+            # real order without a second, live lookup against
+            # WooCommerce on the request path (see that file's docstring
+            # for why a live call per order-create is worth avoiding).
+            "id": product["id"],
             "product": product["name"],
             "category": product["categories"][0]["name"] if product.get("categories") else None,
             "in_stock": product.get("stock_status") == "instock",
@@ -165,6 +171,13 @@ def build_catalogue() -> list[dict]:
                 catalogue.append(
                     {
                         **base_entry,
+                        # A variable product's *parent* id (above) is not
+                        # orderable on its own -- WooCommerce orders a
+                        # specific variation. Kept as a separate field
+                        # (rather than overwriting "id") so a caller can
+                        # always tell a simple product from a variation:
+                        # variation_id is present only when there is one.
+                        "variation_id": variation["id"],
                         "material": _variation_label(variation) or "standard",
                         "price": float(price),
                         "in_stock": variation.get("stock_status", base_entry["in_stock"]) == "instock"

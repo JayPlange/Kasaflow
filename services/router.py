@@ -12,6 +12,16 @@ from services.tool_executor import ToolExecutionError, execute_tool
 
 logger = logging.getLogger(__name__)
 
+# propose_order/confirm_order (services/order_tool.py) both need to know
+# which customer's session they're acting on, but that's never something
+# the LLM decides or the customer states -- it comes from the channel
+# (WhatsApp) this message arrived on. Every other registered tool's
+# **kwargs contract is exactly whatever the LLM returned, nothing more,
+# so session_id is injected only for these two by name rather than added
+# to every tool call: passing an unexpected session_id kwarg to any of
+# the other five would raise inside tool_executor.py's TypeError handler.
+_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order"}
+
 
 def route_customer(message: str, session_id: str) -> dict:
     try:
@@ -40,6 +50,9 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
     # answer from the message alone against what this session last
     # talked about, before the arguments ever reach a tool.
     arguments = fill_missing_context(session_id, tool_request["arguments"])
+
+    if tool_request["tool"] in _SESSION_AWARE_TOOLS:
+        arguments = {**arguments, "session_id": session_id}
 
     try:
         result = execute_tool(tool_request["tool"], **arguments)

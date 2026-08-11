@@ -78,6 +78,39 @@ def test_formats_multi_entry_results_list_as_numbered_replies():
     assert "Chain" in formatted and "350.00" in formatted
 
 
+def test_formats_order_proposal_shape():
+    result = {
+        "proposal": {
+            "quantity": 2,
+            "material": "18k",
+            "product": "Ring",
+            "subtotal": 2400.0,
+            "delivery_address": "12 Cantonments Road, Accra",
+            "delivery": {"delivery_time": "2-5 business days", "shipping_cost": 25},
+            "total": 2425.0,
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "2 x 18k Ring" in formatted
+    assert "2,400.00" in formatted
+    assert "2,425.00" in formatted
+    assert "CONFIRM" in formatted
+
+
+def test_formats_order_confirmation_shape():
+    result = {
+        "order_confirmation": {
+            "order_id": 555,
+            "total": 2425.0,
+            "delivery_address": "12 Cantonments Road, Accra",
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "555" in formatted
+    assert "2,425.00" in formatted
+    assert "Cantonments" in formatted
+
+
 def test_formats_multi_entry_results_list_when_one_entry_errored():
     result = {
         "results": [

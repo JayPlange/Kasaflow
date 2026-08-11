@@ -41,6 +41,27 @@ def format_for_customer(result: dict | None) -> str:
     if "error" in result:
         return result["error"]
 
+    if "proposal" in result:
+        # order_tool.propose_order()'s shape -- a priced, not-yet-placed
+        # order awaiting the customer's explicit confirmation.
+        p = result["proposal"]
+        return (
+            f"{p['quantity']} x {p['material']} {p['product']} — GH₵{p['subtotal']:,.2f}. "
+            f"Delivery to {p['delivery_address']}: {p['delivery']['delivery_time']}, "
+            f"GH₵{p['delivery']['shipping_cost']} shipping. "
+            f"Total: GH₵{p['total']:,.2f}. Reply CONFIRM to place this order."
+        )
+
+    if "order_confirmation" in result:
+        # order_tool.confirm_order()'s shape -- the order now exists in
+        # WooCommerce (status "on-hold": created, payment not yet
+        # collected -- see order_tool.py's module docstring).
+        c = result["order_confirmation"]
+        return (
+            f"Order #{c['order_id']} confirmed — GH₵{c['total']:,.2f}, "
+            f"delivering to {c['delivery_address']}. We'll be in touch about payment next."
+        )
+
     if "answer" in result:
         # answer_policy_question's shape -- already a sentence.
         return result["answer"]
