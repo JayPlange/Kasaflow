@@ -155,6 +155,30 @@ def get_order_draft(session_id: str) -> dict | None:
     return draft
 
 
+_PENDING_INTENT_KEY = "pending_intent"
+
+
+def set_pending_intent(session_id: str, tool_name: str | None) -> None:
+    """Marks (or clears, with None) that this session asked for a
+    product's price/photo/quote but the product itself couldn't be
+    resolved yet -- get_product_price/generate_quote called with
+    product_name genuinely unknown, and found nothing.
+
+    Exists for the same reason as get_order_draft() above, one layer
+    earlier: without it, a customer who says "yeah i wanna see pictures"
+    (no product named -- genuinely ambiguous with several items just
+    shown) then names the product on their VERY NEXT message gets asked
+    yet another clarifying question instead of the system just doing
+    what they already asked for (confirmed live, 2026-08-13: the
+    customer had to name the product twice and was still told "I
+    couldn't find that one"). See llm.py's _pending_intent_state_line()."""
+    _store.set(session_id, _PENDING_INTENT_KEY, tool_name)
+
+
+def get_pending_intent(session_id: str) -> str | None:
+    return _store.get(session_id, _PENDING_INTENT_KEY)
+
+
 def get_session_store() -> SessionStore:
     """Exposed so tests (and, later, a healthcheck or admin endpoint) can
     inspect the store without reaching into the module-level `_store`

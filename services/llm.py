@@ -109,10 +109,12 @@ Use this ONLY when the customer is clearly confirming an order that was already 
 8. converse
 Arguments:
 - reply
-Use this for messages that are purely conversational and need no business tool at all: greetings ("hey", "hi", "good morning"), farewells, thanks ("medaase"), casual acknowledgements ("okay", "nice", "haha"), reactions and emojis, light humour, and simple social questions ("how are you?"). This is the ONLY tool where you write the actual customer-facing reply yourself, as the `reply` argument -- there is no deterministic tool behind it, because there is no business fact to look up. Keep it natural, warm, and concise; match the customer's language (English, Twi, or a natural mix of both). Never mention tools, JSON, databases, or system/error states in the reply.
+Use this for messages that are purely conversational and need no business tool at all: greetings ("hey", "hi", "good morning"), farewells, thanks ("medaase"), casual acknowledgements ("okay", "nice", "haha"), reactions and emojis, light humour, and simple social questions ("how are you?"). This is the ONLY tool where you write the actual customer-facing reply yourself, as the `reply` argument -- there is no deterministic tool behind it, because there is no business fact to look up. Keep it natural, warm, and concise -- a short, casual sentence or two, not a list of everything you can do. Match the customer's language (English, Twi, or a natural mix of both). Never mention tools, JSON, databases, or system/error states in the reply.
 
 Do NOT use converse when:
 - the customer asks about a product, price, availability, delivery, or policy -- those need the matching tool above, even if the message is short or casual in tone.
+- the customer names, repeats, or otherwise identifies a specific catalogue item in any way -- even with no question mark, no "how much"/"show me", just the item's name on its own (e.g. a customer typing back a product name from something you showed them a moment ago). That is them telling you which item they mean, not making conversation -- call get_product_price with that product_name immediately. Do not respond by asking what they'd like to do with it; ask that only if it is genuinely still unclear after using this turn's context (see the pending-intent context below, if present).
+- the customer's message is a vague product-adjacent ask with nothing named yet -- "can I see a photo", "show me pictures", "how much is it" -- and there is no clearer signal in the message. These ARE business requests, just ones missing a detail. Call the matching tool anyway (get_product_price with product_name "unknown") rather than asking your own clarifying question through converse; the system already has a dedicated mechanism for resolving a missing product name (from memory, or from the pending-intent context below), and a canned clarifying reply from that path is preferable to converse improvising one.
 - the customer wants a recommendation, wants to place/change/confirm an order, or is answering a question this assistant itself just asked while an order was being collected (see any pending-order / partial-order context below, if present) -- those must go to the matching business tool, not converse, no matter how short the reply looks.
 - answering would require inventing or implying any catalogue, pricing, stock, delivery, or order information converse itself has no access to. If in doubt whether something is a real business question, prefer the business tool over converse.
 
@@ -130,11 +132,20 @@ Customer: "medaase"
 Customer: "ei that's expensive oo"
 {{"tool": "converse", "arguments": {{"reply": "Haha I hear you! Want me to show you a few more affordable options?"}}}}
 
+Customer: "urm what do you do?"
+{{"tool": "converse", "arguments": {{"reply": "I help with pretty much everything here 😊 Ask me about our jewellery, prices, photos, delivery, or place an order any time."}}}}
+
 Customer: "how much is the gold chain?"
 -> NOT converse. Use get_product_price.
 
 Customer: "do you have bracelets?"
 -> NOT converse. Use recommend_products.
+
+Customer: "this Set Multi Stone Golf Ring, 7g" (just naming a product, no question)
+-> NOT converse. Use get_product_price with product_name "Set Multi Stone Golf Ring, 7g".
+
+Customer: "yeah i wanna see pictures" (nothing specific named yet)
+-> NOT converse. Use get_product_price with product_name "unknown" -- let the system's own missing-product handling ask which one, don't improvise that question yourself.
 
 Rules:
 
@@ -224,6 +235,8 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {order_draft_state}
 
+{pending_intent_state}
+
 Customer:
 {message}
 """
@@ -306,15 +319,65 @@ def _order_draft_state_line(order_draft: dict | None) -> str:
     )
 
 
-def _build_prompt(message: str, pending_order: dict | None, order_draft: dict | None) -> str:
+_PENDING_INTENT_TOOL_DESCRIPTIONS = {
+    "get_product_price": "see its price and photo",
+    "generate_quote": "get a full quote (price and delivery options)",
+}
+
+
+def _pending_intent_state_line(pending_intent: str | None) -> str:
+    """Describes an unresolved product-lookup attempt from a previous
+    turn, so a customer who then names/identifies the product on their
+    very next message gets it resolved immediately instead of being
+    asked yet another clarifying question.
+
+    Exists because a message like "yeah i wanna see pictures" or "how
+    much is it" with no product named is a genuine business ask, just
+    missing one detail -- get_product_price runs with product_name
+    "unknown", finds nothing, and this session is left with an
+    unresolved intent. Without this line, the customer's next message
+    naming the product (e.g. "this Set Multi Stone Golf Ring, 7g") looks,
+    in isolation, like they're just repeating a name with no clear ask --
+    and converse (see llm.py's tool 8) or another clarifying question can
+    swallow it instead of actually completing the lookup the customer
+    already asked for (confirmed live, 2026-08-13: the customer had to
+    name the product twice, then got told "I couldn't find that one",
+    then had to explain that it had literally just been shown to them).
+    router.py's set_pending_intent()/get_pending_intent() track this."""
+    if not pending_intent:
+        return ""
+    action = _PENDING_INTENT_TOOL_DESCRIPTIONS.get(pending_intent, "look something up")
+    return (
+        f"This customer recently tried to {action} but hadn't named a specific product, "
+        f"so nothing could be found yet. If their current message now names, repeats, or "
+        f"otherwise identifies a specific product -- even just the name on its own, with no "
+        f"question -- treat that as completing this request: call {pending_intent} with that "
+        f"product name right away. Do not ask them what they'd like to do with it and do not "
+        f"use converse; they already told you what they wanted, they're now just telling you "
+        f"which item."
+    )
+
+
+def _build_prompt(
+    message: str,
+    pending_order: dict | None,
+    order_draft: dict | None,
+    pending_intent: str | None = None,
+) -> str:
     return _PROMPT_TEMPLATE.format(
         message=message,
         pending_order_state=_pending_order_state_line(pending_order),
         order_draft_state=_order_draft_state_line(order_draft),
+        pending_intent_state=_pending_intent_state_line(pending_intent),
     )
 
 
-def _call_llm(message: str, pending_order: dict | None, order_draft: dict | None) -> str:
+def _call_llm(
+    message: str,
+    pending_order: dict | None,
+    order_draft: dict | None,
+    pending_intent: str | None = None,
+) -> str:
     """Call the model with retries on transient failures only.
 
     Auth errors, bad requests, etc. (APIError) are not retried — retrying
@@ -327,7 +390,7 @@ def _call_llm(message: str, pending_order: dict | None, order_draft: dict | None
         try:
             response = client.responses.create(
                 model=settings.openai_model,
-                input=_build_prompt(message, pending_order, order_draft),
+                input=_build_prompt(message, pending_order, order_draft, pending_intent),
                 timeout=settings.llm_timeout_seconds,
             )
             return response.output_text
@@ -396,7 +459,10 @@ def _validate_multi_request(data: dict) -> dict:
 
 
 def understand_customer(
-    message: str, pending_order: dict | None = None, order_draft: dict | None = None
+    message: str,
+    pending_order: dict | None = None,
+    order_draft: dict | None = None,
+    pending_intent: str | None = None,
 ) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
@@ -405,11 +471,15 @@ def understand_customer(
 
     order_draft is the equivalent one step earlier -- an order that's
     been started but not yet fully priced (see memory.get_order_draft()
-    and _order_draft_state_line())."""
+    and _order_draft_state_line()).
+
+    pending_intent is one step earlier again -- a product lookup the
+    customer asked for but hadn't named a product for yet (see
+    memory.get_pending_intent() and _pending_intent_state_line())."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
-    raw_text = _call_llm(message, pending_order, order_draft)
+    raw_text = _call_llm(message, pending_order, order_draft, pending_intent)
     logger.info("Raw LLM output: %s", raw_text)
 
     return _parse_tool_request(raw_text)

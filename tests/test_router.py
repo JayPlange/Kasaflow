@@ -265,6 +265,7 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
         "yh",
         pending_order={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0},
         order_draft=None,
+        pending_intent=None,
     )
 
 
@@ -277,7 +278,9 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
     router.route_customer("how much is a gold ring?", "session-fresh")
 
     # Assert
-    understand.assert_called_once_with("how much is a gold ring?", pending_order=None, order_draft=None)
+    understand.assert_called_once_with(
+        "how much is a gold ring?", pending_order=None, order_draft=None, pending_intent=None
+    )
 
 
 def test_route_customer_passes_order_draft_state_when_an_order_is_in_progress(monkeypatch):
@@ -396,6 +399,109 @@ def test_route_customer_converse_falls_back_when_llm_omits_a_reply(monkeypatch):
 
     # Assert: still a real, sendable reply, not a blank message
     assert result["conversation_reply"]
+
+
+# ---------------------------------------------------------------------
+# pending_intent -- a product lookup asked for without a product named
+# yet (see memory.set_pending_intent()/get_pending_intent() and llm.py's
+# _pending_intent_state_line())
+# ---------------------------------------------------------------------
+
+def test_route_customer_sets_pending_intent_when_product_lookup_has_no_product_named(monkeypatch):
+    # Arrange: "yeah i wanna see pictures" -- get_product_price runs with
+    # product_name genuinely unresolved (fresh session, nothing to fill
+    # it from) and finds nothing
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "unknown", "material": "unknown"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value=None))
+    set_pending_intent = MagicMock()
+    monkeypatch.setattr(router, "set_pending_intent", set_pending_intent)
+
+    # Act
+    router.route_customer("yeah i wanna see pictures", "session-pending-intent-set")
+
+    # Assert
+    set_pending_intent.assert_called_once_with("session-pending-intent-set", "get_product_price")
+
+
+def test_route_customer_does_not_set_pending_intent_for_a_real_product_name_that_just_was_not_found(monkeypatch):
+    # Arrange: a genuinely made-up/unstocked product ("unicorn pendant")
+    # is a different failure mode from "no product named" -- this must
+    # not be remembered as something to resolve on the next message
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "unicorn pendant", "material": "unknown"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value=None))
+    set_pending_intent = MagicMock()
+    monkeypatch.setattr(router, "set_pending_intent", set_pending_intent)
+
+    # Act
+    router.route_customer("how much is the unicorn pendant?", "session-pending-intent-unicorn")
+
+    # Assert
+    set_pending_intent.assert_not_called()
+
+
+def test_route_customer_clears_pending_intent_once_the_product_lookup_succeeds(monkeypatch):
+    # Arrange: the customer follows up naming the product, and it resolves
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Set Multi Stone Golf Ring, 7g", "material": "unknown"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Set Multi Stone Golf Ring, 7g", "material": "18k", "price": 12033.0}),
+    )
+    set_pending_intent = MagicMock()
+    monkeypatch.setattr(router, "set_pending_intent", set_pending_intent)
+
+    # Act
+    router.route_customer("Set Multi Stone Golf Ring", "session-pending-intent-resolved")
+
+    # Assert: cleared, not left stale for an unrelated later message
+    set_pending_intent.assert_called_once_with("session-pending-intent-resolved", None)
+
+
+def test_route_customer_passes_pending_intent_to_understand_customer(monkeypatch):
+    # Arrange
+    understand = MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}})
+    monkeypatch.setattr(router, "understand_customer", understand)
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"product": "Ring", "material": "18k", "price": 1200}))
+    monkeypatch.setattr(router, "get_pending_intent", MagicMock(return_value="get_product_price"))
+
+    # Act
+    router.route_customer("this Set Multi Stone Golf Ring, 7g", "session-pending-intent-passthrough")
+
+    # Assert
+    call_kwargs = understand.call_args.kwargs
+    assert call_kwargs["pending_intent"] == "get_product_price"
+
+
+def test_route_customer_converse_does_not_read_or_write_pending_intent(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "converse", "arguments": {"reply": "Hey!"}}),
+    )
+    set_pending_intent = MagicMock()
+    monkeypatch.setattr(router, "set_pending_intent", set_pending_intent)
+    execute_tool = MagicMock()
+    monkeypatch.setattr(router, "execute_tool", execute_tool)
+
+    # Act
+    router.route_customer("hey", "session-pending-intent-converse")
+
+    # Assert: converse never touches pending_intent either way
+    set_pending_intent.assert_not_called()
+    execute_tool.assert_not_called()
 
 
 def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypatch):

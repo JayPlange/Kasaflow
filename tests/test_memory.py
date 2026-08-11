@@ -7,7 +7,14 @@ sessions stay isolated from each other and that entries expire, which is
 the exact bug the old shared-dict version had.
 """
 
-from services.memory import SessionStore, fill_missing_context, get_order_draft, remember_context
+from services.memory import (
+    SessionStore,
+    fill_missing_context,
+    get_order_draft,
+    get_pending_intent,
+    remember_context,
+    set_pending_intent,
+)
 
 
 # ---------------------------------------------------------------------
@@ -187,6 +194,33 @@ def test_get_order_draft_reflects_partial_progress(monkeypatch):
     assert draft["quantity"] is None
     assert draft["delivery_address"] is None
     assert draft["delivery_option"] is None
+
+
+# ---------------------------------------------------------------------
+# pending_intent
+# ---------------------------------------------------------------------
+
+def test_get_pending_intent_returns_none_when_nothing_set():
+    assert get_pending_intent("session-never-seen") is None
+
+
+def test_pending_intent_round_trips(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_pending_intent("session-1", "get_product_price")
+
+    assert get_pending_intent("session-1") == "get_product_price"
+
+
+def test_pending_intent_can_be_cleared(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_pending_intent("session-1", "get_product_price")
+    set_pending_intent("session-1", None)
+
+    assert get_pending_intent("session-1") is None
 
 
 def test_context_round_trips_across_two_simulated_turns(monkeypatch):

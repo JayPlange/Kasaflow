@@ -276,6 +276,42 @@ def test_understand_customer_parses_a_converse_response(monkeypatch):
     assert result["arguments"]["reply"] == "Hey! How can I help you today?"
 
 
+# ---------------------------------------------------------------------
+# pending_intent -- a product lookup the customer asked for but hadn't
+# named a product for yet (see llm.py's _pending_intent_state_line())
+# ---------------------------------------------------------------------
+
+def test_prompt_omits_pending_intent_section_when_nothing_pending():
+    prompt = llm._build_prompt("this one", pending_order=None, order_draft=None, pending_intent=None)
+    assert "hadn't named a specific product" not in prompt
+
+
+def test_prompt_describes_a_pending_intent():
+    prompt = llm._build_prompt(
+        "this Set Multi Stone Golf Ring, 7g",
+        pending_order=None, order_draft=None, pending_intent="get_product_price",
+    )
+    assert "hadn't named a specific product" in prompt
+    assert "call get_product_price with that product name" in prompt
+    assert "do not use converse" in prompt.lower()
+
+
+def test_understand_customer_passes_pending_intent_through_to_the_prompt(monkeypatch):
+    # Arrange
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "get_product_price", "arguments": {"product_name": "Set Multi Stone Golf Ring, 7g", "material": "unknown"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    llm.understand_customer("this Set Multi Stone Golf Ring, 7g", pending_intent="get_product_price")
+
+    # Assert
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "hadn't named a specific product" in sent_prompt
+
+
 def test_understand_customer_rejects_empty_message():
     # Arrange: no mocking needed, this should fail before ever touching the client
 

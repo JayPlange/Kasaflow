@@ -295,11 +295,11 @@ let recordTimer = null;
 let presenterMode = false;
 let lastInsightHtml = '';
 
+// Real WhatsApp just shows "typing..." while waiting for a reply -- the
+// previous set of rotating "Hmm, let me check that for you..." style
+// lines read as more artificial than the plain native indicator does.
 const THINKING_LINES = [
-  'Hmm, let me check that for you...',
-  'One moment, checking our stock...',
-  'Let me have a look...',
-  'Kindly hold on a second...',
+  'typing...',
 ];
 
 langBtns.forEach(btn => btn.addEventListener('click', () => {

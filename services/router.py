@@ -7,7 +7,13 @@ customer sees when something goes wrong upstream.
 import logging
 
 from services.llm import ToolSelectionError, understand_customer
-from services.memory import fill_missing_context, get_order_draft, remember_context
+from services.memory import (
+    fill_missing_context,
+    get_order_draft,
+    get_pending_intent,
+    remember_context,
+    set_pending_intent,
+)
 from services.order_tool import get_pending_order_summary
 from services.tool_executor import ToolExecutionError, execute_tool
 
@@ -37,6 +43,12 @@ _SESSION_AWARE_TOOLS = {"propose_order", "confirm_order"}
 # and a stray "reply" key must never leak into or overwrite that state.
 _CONVERSATION_TOOL = "converse"
 _CONVERSATION_FALLBACK_REPLY = "Hey! How can I help you today?"
+
+# The two tools whose only failure mode relevant here is "customer wants
+# this, but hasn't named a product yet" -- see memory.set_pending_intent()
+# and llm.py's _pending_intent_state_line() for why that specific gap
+# needs to be tracked across turns.
+_PENDING_INTENT_TOOLS = {"get_product_price", "generate_quote"}
 
 
 def _found_nothing(result: dict | None) -> bool:
@@ -76,7 +88,16 @@ def route_customer(message: str, session_id: str) -> dict:
         # once a proposal exists, that's the active state, not the
         # draft that led to it. See llm.py's _order_draft_state_line().
         order_draft = None if pending_order else get_order_draft(session_id)
-        tool_request = understand_customer(message, pending_order=pending_order, order_draft=order_draft)
+        # A product lookup the customer asked for but hadn't named a
+        # product for yet ("yeah i wanna see pictures") -- see
+        # memory.get_pending_intent() and llm.py's
+        # _pending_intent_state_line() for why a follow-up naming the
+        # product needs this to avoid asking the customer to repeat
+        # themselves a second time.
+        pending_intent = get_pending_intent(session_id)
+        tool_request = understand_customer(
+            message, pending_order=pending_order, order_draft=order_draft, pending_intent=pending_intent
+        )
     except ValueError as e:
         return {"error": str(e)}
     except ToolSelectionError as e:
@@ -120,7 +141,28 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
     if not _found_nothing(result):
         remember_context(session_id, arguments)
 
+    _update_pending_intent(session_id, tool_request["tool"], arguments, result)
+
     return result
+
+
+def _update_pending_intent(session_id: str, tool_name: str, arguments: dict, result: dict | None) -> None:
+    if tool_name in _PENDING_INTENT_TOOLS and _found_nothing(result):
+        product_name = arguments.get("product_name")
+        if product_name is None or str(product_name).strip().lower() == "unknown":
+            # Missing the product itself, specifically -- not a real name
+            # that just didn't match anything (a made-up item, a typo).
+            # Only this case means "ask again once they tell you which
+            # one", so only this case is worth remembering.
+            set_pending_intent(session_id, tool_name)
+            return
+
+    if not _found_nothing(result):
+        # Whatever was pending (if anything) is now resolved or has been
+        # superseded by a successful, different request -- either way,
+        # stale intent left behind would risk misreading an unrelated
+        # later message as still answering it.
+        set_pending_intent(session_id, None)
 
 
 def _handle_conversation(arguments: dict) -> dict:
