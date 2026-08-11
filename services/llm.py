@@ -81,7 +81,7 @@ Arguments:
 - material
 - category
 Use this when the customer is browsing rather than asking about one named product -- "what rings do you have", "what's available in gold", "show me your necklaces in 18k".
-- `category` is the product type, e.g. "Rings" or "Necklaces". Set to "unknown" if the customer didn't mention a type.
+- `category` must be one of this store's actual two catalogue categories: "Rings" or "Necklaces". Map whatever word the customer used onto one of those two -- "chain(s)", "necklace", and "pendant" all mean `category: "Necklaces"`; "band", "wedding ring", and "engagement ring" all mean `category: "Rings"`. Set to "unknown" if the customer didn't mention a type, or if what they asked for is clearly neither (e.g. bracelets, earrings, watches -- this store doesn't stock those, so pass their word through as-is rather than forcing it into Rings or Necklaces).
 - `material` is the karat purity, e.g. "18k" or "14k", ONLY if the customer stated a specific karat. Every item this store sells is gold, so if the customer just says "gold" without a karat number, set material to "unknown" -- there's nothing to narrow, it would only exclude items that shouldn't be excluded.
 
 5. answer_policy_question

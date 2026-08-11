@@ -23,6 +23,31 @@ logger = logging.getLogger(__name__)
 _SESSION_AWARE_TOOLS = {"propose_order", "confirm_order"}
 
 
+def _found_nothing(result: dict | None) -> bool:
+    """True when a tool ran successfully but didn't actually find what
+    the customer asked about: get_product_price's bare None, an empty
+    recommend_products category, or generate_quote's "couldn't find that
+    product" message.
+
+    Exists because execute_tool() only raises on a genuine failure --
+    an empty/no-match result is a normal, successful return, so without
+    this check remember_context() below would happily save a category
+    or product that produced nothing. A customer asking for something
+    genuinely unstocked (say "bracelets") would then have that dead
+    category silently remembered, trapping every vague follow-up
+    ("show me something else", "yeah lemme see") in the same no-match
+    state until they explicitly named a real category again -- exactly
+    the "never learn an invalid value" promise below is meant to rule
+    out, but previously didn't for this specific case."""
+    if result is None:
+        return True
+    if "recommendations" in result and not result["recommendations"]:
+        return True
+    if "message" in result and "product" not in result:
+        return True
+    return False
+
+
 def route_customer(message: str, session_id: str) -> dict:
     try:
         tool_request = understand_customer(message)
@@ -60,9 +85,10 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
         logger.error("Tool execution failed: %s", e)
         return {"error": "Something went wrong while processing your request."}
 
-    # Only remember context once the tool has actually run against it,
-    # so a session never "learns" a product/material that turned out to
-    # be invalid.
-    remember_context(session_id, arguments)
+    # Only remember context once the tool has actually run against it
+    # AND found something -- see _found_nothing()'s docstring for the
+    # concrete failure mode this avoids.
+    if not _found_nothing(result):
+        remember_context(session_id, arguments)
 
     return result

@@ -13,7 +13,130 @@ Written as duck-typed shape matching (which keys are present) rather
 than router.py telling it which tool ran, on purpose -- it means this
 file can be deleted and rebuilt without touching router.py or the tools
 themselves at all.
+
+Tone, deliberately: reads like a warm boutique salesperson, not a
+form-letter bot -- but every word still traces back to a real field in
+the tool's result. Warmth is in phrasing and structure only, never in
+inventing a claim (a size, a price, a delivery estimate) the tool
+didn't actually return.
 """
+
+
+import re
+
+# Matches the karat digits at the start of any of the catalogue's real
+# material formats -- same pattern as recommendation_service.py's own
+# _extract_karat, duplicated rather than imported since this file is
+# meant to stay a standalone, deletable formatting layer (see module
+# docstring) with no dependency on how a tool produced its result.
+_KARAT_RE = re.compile(r"^\s*(\d+)\s*k?\b", re.IGNORECASE)
+
+
+def _extract_karat(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = _KARAT_RE.match(value)
+    return match.group(1) if match else None
+
+
+def _group_by_product(items: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Group catalogue entries sharing a product name, preserving first-seen
+    order. Exists because the same product often comes back as several
+    entries that only differ in their "material" field -- which sometimes
+    really is the material, but just as often encodes a size/variant
+    (see woocommerce_sync.py's _variation_label()). Grouping first means a
+    5-size ring reads as one product with size options, not five
+    look-alike lines a customer has to puzzle over."""
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for item in items:
+        name = item["product"]
+        if name not in groups:
+            groups[name] = []
+            order.append(name)
+        groups[name].append(item)
+    return [(name, groups[name]) for name in order]
+
+
+def _select_diverse_groups(
+    groups: list[tuple[str, list[dict]]], max_groups: int
+) -> list[tuple[str, list[dict]]]:
+    """Pick up to max_groups groups, round-robinning across categories
+    rather than just taking the first N in catalogue order.
+
+    Exists because data/products.json lists every Necklaces row before
+    any Rings row -- a plain [:4] slice on an unfiltered "what do you
+    have" browse (no category stated) always returned 4 necklaces and
+    never a single ring, hiding 96% of the real catalogue behind pure
+    file order. Round-robinning by category means a broad browse shows
+    a representative mix instead."""
+    if len(groups) <= max_groups:
+        return groups
+
+    buckets: dict[str, list[tuple[str, list[dict]]]] = {}
+    category_order: list[str] = []
+    for name, variants in groups:
+        category = variants[0].get("category") or ""
+        if category not in buckets:
+            buckets[category] = []
+            category_order.append(category)
+        buckets[category].append((name, variants))
+
+    selected: list[tuple[str, list[dict]]] = []
+    i = 0
+    while len(selected) < max_groups and any(buckets[c] for c in category_order):
+        category = category_order[i % len(category_order)]
+        if buckets[category]:
+            selected.append(buckets[category].pop(0))
+        i += 1
+    return selected
+
+
+# Above this many variants of one product, listing every size/karat is a
+# wall of text, not a readable answer -- a price range plus an invitation
+# to narrow down reads the way an actual salesperson would answer "what
+# rings do you have" (a broad "Rings" query with no karat/size stated can
+# genuinely match 3000+ raw catalogue rows for a handful of product names).
+_MAX_VARIANTS_LISTED = 3
+
+
+def _format_recommendation_group(name: str, variants: list[dict]) -> str:
+    if len(variants) == 1:
+        v = variants[0]
+        return f"- {name} ({v['material']}): GH₵{v['price']:,.2f}"
+
+    prices = [v["price"] for v in variants]
+    low, high = min(prices), max(prices)
+
+    if len(variants) <= _MAX_VARIANTS_LISTED:
+        if low == high:
+            options = ", ".join(v["material"] for v in variants)
+            return f"- {name}: GH₵{low:,.2f} -- available in {options}"
+        # Same small handful of variants, but not all the same price --
+        # can't collapse to one line without hiding a real price difference.
+        sub_lines = "\n".join(f"   * {v['material']}: GH₵{v['price']:,.2f}" for v in variants)
+        return f"- {name}:\n{sub_lines}"
+
+    # Only call it "karat" variance if it actually varies within this set
+    # -- if the customer already stated a karat (recommend_products
+    # filtered to it before this ever runs), every remaining variant
+    # shares that karat, and telling them it "comes in different karats"
+    # would be inaccurate, not just imprecise.
+    distinct_karats = {k for k in (_extract_karat(v["material"]) for v in variants) if k}
+    varies_by_karat = len(distinct_karats) > 1
+    unit = "sizes/karats" if varies_by_karat else "sizes"
+    ask = "size and karat" if varies_by_karat else "size"
+
+    if low == high:
+        return (
+            f"- {name}: GH₵{low:,.2f} -- comes in {len(variants)} {unit}, "
+            f"just tell me which you'd like and I'll confirm it"
+        )
+    qualifier = "karat/size" if varies_by_karat else "size"
+    return (
+        f"- {name}: GH₵{low:,.2f}-GH₵{high:,.2f} depending on {qualifier} "
+        f"({len(variants)} options) -- tell me your {ask} and I'll get you the exact price"
+    )
 
 
 def format_for_customer(result: dict | None) -> str:
@@ -36,7 +159,7 @@ def format_for_customer(result: dict | None) -> str:
         # get_product_price call reaches this function with nothing in
         # front of it -- same customer-facing message either way, rather
         # than crashing on `"error" in None`.
-        return "Sorry, we couldn't find that product."
+        return "Hmm, I couldn't find that one -- could you tell me a bit more about what you're after?"
 
     if "error" in result:
         return result["error"]
@@ -46,10 +169,11 @@ def format_for_customer(result: dict | None) -> str:
         # order awaiting the customer's explicit confirmation.
         p = result["proposal"]
         return (
-            f"{p['quantity']} x {p['material']} {p['product']} — GH₵{p['subtotal']:,.2f}. "
-            f"Delivery to {p['delivery_address']}: {p['delivery']['delivery_time']}, "
-            f"GH₵{p['delivery']['shipping_cost']} shipping. "
-            f"Total: GH₵{p['total']:,.2f}. Reply CONFIRM to place this order."
+            f"Lovely choice -- {p['quantity']} x {p['material']} {p['product']} comes to "
+            f"GH₵{p['subtotal']:,.2f}. Delivery to {p['delivery_address']} takes "
+            f"{p['delivery']['delivery_time']} (GH₵{p['delivery']['shipping_cost']} shipping), "
+            f"so you're looking at GH₵{p['total']:,.2f} in total. "
+            f"Just reply CONFIRM and I'll get that placed for you."
         )
 
     if "order_confirmation" in result:
@@ -58,8 +182,8 @@ def format_for_customer(result: dict | None) -> str:
         # collected -- see order_tool.py's module docstring).
         c = result["order_confirmation"]
         return (
-            f"Order #{c['order_id']} confirmed — GH₵{c['total']:,.2f}, "
-            f"delivering to {c['delivery_address']}. We'll be in touch about payment next."
+            f"All set -- order #{c['order_id']} is confirmed for GH₵{c['total']:,.2f}, "
+            f"delivering to {c['delivery_address']}. I'll follow up shortly about payment."
         )
 
     if "answer" in result:
@@ -73,24 +197,46 @@ def format_for_customer(result: dict | None) -> str:
     if "recommendations" in result:
         items = result["recommendations"]
         if not items:
-            return "I don't have anything matching that right now -- want me to check something else?"
-        lines = [f"- {p['product']} ({p['material']}): GH₵{p['price']:,.2f}" for p in items[:5]]
-        return "Here's what I found:\n" + "\n".join(lines)
+            # recommendation_service.py sends available_categories along
+            # when the customer's category genuinely isn't stocked (e.g.
+            # bracelets/earrings) -- a real salesperson says what they DO
+            # have instead of just "no", so do the same here rather than
+            # a flat dead end.
+            available = result.get("available_categories")
+            if available:
+                if len(available) == 1:
+                    listed = available[0]
+                else:
+                    listed = ", ".join(available[:-1]) + f" and {available[-1]}"
+                asked = result.get("requested_category", "that")
+                return (
+                    f"Hmm, I don't have any {asked} right now -- but I do have {listed}. "
+                    f"Want me to show you what's there?"
+                )
+            return "Hmm, I don't have anything matching that right now -- want me to show you something similar instead?"
+        groups = _select_diverse_groups(_group_by_product(items), max_groups=4)
+        lines = [_format_recommendation_group(name, variants) for name, variants in groups]
+        return (
+            "Here's what I found for you:\n\n"
+            + "\n\n".join(lines)
+            + "\n\nWant me to tell you more about any of these, show you a photo, or narrow it down by size or karat?"
+        )
 
     if "price" in result and "delivery" in result:
         delivery = result["delivery"]
         return (
-            f"The {result['material']} {result['product']} is GH₵{result['price']:,.2f}. "
-            f"Delivery is {delivery['delivery_time']}, GH₵{delivery['shipping_cost']} shipping."
+            f"Good news -- the {result['material']} {result['product']} is GH₵{result['price']:,.2f}. "
+            f"Delivery takes about {delivery['delivery_time']}, with GH₵{delivery['shipping_cost']} shipping. "
+            f"Want to go ahead with this one?"
         )
 
     if "price" in result:
-        return f"The {result['material']} {result['product']} is GH₵{result['price']:,.2f}."
+        return f"The {result['material']} {result['product']} is GH₵{result['price']:,.2f}. Want to know about delivery too?"
 
     if "delivery_time" in result:
-        return f"Delivery takes {result['delivery_time']}, shipping is GH₵{result['shipping_cost']}."
+        return f"Delivery usually takes {result['delivery_time']}, with shipping at GH₵{result['shipping_cost']}."
 
     # Unknown shape -- surface something rather than send nothing, but
     # this branch being hit means a new tool was added without updating
     # this file, worth noticing in logs, not just in a customer's chat.
-    return "Let me get back to you on that."
+    return "Hmm, let me get back to you on that one."

@@ -196,6 +196,49 @@ def test_route_customer_keeps_sessions_isolated(monkeypatch):
     assert result_b["material"] == "silver"
 
 
+def test_route_customer_does_not_remember_a_category_that_found_nothing(monkeypatch):
+    # Arrange: "what bracelets do you have" -- a real category word, but
+    # this store doesn't stock any, so recommend_products legitimately
+    # returns zero results (not an error, execute_tool doesn't raise).
+    # That empty category must not get remembered, or every vague
+    # follow-up in the session ("yeah lemme see", "show me something
+    # else") would silently inherit the dead category and stay stuck.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"material": "unknown", "category": "Bracelets"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"recommendations": [], "requested_category": "Bracelets", "available_categories": ["Necklaces", "Rings"]}),
+    )
+
+    # Act
+    router.route_customer("what bracelets do you have?", "session-empty-category")
+
+    # Assert: nothing was remembered from a call that found nothing
+    from services.memory import get_session_store
+    assert get_session_store().get("session-empty-category", "category") is None
+
+
+def test_route_customer_does_not_remember_a_product_price_lookup_that_found_nothing(monkeypatch):
+    # Same failure mode as above, via get_product_price's bare None return.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "unicorn pendant", "material": "unknown"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value=None))
+
+    # Act
+    router.route_customer("how much is the unicorn pendant?", "session-empty-product")
+
+    # Assert
+    from services.memory import get_session_store
+    assert get_session_store().get("session-empty-product", "product_name") is None
+
+
 def test_route_customer_injects_session_id_for_order_tools(monkeypatch):
     # Arrange: propose_order needs to know which customer's session it's
     # acting on, but that's never something the LLM returns -- see

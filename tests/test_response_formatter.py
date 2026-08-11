@@ -44,11 +44,126 @@ def test_formats_empty_recommendations():
     assert "don't have anything" in formatted.lower()
 
 
-def test_formats_recommendations_capped_at_five():
+def test_formats_empty_recommendations_with_available_categories():
+    # recommendation_service.py sends this shape when the customer's
+    # category genuinely isn't stocked (e.g. bracelets) -- should offer
+    # what IS available rather than a flat dead end.
+    result = {
+        "recommendations": [],
+        "requested_category": "Bracelets",
+        "available_categories": ["Necklaces", "Rings"],
+    }
+    formatted = format_for_customer(result)
+    assert "Bracelets" in formatted
+    assert "Necklaces" in formatted and "Rings" in formatted
+    assert "don't have anything" not in formatted.lower()
+
+
+def test_formats_recommendations_products_are_visually_separated():
+    # Distinct products must read as distinct points, not run together --
+    # a blank line between each is what makes that scannable on WhatsApp.
+    items = [
+        {"product": "Ring A", "material": "18k", "price": 100.0},
+        {"product": "Ring B", "material": "18k", "price": 200.0},
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    assert "Ring A" in formatted and "Ring B" in formatted
+    a_end = formatted.index("Ring A")
+    b_start = formatted.index("Ring B")
+    assert "\n\n" in formatted[a_end:b_start]
+
+
+def test_formats_recommendations_capped_at_four_products():
     items = [{"product": f"Ring {i}", "material": "18k", "price": 100.0 * i} for i in range(1, 8)]
     formatted = format_for_customer({"recommendations": items})
-    # 7 items in, only the first 5 should actually appear in the reply
-    assert formatted.count("Ring") == 5
+    # 7 distinct products in, only the first 4 should actually appear
+    assert formatted.count("Ring") == 4
+
+
+def test_formats_recommendations_lists_a_small_same_price_variant_set():
+    # Three sizes of the same ring, same price -- small enough to list
+    # every option directly rather than collapsing to a range
+    items = [
+        {"product": "Minimal White Stone Gold Ring, 1g", "material": f"US {size}", "price": 20628.0}
+        for size in ["8", "8.5", "9"]
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    assert formatted.count("Minimal White Stone Gold Ring, 1g") == 1
+    for size in ["US 8", "US 8.5", "US 9"]:
+        assert size in formatted
+    assert formatted.count("20,628.00") == 1
+
+
+def test_formats_recommendations_summarises_a_large_variant_set_as_a_range():
+    # A real "what rings do you have" query can match 30+ karat/size rows
+    # for one product name -- listing every one is a wall of text, not a
+    # readable reply, so a large set collapses to a price range instead
+    items = [
+        {"product": "Minimal White Stone Gold Ring, 1g", "material": f"US {size}", "price": price}
+        for size, price in [("8", 15127.20), ("8.5", 15127.20), ("9", 17877.60), ("9.5", 20628.00), ("13", 20628.00)]
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    assert formatted.count("Minimal White Stone Gold Ring, 1g") == 1
+    # The individual per-size lines must NOT all be listed out
+    assert "US 8.5" not in formatted
+    assert "15,127.20" in formatted and "20,628.00" in formatted
+    assert "5 options" in formatted
+
+
+def test_formats_recommendations_diversifies_across_categories():
+    # data/products.json lists every Necklaces row before any Rings row --
+    # an unfiltered browse must not silently show 4 necklaces and zero
+    # rings just because of catalogue file order.
+    necklaces = [
+        {"product": f"Necklace {i}", "material": "18k", "price": 100.0, "category": "Necklaces"}
+        for i in range(1, 10)
+    ]
+    rings = [
+        {"product": f"Ring {i}", "material": "18k", "price": 100.0, "category": "Rings"}
+        for i in range(1, 10)
+    ]
+    formatted = format_for_customer({"recommendations": necklaces + rings})
+    assert "Ring 1" in formatted, "an unfiltered browse must surface rings too, not just necklaces"
+    assert "Necklace 1" in formatted
+
+
+def test_formats_recommendations_omits_karat_wording_when_karat_already_fixed():
+    # Customer already asked for 18k specifically -- recommend_products
+    # filtered to only 18k rows before this ever runs, so every remaining
+    # variant shares that karat. Saying "sizes/karats" here would be
+    # inaccurate, not just imprecise.
+    items = [
+        {"product": "Minimal Ring", "material": f"18 / Women US {size} (21.4 mm)", "price": 100.0}
+        for size in ["8", "9", "10", "11", "12"]
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    # The product line itself must not claim karat variance that doesn't
+    # exist -- the generic closing "or karat?" invite is a separate,
+    # always-present footer and isn't what's under test here.
+    product_line = formatted.split("Want me to tell you more")[0]
+    assert "karat" not in product_line.lower()
+    assert "sizes" in product_line.lower()
+
+
+def test_formats_recommendations_keeps_karat_wording_when_karat_varies():
+    items = [
+        {"product": "Minimal Ring", "material": f"{karat} / Women US 12 (21.4 mm)", "price": 100.0}
+        for karat in ["14", "18", "22", "12", "9"]
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    assert "karat" in formatted.lower()
+
+
+def test_formats_recommendations_keeps_variants_with_different_prices_separate():
+    items = [
+        {"product": "Custom Worded Gold Ring", "material": "5g", "price": 6303.0},
+        {"product": "Custom Worded Gold Ring", "material": "8g", "price": 8595.0},
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    # Both real prices must survive -- collapsing to one price would hide
+    # a genuine price difference from the customer
+    assert "6,303.00" in formatted
+    assert "8,595.00" in formatted
 
 
 # ---------------------------------------------------------------------

@@ -28,6 +28,31 @@ logger = logging.getLogger(__name__)
 # formats: "18k", "18", or the Rings compound "18 / Women US 12 (21.4 mm)".
 _KARAT_RE = re.compile(r"^\s*(\d+)\s*k?\b", re.IGNORECASE)
 
+# Code-level safety net for category matching, deliberately not left to
+# the LLM prompt alone -- the prompt (services/llm.py) now tells the
+# model to map "chain"/"necklace"/"pendant" onto "Necklaces", but prompt
+# compliance is never guaranteed, and a plain plural/singular mismatch
+# ("Necklace" vs the catalogue's "Necklaces") would silently return zero
+# results even when the LLM extracted a perfectly reasonable category.
+# Deterministic code should guarantee this, not a hope that the model
+# phrased it exactly right.
+_CATEGORY_SYNONYMS = {
+    "chain": "necklaces",
+    "chains": "necklaces",
+    "necklace": "necklaces",
+    "necklaces": "necklaces",
+    "pendant": "necklaces",
+    "pendants": "necklaces",
+    "ring": "rings",
+    "rings": "rings",
+    "band": "rings",
+    "bands": "rings",
+    "wedding ring": "rings",
+    "wedding rings": "rings",
+    "engagement ring": "rings",
+    "engagement rings": "rings",
+}
+
 
 def _extract_karat(value: str | None) -> str | None:
     if not value:
@@ -38,6 +63,11 @@ def _extract_karat(value: str | None) -> str | None:
 
 def _is_unset(value: str | None) -> bool:
     return not value or value.strip().lower() == "unknown"
+
+
+def _normalize_category(value: str) -> str:
+    key = value.strip().lower()
+    return _CATEGORY_SYNONYMS.get(key, key)
 
 
 def recommend_products(material: str = "unknown", category: str = "unknown") -> dict:
@@ -54,11 +84,30 @@ def recommend_products(material: str = "unknown", category: str = "unknown") -> 
     recommendations = products
 
     if not _is_unset(category):
-        target_category = category.strip().lower()
+        target_category = _normalize_category(category)
         recommendations = [
             p for p in recommendations
-            if (p.get("category") or "").strip().lower() == target_category
+            if _normalize_category(p.get("category") or "") == target_category
         ]
+        if not recommendations:
+            # The category itself matched nothing stocked -- more useful
+            # to a customer than a flat "no results" is telling them what
+            # we actually carry, the way a real salesperson would ("we
+            # don't do bracelets, but here's our rings and necklaces").
+            available = sorted({
+                (p.get("category") or "").strip()
+                for p in products
+                if p.get("category")
+            })
+            logger.info(
+                "No recommendations found for category=%s (available categories: %s)",
+                category, available,
+            )
+            return {
+                "recommendations": [],
+                "requested_category": category,
+                "available_categories": available,
+            }
 
     # A generic metal word ("gold") has no karat digits to extract --
     # correctly falls through to "no karat filter" rather than matching
