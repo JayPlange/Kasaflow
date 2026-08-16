@@ -43,6 +43,28 @@ def test_keyword_overlap_zero_when_nothing_shared():
     assert _keyword_overlap("platinum watch", "Gold Ring, 5g") == 0
 
 
+def test_keyword_overlap_ignores_bare_letter_fragments_from_karat_and_weight():
+    # product_tool.py builds queries as "{material} {product_name}" --
+    # karats/weights are almost always digits+letter ("14k", "15g"), and
+    # _WORD_RE only matches letters, so those become bare single-letter
+    # tokens ("k", "g") once the digits are stripped. Below the minimum
+    # length, the substring-tolerant check is actively wrong: "g" is a
+    # substring of nearly every product name in this catalogue (weights
+    # are almost always "...Ng"), so a real product's own "16g" suffix
+    # would otherwise spuriously "match" a query word like "big" that
+    # has nothing to do with it (confirmed live, 2026-08-13: exactly this
+    # let an unrelated ring outrank -- and nearly get ordered instead of
+    # -- the ring the customer actually asked for).
+    query = "14k Big Stone Yellow Gold Ring, 15g"
+    correct = "Big Stone Yellow Gold Ring, 15g"
+    wrong = "Sparkling Small Stone Yellow Gold Ring, 16g"
+
+    assert _keyword_overlap(query, correct) > _keyword_overlap(query, wrong)
+    # Specifically: "k" and "g" alone must never count as real overlap
+    assert _keyword_overlap("14k", "Big Stone Yellow Gold Ring, 15g") == 0
+    assert _keyword_overlap("15g", "Sparkling Small Stone Yellow Gold Ring, 16g") == 0
+
+
 # ---------------------------------------------------------------------
 # ProductIndex.search: the real behaviour that motivated this file --
 # see _keyword_overlap's docstring for the actual measured case

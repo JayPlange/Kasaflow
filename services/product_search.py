@@ -50,6 +50,28 @@ def _searchable_text(entry: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
+# _WORD_RE only matches letters, so a query like "14k Big Stone Yellow
+# Gold Ring, 15g" (product_tool.py builds queries as "{material}
+# {product_name}", and karats/weights are almost always written as
+# digits+letter) tokenizes the digits away entirely, leaving bare
+# single-letter fragments like "k" and "g". Below this length, the
+# substring-tolerant check two lines down becomes actively wrong rather
+# than lenient: "g" is a substring of nearly every product name in a
+# jewellery catalogue (weights are almost always "...Ng"), so a query
+# for one specific ring was scoring a real, unrelated ring *higher* than
+# the correct one purely because its name happened to contain a "g" or
+# a "k" somewhere -- confirmed live, 2026-08-13: a customer asked for
+# "Big Stone Yellow Gold Ring, 15g" in 14k, an exact match this store
+# genuinely has, and got quoted and nearly ordered a completely
+# different item ("Sparkling Small Stone Yellow Gold Ring, 16g")
+# instead, because "big" spuriously matched via a bare "g" fragment in
+# the wrong product's own "16g" weight suffix. Filtering out anything
+# shorter than 3 letters removes the fragments without weakening the
+# real substring tolerance this function still needs for genuine partial
+# words like "bracelet"/"Bracelets".
+_MIN_KEYWORD_LENGTH = 3
+
+
 def _keyword_overlap(query: str, product_name: str) -> int:
     """How many of the query's words literally appear in this product's
     name (substring-tolerant both ways, so "bracelet" still counts
@@ -63,8 +85,8 @@ def _keyword_overlap(query: str, product_name: str) -> int:
     that merely sounds similar in embedding space but doesn't actually
     say "chain" anywhere in its name.
     """
-    query_words = set(_WORD_RE.findall(query.lower()))
-    name_words = set(_WORD_RE.findall(product_name.lower()))
+    query_words = {w for w in _WORD_RE.findall(query.lower()) if len(w) >= _MIN_KEYWORD_LENGTH}
+    name_words = {w for w in _WORD_RE.findall(product_name.lower()) if len(w) >= _MIN_KEYWORD_LENGTH}
     return sum(
         1
         for qw in query_words
