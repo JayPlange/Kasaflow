@@ -36,6 +36,16 @@ def _woocommerce_settings(monkeypatch, **overrides):
         woocommerce_url="https://adomdejeweller.com",
         woocommerce_orders_consumer_key="ck_test",
         woocommerce_orders_consumer_secret="cs_test",
+        # Explicitly cleared, not left to whatever's in the real .env --
+        # this repo now has a real STAFF_NOTIFICATION_PHONE configured
+        # (needed for the live store), and without this override every
+        # test using this helper would silently start firing real
+        # send_text_message() calls through the module-global `requests`
+        # mock, changing call counts in tests that never meant to
+        # exercise notification at all. Tests that actually want to
+        # assert notification behaviour pass staff_notification_phone=
+        # explicitly via **overrides, same as before.
+        staff_notification_phone=None,
     )
     defaults.update(overrides)
     monkeypatch.setattr(order_tool, "settings", replace(order_tool.settings, **defaults))
@@ -213,6 +223,43 @@ def test_propose_order_returns_error_when_product_missing_woocommerce_id(monkeyp
     assert "error" in result
 
 
+def test_propose_order_records_last_action_outcome_when_product_missing_woocommerce_id(monkeypatch):
+    # Arrange: this is the one propose_order failure a customer did
+    # nothing wrong to cause -- see memory.set_last_action_outcome()'s
+    # docstring for why a follow-up "why?" needs this recorded
+    _mock_product_lookup(
+        monkeypatch,
+        {"product": "Ring", "material": "18k", "price": 1200.0},  # no "id"
+    )
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(order_tool, "set_last_action_outcome", set_last_action_outcome)
+
+    # Act
+    order_tool.propose_order("ring", "18k", 1, "Accra", "accra_rider", "session-1")
+
+    # Assert
+    set_last_action_outcome.assert_called_once()
+    session_id, outcome = set_last_action_outcome.call_args[0]
+    assert session_id == "session-1"
+    assert outcome["action"] == "propose_order"
+    assert "customer_safe_explanation" in outcome
+
+
+def test_propose_order_does_not_record_last_action_outcome_for_a_recoverable_prompt(monkeypatch):
+    # Arrange: a plain "how many would you like?" is self-explanatory --
+    # only the genuinely unrecoverable failure above needs this
+    lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(order_tool, "set_last_action_outcome", set_last_action_outcome)
+
+    # Act
+    order_tool.propose_order("ring", "18k", "unknown", "Accra", "accra_rider", "session-1")
+
+    # Assert
+    set_last_action_outcome.assert_not_called()
+    lookup.assert_not_called()
+
+
 # ---------------------------------------------------------------------
 # get_pending_order_summary
 # ---------------------------------------------------------------------
@@ -387,6 +434,29 @@ def test_confirm_order_resets_to_pending_on_woocommerce_failure(monkeypatch, fre
     assert pending["status"] == "pending"
 
 
+def test_confirm_order_records_last_action_outcome_on_a_non_timeout_failure(monkeypatch, fresh_session_store):
+    # Arrange: same failure as above, checking the other branch that sets
+    # the same shared outcome constant
+    _woocommerce_settings(monkeypatch)
+    monkeypatch.setattr(order_tool.requests, "post", MagicMock(side_effect=RuntimeError("connection reset")))
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(order_tool, "set_last_action_outcome", set_last_action_outcome)
+    fresh_session_store.set(
+        "session-1", order_tool._PENDING_ORDER_KEY,
+        {"token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+         "product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0, "delivery_address": "Accra"},
+    )
+
+    # Act
+    order_tool.confirm_order("session-1")
+
+    # Assert
+    set_last_action_outcome.assert_called_once()
+    session_id, outcome = set_last_action_outcome.call_args[0]
+    assert session_id == "session-1"
+    assert outcome["action"] == "confirm_order"
+
+
 def test_confirm_order_recovers_from_timeout_when_order_was_actually_created(monkeypatch, fresh_session_store):
     # Arrange: the POST times out (response lost), but WooCommerce
     # actually created the order -- the lookup should find it and
@@ -444,6 +514,38 @@ def test_confirm_order_falls_back_to_pending_when_timeout_lookup_finds_nothing(m
     assert "error" in result
     pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
     assert pending["status"] == "pending"
+
+
+def test_confirm_order_records_last_action_outcome_on_unresolved_timeout(monkeypatch, fresh_session_store):
+    # Arrange: same scenario as above -- a genuine, unrecoverable-by-the-
+    # customer failure a follow-up "why?" needs explained honestly
+    _woocommerce_settings(monkeypatch)
+    monkeypatch.setattr(
+        order_tool.requests, "post",
+        MagicMock(side_effect=order_tool.requests.exceptions.Timeout("timed out")),
+    )
+    fake_get_response = MagicMock()
+    fake_get_response.raise_for_status.return_value = None
+    fake_get_response.json.return_value = []
+    monkeypatch.setattr(order_tool.requests, "get", MagicMock(return_value=fake_get_response))
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(order_tool, "set_last_action_outcome", set_last_action_outcome)
+
+    fresh_session_store.set(
+        "session-1", order_tool._PENDING_ORDER_KEY,
+        {"token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+         "product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0, "delivery_address": "Accra"},
+    )
+
+    # Act
+    order_tool.confirm_order("session-1")
+
+    # Assert
+    set_last_action_outcome.assert_called_once()
+    session_id, outcome = set_last_action_outcome.call_args[0]
+    assert session_id == "session-1"
+    assert outcome["action"] == "confirm_order"
+    assert "customer_safe_explanation" in outcome
 
 
 def test_confirm_order_does_not_look_up_on_non_timeout_failures(monkeypatch, fresh_session_store):
@@ -625,3 +727,240 @@ def test_confirm_order_does_not_renotify_staff_on_a_duplicate_confirm(monkeypatc
 
     # Assert
     send_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# cancel_order -- see order_tool.py's cancel_order() docstring: prefers
+# an explicit order number, falls back to this session's last confirmed
+# order, and always re-checks the order's live WooCommerce status rather
+# than trusting what this session last knew about it.
+# ---------------------------------------------------------------------
+
+def _mock_get_order(monkeypatch, status="on-hold", order_id=6846, status_code=200):
+    fake_response = MagicMock()
+    fake_response.status_code = status_code
+    fake_response.raise_for_status.return_value = None
+    fake_response.json.return_value = {"id": order_id, "status": status}
+    fake_get = MagicMock(return_value=fake_response)
+    monkeypatch.setattr(order_tool.requests, "get", fake_get)
+    return fake_get
+
+
+def _mock_put(monkeypatch, status_code=200):
+    fake_response = MagicMock()
+    fake_response.status_code = status_code
+    fake_response.raise_for_status.return_value = None
+    fake_put = MagicMock(return_value=fake_response)
+    monkeypatch.setattr(order_tool.requests, "put", fake_put)
+    return fake_put
+
+
+def test_cancel_order_succeeds_with_an_explicit_order_id(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+    fake_put = _mock_put(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert: cancelled the exact order the customer named
+    assert result["order_cancellation"]["order_id"] == 6846
+    _, kwargs = fake_put.call_args
+    assert kwargs["json"] == {"status": "cancelled"}
+    assert "/orders/6846" in fake_put.call_args[0][0]
+
+
+def test_cancel_order_falls_back_to_last_confirmed_order_when_no_id_given(monkeypatch, fresh_session_store):
+    # Arrange: the LLM passes "unknown" when the customer didn't state a
+    # number -- see llm.py's cancel_order guidance
+    _woocommerce_settings(monkeypatch)
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 6846, "total": 1200.0, "delivery_address": "Accra", "delivery_option_label": "rider delivery within Accra"},
+    )
+    fake_get = _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+    _mock_put(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="unknown")
+
+    # Assert
+    assert result["order_cancellation"]["order_id"] == 6846
+    assert "/orders/6846" in fake_get.call_args[0][0]
+
+
+def test_cancel_order_asks_for_a_number_when_nothing_is_on_file(monkeypatch, fresh_session_store):
+    # Arrange: no order_id given, and nothing to fall back to either
+    _woocommerce_settings(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="unknown")
+
+    # Assert
+    assert "error" in result
+    assert "order number" in result["error"].lower()
+
+
+def test_cancel_order_returns_none_resolved_id_for_an_unparseable_order_id(monkeypatch, fresh_session_store):
+    # Arrange: a garbled order number -- deliberately does NOT fall back
+    # to last_confirmed_order, since the customer did name something,
+    # just not something usable (see _resolve_order_id())
+    _woocommerce_settings(monkeypatch)
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 6846, "total": 1200.0, "delivery_address": "Accra", "delivery_option_label": None},
+    )
+    fake_get = _mock_get_order(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="order number six")
+
+    # Assert
+    assert "error" in result
+    fake_get.assert_not_called()
+
+
+def test_cancel_order_reports_not_found_for_a_404(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status_code=404)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="9999")
+
+    # Assert
+    assert "error" in result
+    assert "9999" in result["error"]
+
+
+def test_cancel_order_is_idempotent_when_already_cancelled(monkeypatch, fresh_session_store):
+    # Arrange: a duplicated "cancel" message, most likely -- same
+    # WhatsApp-delivery-duplication rationale as confirm_order()'s own
+    # idempotency handling above
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="cancelled", order_id=6846)
+    fake_put = _mock_put(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert: reported as already-cancelled, never re-issues the cancel write
+    assert result == {"order_already_cancelled": {"order_id": 6846}}
+    fake_put.assert_not_called()
+
+
+def test_cancel_order_escalates_a_non_cancellable_status_and_notifies_staff(monkeypatch, fresh_session_store):
+    # Arrange: e.g. already shipped/completed/refunded -- not a status
+    # this tool will touch automatically (see _CANCELLABLE_STATUSES)
+    _woocommerce_settings(monkeypatch, staff_notification_phone="233509764406")
+    _mock_get_order(monkeypatch, status="completed", order_id=6846)
+    fake_put = _mock_put(monkeypatch)
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    result = order_tool.cancel_order("session-233500000000", order_id="6846")
+
+    # Assert: handed to staff, not silently refused or force-cancelled
+    assert result == {"order_escalation": {"order_id": 6846, "status": "completed"}}
+    fake_put.assert_not_called()
+    send_mock.assert_called_once()
+    to, body = send_mock.call_args[0]
+    assert to == "233509764406"
+    assert "6846" in body
+    assert "completed" in body
+
+
+def test_cancel_order_escalation_warns_but_does_not_fail_when_staff_phone_not_configured(monkeypatch, fresh_session_store, caplog):
+    # Arrange: no staff_notification_phone -- config gap, not the
+    # customer's problem, same principle as confirm_order()'s own
+    # staff-notification tests above
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="completed", order_id=6846)
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert
+    assert result == {"order_escalation": {"order_id": 6846, "status": "completed"}}
+    send_mock.assert_not_called()
+
+
+def test_cancel_order_reports_a_clean_error_when_the_lookup_fails(monkeypatch, fresh_session_store):
+    # Arrange: a genuine WooCommerce/network failure, not a 404
+    _woocommerce_settings(monkeypatch)
+    monkeypatch.setattr(order_tool.requests, "get", MagicMock(side_effect=RuntimeError("connection reset")))
+    fake_put = _mock_put(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert
+    assert "error" in result
+    fake_put.assert_not_called()
+
+
+def test_cancel_order_reports_a_clean_error_when_the_cancel_write_fails(monkeypatch, fresh_session_store):
+    # Arrange: order is found and cancellable, but the PUT itself fails
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+    monkeypatch.setattr(order_tool.requests, "put", MagicMock(side_effect=RuntimeError("connection reset")))
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert: never claims success, never notifies staff of a cancellation
+    # that didn't actually happen
+    assert "error" in result
+    send_mock.assert_not_called()
+
+
+def test_cancel_order_notifies_staff_and_clears_last_confirmed_on_success(monkeypatch, fresh_session_store):
+    # Arrange: cancelling the session's own last-confirmed order should
+    # clear that fallback -- see cancel_order()'s docstring on why it's
+    # no longer the right order to fall back to afterwards
+    _woocommerce_settings(monkeypatch, staff_notification_phone="233509764406")
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 6846, "total": 1200.0, "delivery_address": "Accra", "delivery_option_label": "rider delivery within Accra"},
+    )
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+    _mock_put(monkeypatch)
+    send_mock = MagicMock()
+    monkeypatch.setattr(order_tool, "send_text_message", send_mock)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert
+    assert result == {"order_cancellation": {"order_id": 6846}}
+    send_mock.assert_called_once()
+    to, body = send_mock.call_args[0]
+    assert to == "233509764406"
+    assert "6846" in body
+    assert "session-1" in body
+    assert fresh_session_store.get("session-1", order_tool._LAST_CONFIRMED_KEY) is None
+
+
+def test_cancel_order_does_not_clear_last_confirmed_when_cancelling_a_different_order(monkeypatch, fresh_session_store):
+    # Arrange: session's last confirmed order is #111, but the customer
+    # explicitly names a different order (#6846) to cancel -- #111 is
+    # still the right fallback for a future bare "cancel my order"
+    _woocommerce_settings(monkeypatch)
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 111, "total": 500.0, "delivery_address": "Accra", "delivery_option_label": None},
+    )
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+    _mock_put(monkeypatch)
+
+    # Act
+    order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert
+    assert fresh_session_store.get("session-1", order_tool._LAST_CONFIRMED_KEY)["order_id"] == 111

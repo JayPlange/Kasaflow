@@ -106,7 +106,12 @@ Arguments:
 - none
 Use this ONLY when the customer is clearly confirming an order that was already proposed to them earlier in this conversation -- for example "yes", "confirm", "go ahead", "place the order". Never call this from a message that hasn't already seen a proposed order; there is nothing to confirm without one.
 
-8. converse
+8. cancel_order
+Arguments:
+- order_id
+Use this when the customer wants to cancel an order they already placed -- "cancel my order", "cancel order 6846", "I don't want it anymore". If they stated an order number, pass it as `order_id`. If they didn't (e.g. "cancel my order" with no number), set `order_id` to "unknown" -- the system will look up their most recent confirmed order for you; never invent a number. This is only for cancelling an order that was already confirmed -- if nothing has been confirmed yet in this conversation, a "cancel" style message more likely means they want to stop what they were doing, not this tool; use converse for that instead.
+
+9. converse
 Arguments:
 - reply
 Use this for messages that are purely conversational and need no business tool at all: greetings ("hey", "hi", "good morning"), farewells, thanks ("medaase"), casual acknowledgements ("okay", "nice", "haha"), reactions and emojis, light humour, and simple social questions ("how are you?"). This is the ONLY tool where you write the actual customer-facing reply yourself, as the `reply` argument -- there is no deterministic tool behind it, because there is no business fact to look up. Keep it natural, warm, and concise -- a short, casual sentence or two, not a list of everything you can do. Match the customer's language (English, Twi, or a natural mix of both). Never mention tools, JSON, databases, or system/error states in the reply.
@@ -114,9 +119,11 @@ Use this for messages that are purely conversational and need no business tool a
 Do NOT use converse when:
 - the customer asks about a product, price, availability, delivery, or policy -- those need the matching tool above, even if the message is short or casual in tone.
 - the customer names, repeats, or otherwise identifies a specific catalogue item in any way -- even with no question mark, no "how much"/"show me", just the item's name on its own (e.g. a customer typing back a product name from something you showed them a moment ago). That is them telling you which item they mean, not making conversation -- call get_product_price with that product_name immediately. Do not respond by asking what they'd like to do with it; ask that only if it is genuinely still unclear after using this turn's context (see the pending-intent context below, if present).
-- the customer's message is a vague product-adjacent ask with nothing named yet -- "can I see a photo", "show me pictures", "how much is it" -- and there is no clearer signal in the message. These ARE business requests, just ones missing a detail. Call the matching tool anyway (get_product_price with product_name "unknown") rather than asking your own clarifying question through converse; the system already has a dedicated mechanism for resolving a missing product name (from memory, or from the pending-intent context below), and a canned clarifying reply from that path is preferable to converse improvising one.
-- the customer wants a recommendation, wants to place/change/confirm an order, or is answering a question this assistant itself just asked while an order was being collected (see any pending-order / partial-order context below, if present) -- those must go to the matching business tool, not converse, no matter how short the reply looks.
+- the customer's message is a vague product-adjacent ask with nothing named yet -- "can I see a photo", "show me pictures", "how much is it" -- and there is no clearer signal in the message. These ARE business requests, just ones missing a detail. If the message names or clearly implies a catalogue CATEGORY (e.g. "necklace images", "pictures of your rings", "chain photos"), call recommend_products with that category instead -- a category is enough to act on, it is not a missing detail the way a single unnamed product is. Only when there is truly no product AND no category to go on (e.g. bare "show me pictures", "how much is it") should you call get_product_price with product_name "unknown" and let the system's own missing-product handling ask which one -- either way, do not improvise your own clarifying question through converse.
+- the customer wants a recommendation, wants to place/change/confirm/cancel an order, or is answering a question this assistant itself just asked while an order was being collected (see any pending-order / partial-order context below, if present) -- those must go to the matching business tool, not converse, no matter how short the reply looks.
 - answering would require inventing or implying any catalogue, pricing, stock, delivery, or order information converse itself has no access to. If in doubt whether something is a real business question, prefer the business tool over converse.
+
+Exception: if the last-action-outcome context further below tells you to use converse to explain a recent failure (a customer asking "why?" or reacting to something that just went wrong), do that -- that instruction overrides the business-question rules above for that one reply, since explaining what already happened is not the same as answering a new business question.
 
 Examples:
 
@@ -147,6 +154,18 @@ Customer: "this Set Multi Stone Golf Ring, 7g" (just naming a product, no questi
 Customer: "yeah i wanna see pictures" (nothing specific named yet)
 -> NOT converse. Use get_product_price with product_name "unknown" -- let the system's own missing-product handling ask which one, don't improvise that question yourself.
 
+Customer: "necklace images" (a category, not a specific product)
+-> NOT converse, and NOT get_product_price. Use recommend_products with category "Necklaces" -- a category is enough to act on immediately.
+
+Customer: "why?" (right after being told an order/action failed)
+-> converse, using the last-action-outcome context below to explain the real reason -- do not say you haven't seen anything, and do not guess a different reason.
+
+Customer: "cancel my order" (no number given)
+{{"tool": "cancel_order", "arguments": {{"order_id": "unknown"}}}}
+
+Customer: "please cancel order 6846"
+{{"tool": "cancel_order", "arguments": {{"order_id": "6846"}}}}
+
 Rules:
 
 - If the customer asks only for a price, use get_product_price.
@@ -157,6 +176,7 @@ Rules:
 - If the customer is asking about returns, warranty, sizing, care, engraving, or payment methods, use answer_policy_question.
 - If the customer wants to actually place an order and has given enough detail, use propose_order.
 - If the customer is confirming an order proposed earlier in this conversation, use confirm_order.
+- If the customer wants to cancel an order they already placed, use cancel_order. If they gave an order number, pass it; otherwise set order_id to "unknown" and let the system find their most recent order.
 - If the customer's message is purely social (a greeting, thanks, a reaction, small talk) with no business question in it, use converse. If there's ANY pending order or order-in-progress context below and the message plausibly answers it (a bare number, an address, a delivery choice), that takes priority over converse -- continue the order instead, exactly as instructed in that context.
 - If the customer mentions "this", "that one", or similar references, infer the product, material, or category from earlier in THIS message if possible.
 - If a tool needs product_name, material, or category and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
@@ -237,6 +257,8 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {pending_intent_state}
 
+{last_action_outcome_state}
+
 Customer:
 {message}
 """
@@ -313,9 +335,14 @@ def _order_draft_state_line(order_draft: dict | None) -> str:
         f"Still missing: {missing_text}. If their current message is short and only makes "
         f"sense as answering one of the missing pieces (a bare number for quantity, a bare "
         f"address, \"Accra\"/\"Kumasi\"/\"ship it\"/\"outside Ghana\" for delivery option), "
-        f"treat it as continuing this order: use propose_order, keep every already-known "
-        f"value exactly as given above, and fill in the new piece from their message. Don't "
-        f"ask them to repeat anything already known, and don't restart with a different tool."
+        f"treat it as continuing this order: use propose_order, fill in the new piece from "
+        f"their message, and keep every OTHER already-known value exactly as given above. "
+        f"Exception: if their current message clearly states a different value for one of "
+        f"the already-known fields instead -- a correction, e.g. \"sorry, Kumasi not Accra\", "
+        f"or a different quantity/address than what's listed above -- use their new value for "
+        f"that field, not the old one; do not silently keep a value they just corrected. Don't "
+        f"ask them to repeat anything they haven't changed, and don't restart with a different "
+        f"tool."
     )
 
 
@@ -338,7 +365,7 @@ def _pending_intent_state_line(pending_intent: str | None) -> str:
     unresolved intent. Without this line, the customer's next message
     naming the product (e.g. "this Set Multi Stone Golf Ring, 7g") looks,
     in isolation, like they're just repeating a name with no clear ask --
-    and converse (see llm.py's tool 8) or another clarifying question can
+    and converse (see llm.py's tool 9) or another clarifying question can
     swallow it instead of actually completing the lookup the customer
     already asked for (confirmed live, 2026-08-13: the customer had to
     name the product twice, then got told "I couldn't find that one",
@@ -358,17 +385,50 @@ def _pending_intent_state_line(pending_intent: str | None) -> str:
     )
 
 
+def _last_action_outcome_state_line(last_action_outcome: dict | None) -> str:
+    """Describes a genuine, unrecoverable failure of a real business
+    action the customer just tried -- not a "still missing a detail"
+    prompt (those are self-explanatory and covered by
+    _order_draft_state_line() above), but something that failed for a
+    real reason with nothing the customer could have done differently.
+
+    Exists because a customer's very next message after a failure like
+    that is very often "why?", or confusion/frustration expressed some
+    other way -- and without this, understand_customer() has no idea a
+    failure even happened a moment ago (confirmed live, 2026-08-13: "why?"
+    got "could you clarify what you mean", and the very next message got
+    told "I haven't seen any order from you yet" -- an outright false
+    claim, since an order attempt had just failed, not never happened).
+    See memory.set_last_action_outcome()/get_last_action_outcome()."""
+    if not last_action_outcome:
+        return ""
+    explanation = last_action_outcome.get("customer_safe_explanation")
+    if not explanation:
+        return ""
+    return (
+        f"The last thing this customer tried just failed, for a real reason: {explanation} "
+        f"If their current message is asking why, expressing confusion, or reacting to that "
+        f"failure in any way (\"why?\", \"why not?\", \"oh wow\", \"sigh\", or similar), use "
+        f"converse and explain using that exact reason. Do not claim nothing happened, do not "
+        f"say you haven't seen anything from them, and do not invent a different reason. If "
+        f"their current message is clearly about something else entirely, ignore this and "
+        f"proceed normally."
+    )
+
+
 def _build_prompt(
     message: str,
     pending_order: dict | None,
     order_draft: dict | None,
     pending_intent: str | None = None,
+    last_action_outcome: dict | None = None,
 ) -> str:
     return _PROMPT_TEMPLATE.format(
         message=message,
         pending_order_state=_pending_order_state_line(pending_order),
         order_draft_state=_order_draft_state_line(order_draft),
         pending_intent_state=_pending_intent_state_line(pending_intent),
+        last_action_outcome_state=_last_action_outcome_state_line(last_action_outcome),
     )
 
 
@@ -377,6 +437,7 @@ def _call_llm(
     pending_order: dict | None,
     order_draft: dict | None,
     pending_intent: str | None = None,
+    last_action_outcome: dict | None = None,
 ) -> str:
     """Call the model with retries on transient failures only.
 
@@ -390,7 +451,7 @@ def _call_llm(
         try:
             response = client.responses.create(
                 model=settings.openai_model,
-                input=_build_prompt(message, pending_order, order_draft, pending_intent),
+                input=_build_prompt(message, pending_order, order_draft, pending_intent, last_action_outcome),
                 timeout=settings.llm_timeout_seconds,
             )
             return response.output_text
@@ -463,6 +524,7 @@ def understand_customer(
     pending_order: dict | None = None,
     order_draft: dict | None = None,
     pending_intent: str | None = None,
+    last_action_outcome: dict | None = None,
 ) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
@@ -475,11 +537,16 @@ def understand_customer(
 
     pending_intent is one step earlier again -- a product lookup the
     customer asked for but hadn't named a product for yet (see
-    memory.get_pending_intent() and _pending_intent_state_line())."""
+    memory.get_pending_intent() and _pending_intent_state_line()).
+
+    last_action_outcome is a different axis entirely -- not "still
+    missing something", but a real business action that was already
+    fully specified and still failed (see memory.get_last_action_outcome()
+    and _last_action_outcome_state_line())."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
-    raw_text = _call_llm(message, pending_order, order_draft, pending_intent)
+    raw_text = _call_llm(message, pending_order, order_draft, pending_intent, last_action_outcome)
     logger.info("Raw LLM output: %s", raw_text)
 
     return _parse_tool_request(raw_text)

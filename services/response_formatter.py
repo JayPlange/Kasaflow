@@ -215,12 +215,51 @@ def format_for_customer(result: dict | None) -> str:
         # itself has also been handed to a human to arrange delivery
         # (see confirm_order()'s staff notification) -- say so, rather
         # than implying delivery is already sorted.
+        #
+        # "placed", not "confirmed": "confirmed" implies a finished,
+        # settled transaction, but nothing has been paid or scheduled
+        # yet -- that's still ahead, via staff. Confirmed live,
+        # 2026-08-14, that the stronger word reads as overpromising once
+        # you're actually looking at what state the order is really in.
         c = result["order_confirmation"]
         delivery_label = c.get("delivery_option_label") or "your chosen delivery option"
         return (
-            f"All set -- *order #{c['order_id']}* is confirmed for *GH₵{c['total']:,.2f}*, "
+            f"All set -- *order #{c['order_id']}* has been placed for *GH₵{c['total']:,.2f}*, "
             f"delivering to {c['delivery_address']} via {delivery_label}. Our team will be in "
-            f"touch shortly to arrange the delivery and payment."
+            f"touch shortly to arrange payment and delivery."
+        )
+
+    if "order_cancellation" in result:
+        # order_tool.cancel_order()'s success shape.
+        c = result["order_cancellation"]
+        return (
+            f"Done -- *order #{c['order_id']}* has been cancelled. Let me know if you'd like "
+            f"to place a new one."
+        )
+
+    if "order_already_cancelled" in result:
+        # order_tool.cancel_order()'s idempotent-repeat shape -- the
+        # order's live WooCommerce status was already "cancelled" before
+        # this request, most likely a duplicated customer message
+        # ("cancel" sent twice) or a repeat after staff already
+        # actioned it. Say so plainly rather than trying to cancel it
+        # again.
+        c = result["order_already_cancelled"]
+        return f"Order *#{c['order_id']}* is already cancelled -- nothing further needed there."
+
+    if "order_escalation" in result:
+        # order_tool.cancel_order()'s shape when the order exists but
+        # its live WooCommerce status isn't one this tool will touch
+        # automatically (already shipped, completed, refunded, etc.) --
+        # see order_tool.py's _CANCELLABLE_STATUSES. Say what's true
+        # (found it, can't act on it directly) rather than either
+        # silently failing or claiming a cancellation that didn't
+        # happen.
+        e = result["order_escalation"]
+        return (
+            f"I found *order #{e['order_id']}*, but it's already {e['status']} and can't be "
+            f"cancelled automatically from here -- I've let our team know so they can help "
+            f"directly."
         )
 
     if "answer" in result:

@@ -69,8 +69,13 @@ import uuid
 import requests
 
 from app.config import settings
-from services.delivery_tool import delivery_option_label, delivery_options_phrase, is_valid_delivery_option
-from services.memory import get_session_store
+from services.delivery_tool import (
+    delivery_option_label,
+    delivery_option_matches_address,
+    delivery_options_phrase,
+    is_valid_delivery_option,
+)
+from services.memory import get_session_store, set_last_action_outcome
 from services.product_tool import get_product_price
 from services.whatsapp_client import WhatsAppError, send_text_message
 
@@ -80,6 +85,20 @@ _store = get_session_store()
 
 _PENDING_ORDER_KEY = "pending_order"
 _LAST_CONFIRMED_KEY = "last_confirmed_order"
+
+# See memory.set_last_action_outcome()'s docstring. Shared by both
+# confirm_order() failure branches below -- a genuine WooCommerce write
+# failure, as opposed to the customer having anything to fix themselves.
+# Reused rather than reset every call: the order is still recoverable
+# (status goes back to "pending"), unlike propose_order's no-id case, so
+# this deliberately doesn't claim it can't be tried again.
+_CONFIRM_ORDER_FAILURE_OUTCOME = {
+    "action": "confirm_order",
+    "customer_safe_explanation": (
+        "There was a temporary hiccup placing your order just now -- nothing "
+        "was charged or lost. We can just try that again."
+    ),
+}
 
 
 def propose_order(
@@ -152,9 +171,40 @@ def propose_order(
             "(python -m services.woocommerce_sync) before taking orders for it",
             product.get("product"),
         )
+        # Unlike every error above (all "still missing a detail" prompts
+        # that are self-explanatory on their own), this one is a genuine,
+        # unrecoverable dead end the customer did nothing wrong to cause
+        # -- see memory.set_last_action_outcome()'s docstring for why a
+        # customer's likely next message ("why?") needs this recorded,
+        # not just the fact that something went wrong.
+        set_last_action_outcome(session_id, {
+            "action": "propose_order",
+            "customer_safe_explanation": (
+                "I found that item in the catalogue, but it isn't linked to our "
+                "ordering system yet, so I can't take an order for it right now."
+            ),
+        })
         return {"error": "Sorry, I can't take orders for that item right now."}
 
     subtotal = product["price"] * quantity_int
+
+    # The customer picked one of the three real delivery arrangements,
+    # but that doesn't guarantee it actually matches the address they
+    # gave -- see delivery_option_matches_address()'s docstring for the
+    # live case (Tamale address, Kumasi rider option) this closes.
+    # Rather than silently building a confirmation sentence that names
+    # two different cities, or blocking the order outright over a
+    # heuristic that can false-positive on a real Accra/Kumasi address,
+    # this only ever softens the *label* shown to the customer and
+    # staff -- delivery_option itself (the raw key) is stored unchanged,
+    # since it still reflects what the customer actually chose.
+    if delivery_option_matches_address(delivery_key, address_stripped):
+        resolved_label = delivery_option_label(delivery_key)
+    else:
+        resolved_label = (
+            f"a delivery arrangement to be confirmed by our team (this address doesn't "
+            f"match our usual {delivery_option_label(delivery_key)} zone)"
+        )
 
     proposal = {
         "token": str(uuid.uuid4()),
@@ -169,7 +219,7 @@ def propose_order(
         "total": subtotal,
         "delivery_address": delivery_address,
         "delivery_option": delivery_key,
-        "delivery_option_label": delivery_option_label(delivery_key),
+        "delivery_option_label": resolved_label,
     }
 
     _store.set(session_id, _PENDING_ORDER_KEY, proposal)
@@ -253,6 +303,7 @@ def confirm_order(session_id: str) -> dict:
         # unlucky timing. Safe to hand back to "pending" for a real retry.
         pending["status"] = "pending"
         _store.set(session_id, _PENDING_ORDER_KEY, pending)
+        set_last_action_outcome(session_id, _CONFIRM_ORDER_FAILURE_OUTCOME)
         return {"error": "Something went wrong placing your order -- let's try that again."}
     except Exception:
         # Every other failure (connection refused, a 4xx/5xx WooCommerce
@@ -262,9 +313,161 @@ def confirm_order(session_id: str) -> dict:
         logger.exception("WooCommerce order creation failed for token=%s", pending.get("token"))
         pending["status"] = "pending"
         _store.set(session_id, _PENDING_ORDER_KEY, pending)
+        set_last_action_outcome(session_id, _CONFIRM_ORDER_FAILURE_OUTCOME)
         return {"error": "Something went wrong placing your order -- let's try that again."}
 
     return _finalize_confirmation(session_id, pending, order["id"])
+
+
+_CANCELLABLE_STATUSES = {"pending", "on-hold"}
+
+
+class _OrderNotFound(Exception):
+    pass
+
+
+def cancel_order(session_id: str, order_id=None) -> dict:
+    """Cancel a customer's order.
+
+    Prefers an order number the customer stated explicitly; falls back
+    to this session's last confirmed order if they didn't give one (the
+    LLM passes "unknown" for order_id in that case -- see llm.py's
+    cancel_order guidance). This deliberately doesn't rely on session
+    memory alone for anything beyond finding *which* order to look at:
+    the order's actual status is re-checked live against WooCommerce
+    every time, because staff can move an order forward -- or cancel it
+    themselves -- directly in WooCommerce at any point after handoff, so
+    what this session last knew about the order is not assumed to still
+    be true.
+
+    Three distinct outcomes, not one -- see response_formatter.py:
+    - order_cancellation: found it, it was still cancellable, cancelled it.
+    - order_already_cancelled: found it, it was already cancelled (a
+      repeated "cancel" message, most likely -- see the module's
+      idempotency discussion above for why WhatsApp delivery can
+      duplicate a message).
+    - order_escalation: found it, but its status (shipped, completed,
+      refunded, ...) means this tool won't touch it automatically --
+      handed to staff instead of guessed at.
+
+    WooCommerce PUT-to-update-status is the documented, standard way to
+    change an order's status via the REST API -- not yet verified
+    against a real store, same caveat as _find_existing_order_by_token()
+    above: confirm it actually works before relying on it in
+    production."""
+
+    resolved_id = _resolve_order_id(session_id, order_id)
+    if resolved_id is None:
+        return {
+            "error": "I don't have an order on file for you right now -- "
+            "what's the order number you'd like to cancel?"
+        }
+
+    try:
+        order = _get_woocommerce_order(resolved_id)
+    except _OrderNotFound:
+        return {"error": f"I couldn't find order #{resolved_id} -- could you double-check the number?"}
+    except Exception:
+        logger.exception("Order lookup failed for #%s during cancellation", resolved_id)
+        return {"error": "Something went wrong looking up that order -- let's try again in a moment."}
+
+    if order["status"] == "cancelled":
+        return {"order_already_cancelled": {"order_id": resolved_id}}
+
+    if order["status"] not in _CANCELLABLE_STATUSES:
+        _notify_staff_of_cancel_request(session_id, resolved_id, order["status"])
+        return {"order_escalation": {"order_id": resolved_id, "status": order["status"]}}
+
+    try:
+        _cancel_woocommerce_order(resolved_id)
+    except Exception:
+        logger.exception("WooCommerce cancellation failed for order #%s", resolved_id)
+        return {"error": "Something went wrong cancelling that order -- let's try again in a moment."}
+
+    _notify_staff_of_cancellation(session_id, resolved_id)
+
+    last = _store.get(session_id, _LAST_CONFIRMED_KEY)
+    if last is not None and last.get("order_id") == resolved_id:
+        # No longer the active order to fall back to -- see
+        # _resolve_order_id()'s fallback below.
+        _store.set(session_id, _LAST_CONFIRMED_KEY, None)
+
+    return {"order_cancellation": {"order_id": resolved_id}}
+
+
+def _resolve_order_id(session_id: str, order_id) -> int | None:
+    given = str(order_id).strip() if order_id else ""
+    if given and given.lower() != "unknown":
+        try:
+            return int(given)
+        except ValueError:
+            return None
+    last = _store.get(session_id, _LAST_CONFIRMED_KEY)
+    return last["order_id"] if last else None
+
+
+def _get_woocommerce_order(order_id: int) -> dict:
+    _require_orders_config()
+    auth = (settings.woocommerce_orders_consumer_key, settings.woocommerce_orders_consumer_secret)
+    response = requests.get(
+        f"{settings.woocommerce_url.rstrip('/')}/wp-json/wc/v3/orders/{order_id}",
+        auth=auth,
+        timeout=15,
+    )
+    if response.status_code == 404:
+        raise _OrderNotFound(order_id)
+    response.raise_for_status()
+    return response.json()
+
+
+def _cancel_woocommerce_order(order_id: int) -> None:
+    _require_orders_config()
+    auth = (settings.woocommerce_orders_consumer_key, settings.woocommerce_orders_consumer_secret)
+    response = requests.put(
+        f"{settings.woocommerce_url.rstrip('/')}/wp-json/wc/v3/orders/{order_id}",
+        json={"status": "cancelled"},
+        auth=auth,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def _notify_staff_of_cancellation(session_id: str, order_id: int) -> None:
+    if not settings.staff_notification_phone:
+        logger.warning(
+            "STAFF_NOTIFICATION_PHONE not configured -- order #%s was cancelled but no "
+            "rider coordinator was notified.",
+            order_id,
+        )
+        return
+    message = f"KasaFlow order #{order_id} was cancelled by the customer (WhatsApp: {session_id})."
+    try:
+        send_text_message(settings.staff_notification_phone, message)
+    except WhatsAppError as e:
+        logger.error("Failed to notify staff about cancellation of order #%s: %s", order_id, e)
+
+
+def _notify_staff_of_cancel_request(session_id: str, order_id: int, status: str) -> None:
+    """A customer asked to cancel an order that's past the point this
+    tool will touch automatically. Staff still need to know -- silently
+    telling the customer "no" without anyone finding out they wanted to
+    cancel would be worse than the automatic case just not existing."""
+    if not settings.staff_notification_phone:
+        logger.warning(
+            "STAFF_NOTIFICATION_PHONE not configured -- customer requested cancellation of "
+            "order #%s (status: %s) but no rider coordinator was notified.",
+            order_id,
+            status,
+        )
+        return
+    message = (
+        f"Customer (WhatsApp: {session_id}) asked to cancel order #{order_id}, "
+        f"but its status is \"{status}\" -- please handle manually."
+    )
+    try:
+        send_text_message(settings.staff_notification_phone, message)
+    except WhatsAppError as e:
+        logger.error("Failed to notify staff about cancel request for order #%s: %s", order_id, e)
 
 
 def _finalize_confirmation(session_id: str, pending: dict, order_id) -> dict:

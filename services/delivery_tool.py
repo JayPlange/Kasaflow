@@ -39,6 +39,38 @@ def delivery_option_label(key: str | None) -> str | None:
     return next((option["label"] for option in DELIVERY_OPTIONS if option["key"] == key), None)
 
 
+def delivery_option_matches_address(key: str | None, address: str | None) -> bool:
+    """Whether a rider delivery option plausibly matches the stated
+    delivery address. A simple substring check, not geocoding -- good
+    enough to catch the case where a customer's chosen delivery
+    arrangement and stated address name two different cities (e.g.
+    address "Tamale", delivery option "kumasi_rider"), confirmed live,
+    2026-08-14: a customer got a confirmation claiming delivery "to
+    Tamale via rider delivery within Kumasi", which is not a real
+    arrangement this business offers.
+
+    Deliberately conservative in one direction only: this can produce a
+    false "mismatch" for a real Accra/Kumasi address that doesn't
+    literally contain the city name (e.g. a neighbourhood name alone).
+    That failure mode routes the order to manual staff confirmation
+    instead of asserting a wrong delivery arrangement -- the same
+    "say you don't know rather than guess" principle the rest of this
+    file already follows for pricing delivery itself. It never produces
+    a false match, which is the direction that actually matters: it
+    can't quietly clear a real mismatch.
+
+    "international" has no address-region constraint by definition, so
+    always matches; an unrecognised key isn't this function's job to
+    judge and also matches, so an already-invalid delivery_option
+    doesn't get flagged twice over by two different checks."""
+    if key not in ("accra_rider", "kumasi_rider"):
+        return True
+    address_lower = (address or "").lower()
+    if key == "accra_rider":
+        return "accra" in address_lower
+    return "kumasi" in address_lower
+
+
 def delivery_options_phrase(options: list[dict] | None = None) -> str:
     """"rider delivery within Accra, rider delivery within Kumasi, or
     shipping outside Ghana" -- the one place this phrasing is built, so

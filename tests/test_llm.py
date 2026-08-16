@@ -217,6 +217,22 @@ def test_prompt_describes_a_partial_order_draft():
     assert "Still missing: quantity, delivery address, delivery option" in prompt
 
 
+def test_prompt_lets_the_model_correct_an_already_known_order_draft_field():
+    # A customer correcting themselves ("sorry, delivery within kumasi"
+    # after already saying Accra) must not get told to keep the old
+    # value -- confirmed live, 2026-08-13: the correction got routed to
+    # a fresh get_delivery_information question instead of updating the
+    # order, because this instruction only ever said "keep every
+    # already-known value", with no exception for a correction.
+    draft = {
+        "product_name": "Ring", "material": None, "quantity": 2,
+        "delivery_address": "Suame, Kumasi", "delivery_option": "accra_rider",
+    }
+    prompt = llm._build_prompt("sorry, delivery within kumasi", pending_order=None, order_draft=draft)
+    assert "clearly states a different value" in prompt
+    assert "do not silently keep a value they just corrected" in prompt
+
+
 def test_prompt_omits_order_draft_section_once_everything_is_known():
     # Nothing left for a short reply to be answering -- propose_order
     # itself is the next step, not another round of "what's missing".
@@ -249,15 +265,69 @@ def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatc
 
 
 # ---------------------------------------------------------------------
-# converse -- the eighth outcome, for purely conversational messages
-# that need no business tool (see llm.py's tool 8 description)
+# converse -- the ninth outcome, for purely conversational messages
+# that need no business tool (see llm.py's tool 9 description). It moved
+# from 8th to 9th when cancel_order was added as tool 8.
 # ---------------------------------------------------------------------
 
 def test_prompt_includes_converse_tool_guidance():
     prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
-    assert "8. converse" in prompt
+    assert "9. converse" in prompt
     assert "reply" in prompt
     assert "NOT_FOUND" not in prompt  # guardrail language stays out of the prompt itself
+
+
+def test_prompt_tells_the_model_to_use_recommend_products_for_category_photo_requests():
+    # "necklace images" etc. -- a category is enough to act on, must not
+    # fall through to get_product_price("unknown") or converse
+    prompt = llm._build_prompt("necklace images", pending_order=None, order_draft=None)
+    assert "recommend_products with category" in prompt.lower() or "use recommend_products" in prompt.lower()
+
+
+# ---------------------------------------------------------------------
+# cancel_order -- tool 8, added 2026-08-16 alongside the delivery-address
+# mismatch check and the "placed" wording softening (see order_tool.py's
+# cancel_order() and llm.py's tool 8 description)
+# ---------------------------------------------------------------------
+
+def test_prompt_includes_cancel_order_tool_guidance():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "8. cancel_order" in prompt
+    assert "order_id" in prompt
+
+
+def test_understand_customer_parses_a_cancel_order_response_with_no_number(monkeypatch):
+    # Arrange: customer didn't state an order number -- the LLM must
+    # pass "unknown", never invent one (see llm.py's cancel_order
+    # guidance and order_tool._resolve_order_id()'s fallback)
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "cancel_order", "arguments": {"order_id": "unknown"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    result = llm.understand_customer("cancel my order")
+
+    # Assert
+    assert result["tool"] == "cancel_order"
+    assert result["arguments"]["order_id"] == "unknown"
+
+
+def test_understand_customer_parses_a_cancel_order_response_with_a_number(monkeypatch):
+    # Arrange: customer gave an explicit order number
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "cancel_order", "arguments": {"order_id": "6846"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    result = llm.understand_customer("please cancel order 6846")
+
+    # Assert
+    assert result["tool"] == "cancel_order"
+    assert result["arguments"]["order_id"] == "6846"
 
 
 def test_understand_customer_parses_a_converse_response(monkeypatch):
@@ -310,6 +380,44 @@ def test_understand_customer_passes_pending_intent_through_to_the_prompt(monkeyp
     # Assert
     sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
     assert "hadn't named a specific product" in sent_prompt
+
+
+# ---------------------------------------------------------------------
+# last_action_outcome -- a fully-specified business action that still
+# failed for a real reason (see llm.py's _last_action_outcome_state_line())
+# ---------------------------------------------------------------------
+
+def test_prompt_omits_last_action_outcome_section_when_none():
+    prompt = llm._build_prompt("why?", pending_order=None, order_draft=None, last_action_outcome=None)
+    assert "just failed" not in prompt
+
+
+def test_prompt_describes_a_last_action_outcome():
+    outcome = {
+        "action": "propose_order",
+        "customer_safe_explanation": "I can't take an order for that item right now.",
+    }
+    prompt = llm._build_prompt("why?", pending_order=None, order_draft=None, last_action_outcome=outcome)
+    assert "just failed" in prompt
+    assert "I can't take an order for that item right now." in prompt
+    assert "do not say you haven't seen anything" in prompt.lower()
+
+
+def test_understand_customer_passes_last_action_outcome_through_to_the_prompt(monkeypatch):
+    # Arrange
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "converse", "arguments": {"reply": "..."}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+    outcome = {"action": "propose_order", "customer_safe_explanation": "reason given to the customer"}
+
+    # Act
+    llm.understand_customer("why?", last_action_outcome=outcome)
+
+    # Assert
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "reason given to the customer" in sent_prompt
 
 
 def test_understand_customer_rejects_empty_message():

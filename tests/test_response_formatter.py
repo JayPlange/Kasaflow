@@ -310,6 +310,64 @@ def test_formats_order_confirmation_shape():
     assert "rider delivery within Accra" in formatted
 
 
+def test_order_confirmation_says_placed_not_confirmed():
+    # "confirmed" implies a finished, settled transaction -- nothing has
+    # been paid or scheduled yet at this point (see order_tool.py's
+    # confirm_order(), which hands delivery/payment to staff after
+    # creating the order). Confirmed live, 2026-08-14, that "confirmed"
+    # reads as overpromising once you look at what state the order is
+    # actually in.
+    result = {
+        "order_confirmation": {
+            "order_id": 555,
+            "total": 2400.0,
+            "delivery_address": "12 Cantonments Road, Accra",
+            "delivery_option_label": "rider delivery within Accra",
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "has been placed" in formatted
+    assert "confirmed" not in formatted.lower()
+
+
+def test_order_confirmation_falls_back_when_delivery_label_missing():
+    # A proposal built before delivery_option_matches_address() existed,
+    # or any other path that never set a label -- still a real order, so
+    # this must not blow up with a KeyError/None formatting into the text.
+    result = {
+        "order_confirmation": {
+            "order_id": 555,
+            "total": 2400.0,
+            "delivery_address": "12 Cantonments Road, Accra",
+            "delivery_option_label": None,
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "your chosen delivery option" in formatted
+
+
+def test_formats_order_cancellation_shape():
+    result = {"order_cancellation": {"order_id": 6846}}
+    formatted = format_for_customer(result)
+    assert "*order #6846*" in formatted
+    assert "cancelled" in formatted.lower()
+
+
+def test_formats_order_already_cancelled_shape():
+    result = {"order_already_cancelled": {"order_id": 6846}}
+    formatted = format_for_customer(result)
+    assert "*#6846*" in formatted
+    assert "already cancelled" in formatted.lower()
+
+
+def test_formats_order_escalation_shape():
+    result = {"order_escalation": {"order_id": 6846, "status": "completed"}}
+    formatted = format_for_customer(result)
+    assert "*order #6846*" in formatted
+    assert "completed" in formatted
+    assert "team" in formatted.lower()
+
+
 def test_formats_multi_entry_results_list_when_one_entry_errored():
     result = {
         "results": [

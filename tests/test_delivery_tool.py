@@ -1,6 +1,7 @@
 from services.delivery_tool import (
     DELIVERY_OPTIONS,
     delivery_option_label,
+    delivery_option_matches_address,
     delivery_options_phrase,
     get_delivery_information,
     is_valid_delivery_option,
@@ -54,3 +55,53 @@ def test_delivery_options_phrase_uses_an_oxford_comma_and_or():
 def test_delivery_options_phrase_handles_a_single_option():
     phrase = delivery_options_phrase([{"key": "accra_rider", "label": "rider delivery within Accra"}])
     assert phrase == "rider delivery within Accra"
+
+
+# ---------------------------------------------------------------------
+# delivery_option_matches_address -- catches the case where the chosen
+# rider option and the stated address name two different cities (the
+# live Tamale/kumasi_rider case, 2026-08-14). Conservative in one
+# direction only: never false-positive-matches a real mismatch, but can
+# false-negative (report "mismatch") on a real Accra/Kumasi address that
+# doesn't literally contain the city name.
+# ---------------------------------------------------------------------
+
+def test_matches_when_accra_rider_and_address_contains_accra():
+    assert delivery_option_matches_address("accra_rider", "12 Cantonments Road, Accra")
+
+
+def test_mismatches_when_accra_rider_but_address_is_elsewhere():
+    assert not delivery_option_matches_address("accra_rider", "Tamale")
+
+
+def test_matches_when_kumasi_rider_and_address_contains_kumasi():
+    assert delivery_option_matches_address("kumasi_rider", "Adum, Kumasi")
+
+
+def test_mismatches_when_kumasi_rider_but_address_is_elsewhere():
+    assert not delivery_option_matches_address("kumasi_rider", "Tamale")
+
+
+def test_matches_is_case_insensitive():
+    assert delivery_option_matches_address("accra_rider", "ACCRA")
+    assert delivery_option_matches_address("kumasi_rider", "kumasi central market")
+
+
+def test_international_always_matches_regardless_of_address():
+    # No regional constraint by definition -- see the function's docstring
+    assert delivery_option_matches_address("international", "Tamale")
+    assert delivery_option_matches_address("international", "")
+    assert delivery_option_matches_address("international", None)
+
+
+def test_invalid_key_always_matches_rather_than_double_flagging():
+    # An already-invalid delivery_option is is_valid_delivery_option()'s
+    # job to catch, not this function's -- it shouldn't also report a
+    # mismatch for a key that's wrong in the first place.
+    assert delivery_option_matches_address("nonsense", "Accra")
+    assert delivery_option_matches_address(None, "Accra")
+
+
+def test_mismatch_with_no_address_at_all():
+    assert not delivery_option_matches_address("accra_rider", "")
+    assert not delivery_option_matches_address("accra_rider", None)

@@ -9,9 +9,11 @@ import logging
 from services.llm import ToolSelectionError, understand_customer
 from services.memory import (
     fill_missing_context,
+    get_last_action_outcome,
     get_order_draft,
     get_pending_intent,
     remember_context,
+    set_last_action_outcome,
     set_pending_intent,
 )
 from services.order_tool import get_pending_order_summary
@@ -19,15 +21,16 @@ from services.tool_executor import ToolExecutionError, execute_tool
 
 logger = logging.getLogger(__name__)
 
-# propose_order/confirm_order (services/order_tool.py) both need to know
-# which customer's session they're acting on, but that's never something
-# the LLM decides or the customer states -- it comes from the channel
-# (WhatsApp) this message arrived on. Every other registered tool's
-# **kwargs contract is exactly whatever the LLM returned, nothing more,
-# so session_id is injected only for these two by name rather than added
-# to every tool call: passing an unexpected session_id kwarg to any of
-# the other five would raise inside tool_executor.py's TypeError handler.
-_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order"}
+# propose_order/confirm_order/cancel_order (services/order_tool.py) all
+# need to know which customer's session they're acting on, but that's
+# never something the LLM decides or the customer states -- it comes
+# from the channel (WhatsApp) this message arrived on. Every other
+# registered tool's **kwargs contract is exactly whatever the LLM
+# returned, nothing more, so session_id is injected only for these three
+# by name rather than added to every tool call: passing an unexpected
+# session_id kwarg to any of the other five would raise inside
+# tool_executor.py's TypeError handler.
+_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order", "cancel_order"}
 
 # converse (services/llm.py) isn't a real registered tool -- there's no
 # deterministic business logic behind it, no lookup, nothing to execute.
@@ -95,8 +98,18 @@ def route_customer(message: str, session_id: str) -> dict:
         # product needs this to avoid asking the customer to repeat
         # themselves a second time.
         pending_intent = get_pending_intent(session_id)
+        # A real business action (usually propose_order/confirm_order)
+        # that was fully specified and still hit a genuine, unrecoverable
+        # failure -- different axis from all three above, which are about
+        # missing information. See memory.get_last_action_outcome() and
+        # llm.py's _last_action_outcome_state_line().
+        last_action_outcome = get_last_action_outcome(session_id)
         tool_request = understand_customer(
-            message, pending_order=pending_order, order_draft=order_draft, pending_intent=pending_intent
+            message,
+            pending_order=pending_order,
+            order_draft=order_draft,
+            pending_intent=pending_intent,
+            last_action_outcome=last_action_outcome,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -143,7 +156,23 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
 
     _update_pending_intent(session_id, tool_request["tool"], arguments, result)
 
+    if _tool_succeeded(result):
+        # A genuine success means whatever failed before is no longer
+        # the active topic -- see memory.set_last_action_outcome()'s
+        # docstring. Deliberately stricter than "not _found_nothing()":
+        # that treats any {"error": ...} shape (including the very
+        # failure this session just recorded, e.g. propose_order's own
+        # no-id return) as "found something", which would wipe out the
+        # outcome on the exact same call that just set it.
+        set_last_action_outcome(session_id, None)
+
     return result
+
+
+def _tool_succeeded(result: dict | None) -> bool:
+    if result is None or "error" in result:
+        return False
+    return not _found_nothing(result)
 
 
 def _update_pending_intent(session_id: str, tool_name: str, arguments: dict, result: dict | None) -> None:

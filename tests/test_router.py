@@ -266,6 +266,7 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
         pending_order={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0},
         order_draft=None,
         pending_intent=None,
+        last_action_outcome=None,
     )
 
 
@@ -279,7 +280,11 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
 
     # Assert
     understand.assert_called_once_with(
-        "how much is a gold ring?", pending_order=None, order_draft=None, pending_intent=None
+        "how much is a gold ring?",
+        pending_order=None,
+        order_draft=None,
+        pending_intent=None,
+        last_action_outcome=None,
     )
 
 
@@ -339,9 +344,58 @@ def test_route_customer_injects_session_id_for_order_tools(monkeypatch):
     assert captured_calls[0]["session_id"] == "session-order-1"
 
 
+def test_route_customer_injects_session_id_for_cancel_order(monkeypatch):
+    # Arrange: cancel_order needs to know which session's last confirmed
+    # order to fall back to when the customer doesn't state a number --
+    # see router.py's _SESSION_AWARE_TOOLS and order_tool.cancel_order()
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "cancel_order", "arguments": {"order_id": "unknown"}}),
+    )
+    captured_calls = []
+
+    def fake_execute_tool(tool_name, **kwargs):
+        captured_calls.append(kwargs)
+        return {"order_cancellation": {"order_id": 6846}}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    router.route_customer("cancel my order", "session-cancel-1")
+
+    # Assert
+    assert captured_calls[0]["session_id"] == "session-cancel-1"
+
+
+def test_route_customer_keeps_cancel_order_session_state_isolated(monkeypatch):
+    # Arrange: two different customers cancelling -- session_id must be
+    # each caller's own, never leak across sessions
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "cancel_order", "arguments": {"order_id": "6846"}}),
+    )
+    captured_calls = []
+
+    def fake_execute_tool(tool_name, **kwargs):
+        captured_calls.append(kwargs)
+        return {"order_cancellation": {"order_id": 6846}}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    router.route_customer("cancel order 6846", "session-A")
+    router.route_customer("cancel order 6846", "session-B")
+
+    # Assert: each call carried its own caller's session_id, not a shared/stale one
+    assert captured_calls[0]["session_id"] == "session-A"
+    assert captured_calls[1]["session_id"] == "session-B"
+
+
 # ---------------------------------------------------------------------
 # converse -- purely conversational messages that need no business tool
-# (see llm.py's tool 8 description and router.py's _CONVERSATION_TOOL)
+# (see llm.py's tool 9 description and router.py's _CONVERSATION_TOOL)
 # ---------------------------------------------------------------------
 
 def test_route_customer_returns_converse_reply_directly(monkeypatch):
@@ -502,6 +556,86 @@ def test_route_customer_converse_does_not_read_or_write_pending_intent(monkeypat
     # Assert: converse never touches pending_intent either way
     set_pending_intent.assert_not_called()
     execute_tool.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# last_action_outcome -- a fully-specified action that still hit a
+# genuine, unrecoverable failure (see memory.set_last_action_outcome()
+# and llm.py's _last_action_outcome_state_line())
+# ---------------------------------------------------------------------
+
+def test_route_customer_passes_last_action_outcome_to_understand_customer(monkeypatch):
+    # Arrange
+    understand = MagicMock(return_value={"tool": "converse", "arguments": {"reply": "..."}})
+    monkeypatch.setattr(router, "understand_customer", understand)
+    monkeypatch.setattr(router, "get_last_action_outcome", MagicMock(return_value={"action": "propose_order", "customer_safe_explanation": "x"}))
+
+    # Act
+    router.route_customer("why?", "session-1")
+
+    # Assert
+    call_kwargs = understand.call_args.kwargs
+    assert call_kwargs["last_action_outcome"] == {"action": "propose_order", "customer_safe_explanation": "x"}
+
+
+def test_route_customer_clears_last_action_outcome_on_a_genuine_success(monkeypatch):
+    # Arrange: the customer moves on and successfully looks something up
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"product": "Ring", "material": "18k", "price": 1200}))
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(router, "set_last_action_outcome", set_last_action_outcome)
+
+    # Act
+    router.route_customer("how much is the ring?", "session-outcome-clear")
+
+    # Assert
+    set_last_action_outcome.assert_called_once_with("session-outcome-clear", None)
+
+
+def test_route_customer_does_not_clear_last_action_outcome_on_a_business_error(monkeypatch):
+    # Arrange: propose_order's own hard-failure return ({"error": ...})
+    # must not immediately wipe out the outcome it (order_tool.py) just
+    # recorded for this exact call -- see router.py's _tool_succeeded(),
+    # which is deliberately stricter than _found_nothing() for this reason
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "propose_order",
+            "arguments": {"product_name": "Ring", "material": "18k", "quantity": 1, "delivery_address": "Accra", "delivery_option": "accra_rider"},
+        }),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"error": "Sorry, I can't take orders for that item right now."}))
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(router, "set_last_action_outcome", set_last_action_outcome)
+
+    # Act
+    router.route_customer("place the order", "session-outcome-no-clear")
+
+    # Assert: router itself never called it -- order_tool.py is the only
+    # thing that sets a real outcome, on a genuine hard failure
+    set_last_action_outcome.assert_not_called()
+
+
+def test_route_customer_converse_does_not_touch_last_action_outcome(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "converse", "arguments": {"reply": "I'm sorry, here's why..."}}),
+    )
+    set_last_action_outcome = MagicMock()
+    monkeypatch.setattr(router, "set_last_action_outcome", set_last_action_outcome)
+
+    # Act
+    router.route_customer("why?", "session-outcome-converse")
+
+    # Assert: converse must never clear an outcome mid-explanation
+    set_last_action_outcome.assert_not_called()
 
 
 def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypatch):

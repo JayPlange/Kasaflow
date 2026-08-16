@@ -1,5 +1,5 @@
 from services.delivery_tool import get_delivery_information
-from services.order_tool import confirm_order, propose_order
+from services.order_tool import cancel_order, confirm_order, propose_order
 from services.policy_tool import answer_policy_question
 from services.product_tool import get_product_price
 from services.quote_service import generate_quote
@@ -17,4 +17,9 @@ TOOLS = {
     # execute_tool(). See router.py's _SESSION_AWARE_TOOLS.
     "propose_order": propose_order,
     "confirm_order": confirm_order,
+    # cancel_order is session-aware for the same reason -- see
+    # router.py's _SESSION_AWARE_TOOLS -- it needs to know which
+    # session's last_confirmed_order to fall back to when the customer
+    # doesn't state an order number explicitly.
+    "cancel_order": cancel_order,
 }
