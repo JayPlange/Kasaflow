@@ -179,6 +179,36 @@ def get_pending_intent(session_id: str) -> str | None:
     return _store.get(session_id, _PENDING_INTENT_KEY)
 
 
+_LAST_ACTION_OUTCOME_KEY = "last_action_outcome"
+
+
+def set_last_action_outcome(session_id: str, outcome: dict | None) -> None:
+    """Records (or clears, with None) a genuine, unrecoverable failure of
+    a real business action -- e.g. propose_order finding a product with
+    no WooCommerce id behind it, or confirm_order's write to WooCommerce
+    itself failing. Deliberately NOT used for ordinary "still missing a
+    detail" prompts (how many, what address, ...) -- those are already
+    self-explanatory and get_order_draft() already covers them; this is
+    for the case where the customer did everything right and it still
+    didn't work, for a reason they have no way to guess.
+
+    Exists because a customer's very next message after a failure like
+    that is often "why?" -- and without this, understand_customer() has
+    no way to know a failure even happened a moment ago, let alone why
+    (confirmed live, 2026-08-13: "why?" got "could you clarify what you
+    mean", and the next message got told "I haven't seen any order from
+    you yet" -- an outright false claim, not just a vague one). Expected
+    shape: {"action": "propose_order", "customer_safe_explanation": "..."}
+    -- a ready-made, already-safe-to-say sentence, not raw internal detail,
+    so the model explains the real reason instead of guessing at one or
+    denying anything happened. See llm.py's _last_action_outcome_state_line()."""
+    _store.set(session_id, _LAST_ACTION_OUTCOME_KEY, outcome)
+
+
+def get_last_action_outcome(session_id: str) -> dict | None:
+    return _store.get(session_id, _LAST_ACTION_OUTCOME_KEY)
+
+
 def get_session_store() -> SessionStore:
     """Exposed so tests (and, later, a healthcheck or admin endpoint) can
     inspect the store without reaching into the module-level `_store`
