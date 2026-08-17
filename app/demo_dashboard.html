@@ -248,9 +248,9 @@
       <p class="header-title">Adom De Jeweller</p>
       <p class="header-sub"><span class="dot"></span>KasaFlow</p>
     </div>
-    <div class="lang-toggle">
-      <button class="lang-btn active" data-lang="twi">Twi</button>
-      <button class="lang-btn" data-lang="english">English</button>
+    <div class="lang-toggle" title="Only affects voice notes -- transcription and spoken replies. Typed messages and their replies are unaffected.">
+      <button class="lang-btn active" data-lang="twi">Twi voice</button>
+      <button class="lang-btn" data-lang="english">English voice</button>
     </div>
     <button class="presenter-toggle" id="presenterToggle" aria-label="Toggle presenter view" title="Presenter view (not visible to customers)">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0H5a2 2 0 0 1-2-2v-4m6 6h10a2 2 0 0 0 2-2v-4"/></svg>
@@ -265,6 +265,10 @@
     <div class="rec-indicator" id="recIndicator"><span class="rec-dot"></span><span id="recTime">Recording · 0:00</span></div>
     <div class="composer-row">
       <input class="text-field" id="textInput" type="text" placeholder="Message Adom De Jeweller" autocomplete="off">
+      <input type="file" id="imageInput" accept="image/*" style="display:none">
+      <button class="icon-btn photo-btn" id="photoBtn" aria-label="Send a photo">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+      </button>
       <button class="icon-btn mic-btn" id="micBtn" aria-label="Record voice note">
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
       </button>
@@ -280,6 +284,8 @@ const thread = document.getElementById('thread');
 const textInput = document.getElementById('textInput');
 const micBtn = document.getElementById('micBtn');
 const sendBtn = document.getElementById('sendBtn');
+const photoBtn = document.getElementById('photoBtn');
+const imageInput = document.getElementById('imageInput');
 const insight = document.getElementById('insight');
 const recIndicator = document.getElementById('recIndicator');
 const recTime = document.getElementById('recTime');
@@ -456,13 +462,14 @@ function showInsight(tool, extra) {
   insight.classList.toggle('show', presenterMode);
 }
 
-async function sendToServer({ text, audioBlob }) {
+async function sendToServer({ text, audioBlob, imageFile }) {
   const form = new FormData();
   if (sessionId) form.append('session_id', sessionId);
   form.append('language', language);
   form.append('voice_reply', audioBlob ? 'true' : 'false');
   if (text) form.append('text', text);
   if (audioBlob) form.append('audio', audioBlob, 'note.webm');
+  if (imageFile) form.append('image', imageFile, imageFile.name || 'photo.jpg');
 
   showTyping();
   try {
@@ -473,13 +480,13 @@ async function sendToServer({ text, audioBlob }) {
     if (data.error) { addTextRow(false, data.error); return; }
 
     sessionId = data.session_id;
-    if (data.transcript && audioBlob) {
+    if (data.transcript && (audioBlob || imageFile)) {
       const lastRow = thread.querySelectorAll('.row.mine');
       const last = lastRow[lastRow.length - 1];
       if (last) {
         const cap = document.createElement('p');
         cap.className = 'meta-line';
-        cap.textContent = '"' + data.transcript + '"';
+        cap.textContent = imageFile ? 'Read as: "' + data.transcript + '"' : '"' + data.transcript + '"';
         last.after(cap);
       }
     }
@@ -510,6 +517,23 @@ sendBtn.addEventListener('click', () => {
   sendToServer({ text: val });
 });
 textInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendBtn.click(); });
+
+photoBtn.addEventListener('click', () => imageInput.click());
+imageInput.addEventListener('change', () => {
+  const file = imageInput.files[0];
+  imageInput.value = ''; // allow picking the same file again later
+  if (!file) return;
+
+  // Preview what the customer "sent", same immediate-feedback pattern
+  // as the voice note bubble, before the server has replied at all.
+  const row = document.createElement('div');
+  row.className = 'row mine';
+  row.innerHTML = `<div class="img-bubble"><img src="${URL.createObjectURL(file)}"></div>`;
+  thread.appendChild(row);
+  scrollDown();
+
+  sendToServer({ imageFile: file });
+});
 
 micBtn.addEventListener('click', async () => {
   if (mediaRecorder && mediaRecorder.state === 'recording') {

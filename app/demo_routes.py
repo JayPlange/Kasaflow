@@ -33,6 +33,7 @@ from fastapi.responses import HTMLResponse, Response
 from app.config import settings
 from services.response_formatter import _group_by_product, _select_diverse_groups, format_for_customer
 from services.router import route_customer
+from services.vision_tool import VisionServiceError, describe_product_image
 from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
 
 # How many product photos to attach for a recommendations reply -- kept
@@ -152,6 +153,7 @@ def _build_recommendation_cards(result: dict) -> list[dict]:
 async def demo_message(
     text: str | None = Form(None),
     audio: UploadFile | None = File(None),
+    image: UploadFile | None = File(None),
     session_id: str | None = Form(None),
     language: str = Form("twi"),
     voice_reply: bool = Form(False),
@@ -176,10 +178,29 @@ async def demo_message(
         if not transcript.strip():
             return {"error": "Couldn't make that out -- try again or type it instead."}
         customer_text = transcript
+    elif image is not None:
+        # Mirrors whatsapp_routes.py's image branch exactly -- a photo
+        # becomes customer_text the same way a voice note does, then
+        # goes through the identical route_customer()/format_for_customer()
+        # pipeline. describe_product_image() itself is flagged in
+        # vision_tool.py as not yet confirmed against a real OpenAI
+        # response from this environment -- this is genuinely the first
+        # place to find out whether it works, before a customer's photo
+        # does.
+        image_bytes = await image.read()
+        try:
+            transcript = describe_product_image(image_bytes, mime_type=image.content_type or "image/jpeg")
+        except VisionServiceError as e:
+            logger.error("Image description failed: %s", e)
+            return {"error": f"Image description failed: {e}"}
+
+        if not transcript.strip():
+            return {"error": "Couldn't quite tell what that was -- mind describing it in words instead?"}
+        customer_text = transcript
     elif text and text.strip():
         customer_text = text.strip()
     else:
-        return {"error": "Send text or a voice note."}
+        return {"error": "Send text, a voice note, or a photo."}
 
     result = route_customer(customer_text, session_id=session_id)
     reply_text = format_for_customer(result)
