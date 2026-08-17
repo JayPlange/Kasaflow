@@ -220,6 +220,26 @@ def test_formats_recommendations_keeps_karat_wording_when_karat_varies():
     assert "karat" in formatted.lower()
 
 
+def test_formats_recommendations_drops_the_redundant_per_item_cta():
+    # Each multi-variant product used to end its own line with "tell me
+    # your size and karat and I'll get you the exact price" -- fine for
+    # one item, noisy and robotic once several items in the same list
+    # each repeated it (confirmed live, 2026-08-16). The one closing
+    # question at the end of the whole message already covers this.
+    items = [
+        {"product": f"Ring {i}", "material": f"18 / Women US {size} (21.4 mm)", "price": p}
+        for i in (1, 2)
+        for size, p in [("8", 100.0 + i), ("9", 200.0 + i), ("10", 300.0 + i), ("11", 400.0 + i)]
+    ]
+    formatted = format_for_customer({"recommendations": items})
+    assert formatted.count("tell me your") == 0
+    assert formatted.count("get you the exact price") == 0
+    # The closing footer still invites narrowing down, just once
+    assert formatted.count("narrow it down by size or karat") == 1
+    # Price ranges are still shown per item
+    assert "options)" in formatted
+
+
 def test_formats_recommendations_keeps_variants_with_different_prices_separate():
     items = [
         {"product": "Custom Worded Gold Ring", "material": "5g", "price": 6303.0},

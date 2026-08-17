@@ -147,17 +147,20 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
     distinct_karats = {k for k in (_extract_karat(v["material"]) for v in variants) if k}
     varies_by_karat = len(distinct_karats) > 1
     unit = "sizes/karats" if varies_by_karat else "sizes"
-    ask = "size and karat" if varies_by_karat else "size"
 
+    # Deliberately no per-item "tell me your size/karat" call-to-action
+    # here any more -- format_for_customer()'s single closing question
+    # ("Want me to tell you more about any of these... or narrow it down
+    # by size or karat?") already covers every line in the list. Repeating
+    # the same ask on every multi-variant item read as noisy and robotic
+    # once more than one item in the same list needed it (confirmed live,
+    # 2026-08-16).
     if low == high:
-        return (
-            f"- *{name}*: *GH₵{low:,.2f}* -- comes in {len(variants)} {unit}, "
-            f"just tell me which you'd like and I'll confirm it"
-        )
+        return f"- *{name}*: *GH₵{low:,.2f}* -- comes in {len(variants)} {unit}"
     qualifier = "karat/size" if varies_by_karat else "size"
     return (
         f"- *{name}*: *GH₵{low:,.2f}-GH₵{high:,.2f}* depending on {qualifier} "
-        f"({len(variants)} options) -- tell me your {ask} and I'll get you the exact price"
+        f"({len(variants)} options)"
     )
 
 

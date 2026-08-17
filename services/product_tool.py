@@ -12,11 +12,26 @@ ring" will never exact-match "Heart Twin Gold Ring, 16g".
 
 import json
 import logging
+import re
 
 from app.config import settings
 from services.product_search import get_product_index
 
 logger = logging.getLogger(__name__)
+
+# Same pattern as recommendation_service.py's own _KARAT_RE, duplicated
+# rather than imported for the same standalone-file reason documented in
+# response_formatter.py's module docstring: matches the karat digits at
+# the start of any of the catalogue's real formats, "18k", "18", or the
+# Rings compound "18 / Women US 12 (21.4 mm)".
+_KARAT_RE = re.compile(r"^\s*(\d+)\s*k?\b", re.IGNORECASE)
+
+
+def _extract_karat(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = _KARAT_RE.match(value)
+    return match.group(1) if match else None
 
 
 def get_product_price(product_name: str, material: str):
@@ -33,6 +48,33 @@ def get_product_price(product_name: str, material: str):
     for product in products:
         if product["product"] == product_name and product["material"] == material:
             return product
+
+    # A sized/varianted product (e.g. a ring with 33 karat+size
+    # combinations) stores material as "{karat} / {size} ({mm})", never
+    # a bare "18k" -- so the literal exact match above can never succeed
+    # for these, and used to fall straight through to semantic search
+    # below, which silently loses the requested karat entirely (see
+    # product_search.py's _keyword_overlap docstring: digits get
+    # stripped during keyword filtering, so "18k" becomes a filtered-out
+    # single-letter "k"), returning whichever variant the embedding
+    # happened to rank first. Confirmed live, 2026-08-16: asked for the
+    # Set Multi Stone Golf Ring in 18k, quoted GH₵8,824.20 -- the 12k
+    # price -- not the real 18k price of GH₵12,033.00. Matching on the
+    # exact product name plus extracted karat catches this
+    # deterministically, before semantic search ever runs. Safe to
+    # return the first match without asking for size: every variant of
+    # the same product at the same karat shares one price regardless of
+    # size in this catalogue (confirmed against the real data), size
+    # only matters for confirm_order()'s variation_id downstream, not
+    # for pricing.
+    target_karat = _extract_karat(material)
+    if target_karat:
+        karat_matches = [
+            product for product in products
+            if product["product"] == product_name and _extract_karat(product.get("material")) == target_karat
+        ]
+        if karat_matches:
+            return karat_matches[0]
 
     logger.info(
         "No exact match for product_name=%s material=%s -- falling back to semantic search",
