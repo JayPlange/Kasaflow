@@ -166,6 +166,49 @@ def test_image_message_photo_reply_failure_falls_back_to_text(monkeypatch):
     send_text.assert_called_once_with("233555000111", "The gold Ring is GH₵1,200.00.")
 
 
+def test_image_message_with_caption_merges_caption_into_routed_text(monkeypatch):
+    # Arrange: a photo sent with a caption naming the product -- WhatsApp's
+    # Cloud API image object supports an optional "caption" field (see
+    # whatsapp_client.py's own send_image_message, which sends one on the
+    # way out); previously only message["image"]["id"] was ever read here,
+    # silently dropping any caption.
+    monkeypatch.setattr(whatsapp_routes, "download_media", MagicMock(return_value=b"jpeg-bytes"))
+    monkeypatch.setattr(whatsapp_routes, "describe_product_image", MagicMock(return_value="gold pendant necklace"))
+    route_mock = MagicMock(return_value=_no_image_result())
+    monkeypatch.setattr(whatsapp_routes, "route_customer", route_mock)
+    monkeypatch.setattr(whatsapp_routes, "format_for_customer", MagicMock(return_value="ok"))
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", MagicMock())
+
+    # Act
+    _handle_message({
+        "from": "233555000111",
+        "type": "image",
+        "image": {"id": "media-2", "caption": "is this the Adinkra necklace"},
+    })
+
+    # Assert: caption is folded in ahead of the vision description
+    route_mock.assert_called_once_with(
+        "is this the Adinkra necklace gold pendant necklace", session_id="233555000111"
+    )
+
+
+def test_image_message_without_caption_routes_description_alone(monkeypatch):
+    # Arrange: no caption field at all on the payload -- must not crash
+    # on a missing key, and must not glue on an empty string
+    monkeypatch.setattr(whatsapp_routes, "download_media", MagicMock(return_value=b"jpeg-bytes"))
+    monkeypatch.setattr(whatsapp_routes, "describe_product_image", MagicMock(return_value="gold pendant necklace"))
+    route_mock = MagicMock(return_value=_no_image_result())
+    monkeypatch.setattr(whatsapp_routes, "route_customer", route_mock)
+    monkeypatch.setattr(whatsapp_routes, "format_for_customer", MagicMock(return_value="ok"))
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", MagicMock())
+
+    # Act
+    _handle_message({"from": "233555000111", "type": "image", "image": {"id": "media-2"}})
+
+    # Assert
+    route_mock.assert_called_once_with("gold pendant necklace", session_id="233555000111")
+
+
 def test_image_message_empty_description_sends_fallback_without_routing(monkeypatch):
     # Arrange: photo didn't look like jewellery at all
     monkeypatch.setattr(whatsapp_routes, "download_media", MagicMock(return_value=b"jpeg-bytes"))

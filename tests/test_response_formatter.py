@@ -220,6 +220,62 @@ def test_formats_recommendations_keeps_karat_wording_when_karat_varies():
     assert "karat" in formatted.lower()
 
 
+def test_formats_identified_product_shows_every_karat_price():
+    # photo_match_tool.py's confident-match shape -- unlike the
+    # recommendations list (which collapses to a price range above 3
+    # variants), this is exactly one identified product, so every karat
+    # is shown, not a range.
+    result = {
+        "identified_product": {
+            "product": "Custom Adinkra Chains Gold Necklace",
+            "image_url": "https://example.com/necklace.jpg",
+            "variants": [
+                {"material": "18k", "price": 45000.0},
+                {"material": "14k", "price": 39000.0},
+                {"material": "12k", "price": 33000.0},
+            ],
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "Custom Adinkra Chains Gold Necklace" in formatted
+    assert "*GH₵45,000.00*" in formatted
+    assert "*GH₵39,000.00*" in formatted
+    assert "*GH₵33,000.00*" in formatted
+    assert "18k" in formatted and "14k" in formatted and "12k" in formatted
+    # Delivery is offered, never priced -- same rule as every other shape
+    assert "rider delivery within Accra" in formatted
+
+
+def test_formats_identified_product_invites_correction_rather_than_asserting_certainty():
+    # Confirmed live, 2026-08-18: a photo match confidently picked the
+    # wrong one of two similar cross necklace-and-earring sets, despite
+    # the temperature=0/prompt-conservatism fix made after an earlier,
+    # similar mismatch. The wording must invite a correction rather than
+    # assert "that's the X" as settled fact, since the system can be
+    # confidently wrong here.
+    result = {
+        "identified_product": {
+            "product": "Custom Cross Gold Necklace with Earrings",
+            "image_url": "https://example.com/cross.jpg",
+            "variants": [{"material": "18k", "price": 18000.0}],
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "that's the" not in formatted.lower()
+    assert "looks like" in formatted.lower()
+    assert "let me know if that's not" in formatted.lower()
+
+
+def test_formats_identified_product_with_no_variants_gives_an_honest_fallback():
+    # The product was visually identified, but its price rows couldn't
+    # be pulled up (e.g. products.json changed underneath us) -- say so
+    # rather than showing an empty price list.
+    result = {"identified_product": {"product": "Some Necklace", "image_url": None, "variants": []}}
+    formatted = format_for_customer(result)
+    assert "Some Necklace" in formatted
+    assert "couldn't pull up current pricing" in formatted
+
+
 def test_formats_recommendations_drops_the_redundant_per_item_cta():
     # Each multi-variant product used to end its own line with "tell me
     # your size and karat and I'll get you the exact price" -- fine for

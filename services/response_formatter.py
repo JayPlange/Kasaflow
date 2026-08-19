@@ -273,6 +273,41 @@ def format_for_customer(result: dict | None) -> str:
         # generate_quote's "couldn't find that product" case.
         return result["message"]
 
+    if "identified_product" in result:
+        # A photo match (services/photo_match_tool.py's
+        # identify_product_from_photo) -- the exact product is already
+        # known here, not just a category, so this shows every karat
+        # price rather than the recommendations list's 3-variant cap
+        # (_MAX_VARIANTS_LISTED above): there's exactly one product to
+        # describe, not a browse list to keep short.
+        #
+        # Deliberately hedged wording ("looks like", not "that's the"),
+        # even though this is presented as a single confident match, not
+        # a browse list. Confirmed live, 2026-08-18: this matched
+        # confidently to the wrong one of two similar cross
+        # necklace-and-earring sets in the catalogue, despite the
+        # temperature=0 and conservative-prompt changes made after an
+        # earlier, similar mismatch the day before -- those reduced but
+        # did not eliminate the risk of a wrong-but-confident visual
+        # match. The product's own photo is always shown alongside this
+        # reply so a human can catch a wrong match by eye; the wording
+        # itself should invite that check rather than assert certainty
+        # the system doesn't reliably have.
+        p = result["identified_product"]
+        variants = p.get("variants") or []
+        if not variants:
+            return (
+                f"This looks like our *{p['product']}* -- but I couldn't pull up current "
+                f"pricing for it just now. Let me get someone to check for you."
+            )
+        sub_lines = "\n".join(f"- {v['material']}: *GH₵{v['price']:,.2f}*" for v in variants)
+        options_phrase = delivery_options_phrase()
+        return (
+            f"This looks like our *{p['product']}* -- it's in stock. Prices by karat:\n{sub_lines}\n\n"
+            f"We deliver via {options_phrase}. Let me know if that's not quite the right one and "
+            f"I'll help you find the correct piece -- otherwise, want me to get an order started?"
+        )
+
     if "recommendations" in result:
         items = result["recommendations"]
         if not items:

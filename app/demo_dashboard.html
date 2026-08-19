@@ -236,6 +236,20 @@
     font-size: 12.5px; color: #d64545; font-weight: 500;
   }
   .rec-indicator.show { display: flex; }
+  .staged-photo {
+    display: none; align-items: center; gap: 10px; padding: 6px 6px 10px;
+  }
+  .staged-photo.show { display: flex; }
+  .staged-photo .thumb {
+    width: 40px; height: 40px; border-radius: 10px; object-fit: cover;
+    border: 1px solid var(--line); flex-shrink: 0;
+  }
+  .staged-photo .label { font-size: 12.5px; color: var(--ink-soft); flex: 1; }
+  .staged-photo .remove-btn {
+    width: 22px; height: 22px; border-radius: 50%; border: none; cursor: pointer;
+    background: var(--line); color: var(--ink-soft); font-size: 14px; line-height: 1;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
   .rec-dot { width: 7px; height: 7px; border-radius: 50%; background: #d64545; animation: pulse 1.2s infinite; }
 </style>
 </head>
@@ -263,6 +277,11 @@
 
   <div class="composer">
     <div class="rec-indicator" id="recIndicator"><span class="rec-dot"></span><span id="recTime">Recording · 0:00</span></div>
+    <div class="staged-photo" id="stagedPhoto">
+      <img class="thumb" id="stagedPhotoThumb" src="">
+      <span class="label">Photo attached -- type a caption (optional) and send</span>
+      <button class="remove-btn" id="stagedPhotoRemove" aria-label="Remove photo" type="button">&times;</button>
+    </div>
     <div class="composer-row">
       <input class="text-field" id="textInput" type="text" placeholder="Message Adom De Jeweller" autocomplete="off">
       <input type="file" id="imageInput" accept="image/*" style="display:none">
@@ -291,8 +310,18 @@ const recIndicator = document.getElementById('recIndicator');
 const recTime = document.getElementById('recTime');
 const langBtns = document.querySelectorAll('.lang-btn');
 const presenterToggle = document.getElementById('presenterToggle');
+const stagedPhoto = document.getElementById('stagedPhoto');
+const stagedPhotoThumb = document.getElementById('stagedPhotoThumb');
+const stagedPhotoRemove = document.getElementById('stagedPhotoRemove');
 
 let sessionId = null;
+// The photo picked via photoBtn, held here rather than sent immediately
+// -- a real customer attaches a photo, types a caption ("is this the
+// Adinkra necklace"), then sends both together. Sending the moment the
+// file picker closes never gave them that chance (confirmed live,
+// 2026-08-17: typing a caption AFTER picking the photo was silently
+// ignored, since by then the request had already gone out).
+let pendingImageFile = null;
 let language = 'twi';
 let mediaRecorder = null;
 let audioChunks = [];
@@ -502,7 +531,8 @@ async function sendToServer({ text, audioBlob, imageFile }) {
       addVoiceRow(false, 'data:audio/mpeg;base64,' + data.reply_audio_base64, language === 'twi' ? 'Reply spoken in Twi' : 'Reply spoken back');
     }
 
-    showInsight(data.image_url ? 'get_product_price' : 'route_customer', 'session ' + sessionId.slice(0, 8));
+    const toolLabel = data.tool || (data.image_url ? 'get_product_price' : 'route_customer');
+    showInsight(toolLabel, 'session ' + sessionId.slice(0, 8));
   } catch (e) {
     hideTyping();
     addTextRow(false, 'Connection error — is the KasaFlow server running?');
@@ -511,6 +541,13 @@ async function sendToServer({ text, audioBlob, imageFile }) {
 
 sendBtn.addEventListener('click', () => {
   const val = textInput.value.trim();
+  // A staged photo takes priority -- send it (with whatever's been
+  // typed as its caption) rather than treating the typed text as a
+  // separate, photo-less message.
+  if (pendingImageFile) {
+    sendStagedPhoto(val);
+    return;
+  }
   if (!val) return;
   addTextRow(true, val);
   textInput.value = '';
@@ -524,16 +561,43 @@ imageInput.addEventListener('change', () => {
   imageInput.value = ''; // allow picking the same file again later
   if (!file) return;
 
+  // Stage, don't send yet -- a real customer attaches a photo, THEN
+  // types a caption ("is this the Adinkra necklace"), then sends both
+  // together. Sending immediately on pick left no way to type a
+  // caption afterwards (confirmed live, 2026-08-17).
+  pendingImageFile = file;
+  stagedPhotoThumb.src = URL.createObjectURL(file);
+  stagedPhoto.classList.add('show');
+  textInput.focus();
+});
+
+stagedPhotoRemove.addEventListener('click', () => {
+  pendingImageFile = null;
+  stagedPhoto.classList.remove('show');
+});
+
+function sendStagedPhoto(caption) {
+  const file = pendingImageFile;
+  pendingImageFile = null;
+  stagedPhoto.classList.remove('show');
+  textInput.value = '';
+
   // Preview what the customer "sent", same immediate-feedback pattern
   // as the voice note bubble, before the server has replied at all.
   const row = document.createElement('div');
   row.className = 'row mine';
   row.innerHTML = `<div class="img-bubble"><img src="${URL.createObjectURL(file)}"></div>`;
   thread.appendChild(row);
+  if (caption) {
+    const capRow = document.createElement('p');
+    capRow.className = 'meta-line';
+    capRow.textContent = caption;
+    row.after(capRow);
+  }
   scrollDown();
 
-  sendToServer({ imageFile: file });
-});
+  sendToServer({ imageFile: file, text: caption || undefined });
+}
 
 micBtn.addEventListener('click', async () => {
   if (mediaRecorder && mediaRecorder.state === 'recording') {

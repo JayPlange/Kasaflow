@@ -30,6 +30,7 @@ class Settings:
     openai_api_key: str
     openai_model: str
     products_path: Path
+    image_embeddings_path: Path
     llm_max_retries: int
     llm_timeout_seconds: float
     log_level: str
@@ -73,6 +74,25 @@ class Settings:
     # a real sale on a notification channel not being configured yet.
     staff_notification_phone: str | None
 
+    # Cohere, not OpenAI -- OpenAI has no hosted image-embedding
+    # endpoint (confirmed against their API reference, 2026-08-18);
+    # text-embedding-3-* is text-only. Optional like the other
+    # integrations above: identify_product_from_photo() falls back to
+    # the ordinary text pipeline when this isn't configured, a photo
+    # customers send just won't get exact-item identification without
+    # it. See services/image_embed_tool.py.
+    cohere_api_key: str | None
+
+    # Optional, like cohere_api_key above: services/geocoding_tool.py
+    # falls back to delivery_tool.delivery_option_matches_address()'s
+    # offline curated-city-name heuristic when this isn't configured,
+    # rather than blocking order flow on a geocoding vendor. See
+    # geocoding_tool.py's module docstring for why a real geocoder
+    # (rather than a hardcoded city list) is needed at all: customers
+    # give neighbourhood-level addresses ("East Legon", "Suame",
+    # "Mankessim"), not region names, and no fixed list can cover those.
+    google_maps_api_key: str | None
+
 
 def load_settings() -> Settings:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -98,6 +118,9 @@ def load_settings() -> Settings:
         products_path=Path(
             os.getenv("PRODUCTS_PATH", str(BASE_DIR / "data" / "products.json"))
         ),
+        image_embeddings_path=Path(
+            os.getenv("IMAGE_EMBEDDINGS_PATH", str(BASE_DIR / "data" / "image_embeddings.json"))
+        ),
         llm_max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
         llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
@@ -118,6 +141,8 @@ def load_settings() -> Settings:
         whatsapp_access_token=os.getenv("WHATSAPP_ACCESS_TOKEN"),
         whatsapp_phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID"),
         staff_notification_phone=os.getenv("STAFF_NOTIFICATION_PHONE"),
+        cohere_api_key=os.getenv("COHERE_API_KEY"),
+        google_maps_api_key=os.getenv("GOOGLE_MAPS_API_KEY"),
     )
 
 

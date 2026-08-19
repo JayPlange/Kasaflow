@@ -6,3 +6,4 @@ pydantic==2.12.5
 slowapi==0.1.9
 requests==2.32.3
 python-multipart==0.0.20
+cohere==7.0.8

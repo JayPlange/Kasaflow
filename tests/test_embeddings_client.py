@@ -16,6 +16,13 @@ from services import embeddings_client
 from services.embeddings_client import EmbeddingError
 
 
+def test_embeddings_client_disables_sdk_level_retries():
+    # Same fix as vision_tool.py and llm.py's clients -- this module
+    # already implements its own retry/backoff loop, so the SDK's own
+    # default internal retries only add compounding delay on top of it.
+    assert embeddings_client.client.max_retries == 0
+
+
 def _mock_embeddings_response(vectors: list[list[float]]):
     """Builds a fake response object shaped like the real OpenAI SDK's."""
     return SimpleNamespace(data=[SimpleNamespace(embedding=vector) for vector in vectors])

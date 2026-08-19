@@ -31,6 +31,9 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, Response
 
 from app.config import settings
+from services.memory import remember_context
+from services.photo_match_tool import identify_product_from_photo
+from services.product_tool import get_product_karat_options
 from services.response_formatter import _group_by_product, _select_diverse_groups, format_for_customer
 from services.router import route_customer
 from services.vision_tool import VisionServiceError, describe_product_image
@@ -160,6 +163,9 @@ async def demo_message(
 ):
     session_id = session_id or str(uuid.uuid4())
     transcript = None
+    result = None
+    matched_tool = None
+    photo_unconfirmed = False
 
     if audio is not None:
         raw_bytes = await audio.read()
@@ -179,31 +185,101 @@ async def demo_message(
             return {"error": "Couldn't make that out -- try again or type it instead."}
         customer_text = transcript
     elif image is not None:
-        # Mirrors whatsapp_routes.py's image branch exactly -- a photo
-        # becomes customer_text the same way a voice note does, then
-        # goes through the identical route_customer()/format_for_customer()
-        # pipeline. describe_product_image() itself is flagged in
-        # vision_tool.py as not yet confirmed against a real OpenAI
-        # response from this environment -- this is genuinely the first
-        # place to find out whether it works, before a customer's photo
-        # does.
+        # Mirrors whatsapp_routes.py's image branch -- a photo becomes
+        # customer_text the same way a voice note does. describe_product_image()
+        # itself was flagged in vision_tool.py as not yet confirmed
+        # against a real OpenAI response before this dashboard existed;
+        # confirmed working live, 2026-08-17.
         image_bytes = await image.read()
+        image_mime_type = image.content_type or "image/jpeg"
         try:
-            transcript = describe_product_image(image_bytes, mime_type=image.content_type or "image/jpeg")
+            transcript = describe_product_image(image_bytes, mime_type=image_mime_type)
         except VisionServiceError as e:
             logger.error("Image description failed: %s", e)
             return {"error": f"Image description failed: {e}"}
 
         if not transcript.strip():
             return {"error": "Couldn't quite tell what that was -- mind describing it in words instead?"}
-        customer_text = transcript
+
+        # A caption sent alongside the photo ("is this the Adinkra
+        # necklace") is a real identifying signal -- previously dropped
+        # entirely, since this branch only ever looked at `image` and
+        # never `text`. No longer used for candidate narrowing itself
+        # (see photo_match_tool.py's module docstring for why that
+        # moved to image embeddings), but still folded into
+        # customer_text: it's what gets routed if no confident photo
+        # match is found, and what's shown as the "Read as" caption in
+        # the UI either way.
+        caption = text.strip() if text and text.strip() else None
+        customer_text = f"{caption} {transcript}" if caption else transcript
+
+        # Confirmed live, 2026-08-17: a generic vision description
+        # ("gold pendant necklace with chain link design") routed
+        # through the ordinary text pipeline only ever produces a
+        # category-level browse (see llm.py's recommend_products
+        # guidance), never a specific-item match -- there's no literal
+        # product name to exact-match against. identify_product_from_photo()
+        # attempts an actual visual match (image embeddings, then a
+        # vision comparison against the narrowed shortlist -- see
+        # photo_match_tool.py) before falling back to that same generic
+        # browse.
+        try:
+            matched_name = identify_product_from_photo(image_bytes, image_mime_type)
+        except VisionServiceError as e:
+            logger.warning("Photo identification failed, falling back to text pipeline: %s", e)
+            matched_name = None
+
+        if matched_name:
+            variants = get_product_karat_options(matched_name)
+            matched_image_url = next((v.get("image_url") for v in variants if v.get("image_url")), None)
+            result = {
+                "identified_product": {"product": matched_name, "image_url": matched_image_url, "variants": variants},
+                # Duplicated at top level too -- the image_url/cards
+                # extraction below (shared with every other result
+                # shape) reads result.get("image_url") directly, same
+                # as get_product_price()'s shape does.
+                "image_url": matched_image_url,
+            }
+            # A confident match bypasses route_customer() entirely (it's
+            # answered deterministically, no LLM call needed), which
+            # means remember_context() -- normally called inside
+            # router.py's _execute_single() for every LLM-driven tool
+            # call -- never runs for this turn. Without this, a
+            # follow-up "I'll take it" or "2 please" right after a photo
+            # match has nothing to resolve "it"/an implicit product
+            # against, since nothing was ever remembered.
+            #
+            # material and category explicitly cleared (set to None,
+            # not just omitted): remember_context() only overwrites keys
+            # actually present in the dict passed to it, so if an
+            # earlier, unrelated product in this same session had
+            # remembered a karat (e.g. "the 18k ring" from three turns
+            # ago), leaving material out here would let that stale
+            # karat silently attach itself to this newly-identified,
+            # different product on the very next turn.
+            remember_context(session_id, {"product_name": matched_name, "material": None, "category": None})
+            matched_tool = "identify_product_from_photo"
+        else:
+            # No confident single-item match -- fall back to the
+            # ordinary text-driven pipeline, same behaviour as before
+            # this feature existed. Flagged with photo_unconfirmed so
+            # the reply below is honest about being a nearest-match
+            # browse, not a confirmed identification.
+            photo_unconfirmed = True
     elif text and text.strip():
         customer_text = text.strip()
     else:
         return {"error": "Send text, a voice note, or a photo."}
 
-    result = route_customer(customer_text, session_id=session_id)
+    if result is None:
+        result = route_customer(customer_text, session_id=session_id)
+
     reply_text = format_for_customer(result)
+    if photo_unconfirmed:
+        reply_text = (
+            "I couldn't confirm that's one exact item in our catalogue, but here's what looks closest:\n\n"
+            + reply_text
+        )
     image_url = _proxied_image_url(result.get("image_url")) if isinstance(result, dict) else None
     cards = _build_recommendation_cards(result) if isinstance(result, dict) and "recommendations" in result else []
 
@@ -222,4 +298,5 @@ async def demo_message(
         "image_url": image_url,
         "cards": cards,
         "reply_audio_base64": reply_audio_base64,
+        "tool": matched_tool,
     }

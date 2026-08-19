@@ -112,6 +112,19 @@ def _handle_message(message: dict) -> None:
                 )
                 return
 
+            # A caption sent alongside the photo ("is this the Adinkra
+            # necklace") is a real identifying signal -- previously
+            # dropped entirely, since only message["image"]["id"] was
+            # ever read here. WhatsApp's Cloud API image object supports
+            # an optional "caption" field (see whatsapp_client.py's own
+            # send_image_message, which sends one on the way out); the
+            # inbound payload mirrors that shape. Confirmed a matching
+            # gap existed in app/demo_routes.py's own image branch,
+            # 2026-08-17, fixed there the same way.
+            caption = (message["image"].get("caption") or "").strip()
+            if caption:
+                customer_text = f"{caption} {customer_text}"
+
         else:
             logger.info("Unhandled WhatsApp message type: %s", message_type)
             return

@@ -145,3 +145,72 @@ def test_get_product_price_falls_through_to_semantic_search_when_no_karat_match(
 
     # Assert: no crash, correctly falls through to "no match"
     assert result is None
+
+
+# ---------------------------------------------------------------------
+# get_product_karat_options -- the full price-by-karat breakdown for
+# one already-identified product (see photo_match_tool.py), not just
+# the single karat get_product_price() returns.
+# ---------------------------------------------------------------------
+
+def _necklace_catalogue():
+    return [
+        {"product": "Gye Nyame White Necklace", "material": "18k", "price": 51000.0, "image_url": "https://x/a.jpg"},
+        {"product": "Gye Nyame White Necklace", "material": "14k", "price": 45000.0, "image_url": "https://x/a.jpg"},
+        {"product": "Gye Nyame White Necklace", "material": "12k", "price": 39000.0, "image_url": "https://x/a.jpg"},
+        {"product": "Other Necklace", "material": "18k", "price": 20000.0, "image_url": "https://x/b.jpg"},
+    ]
+
+
+def test_get_product_karat_options_returns_only_matching_product_sorted_by_karat(monkeypatch, tmp_path):
+    # Arrange
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # Act
+    result = product_tool.get_product_karat_options("Gye Nyame White Necklace")
+
+    # Assert: highest karat first, only this product's rows, none of the
+    # unrelated "Other Necklace" rows leaked in
+    assert [r["material"] for r in result] == ["18k", "14k", "12k"]
+    assert all(r["product"] == "Gye Nyame White Necklace" for r in result)
+
+
+def test_get_product_karat_options_dedupes_sized_variants_sharing_a_karat(monkeypatch, tmp_path):
+    # Arrange: a ring with several sizes at the same karat -- same
+    # "size doesn't affect price" fact get_product_price() already
+    # relies on, so only one row per karat should come back
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_variant_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # Act
+    result = product_tool.get_product_karat_options("Set Multi Stone Golf Ring, 7g")
+
+    # Assert: 4 rows in, 2 distinct karats out
+    assert len(result) == 2
+    assert {r["material"][:2] for r in result} == {"12", "18"}
+
+
+def test_get_product_karat_options_returns_empty_list_for_no_match(monkeypatch, tmp_path):
+    # Arrange
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # Act
+    result = product_tool.get_product_karat_options("Completely Unknown Product")
+
+    # Assert: no fabricated fallback -- see module docstring, this
+    # deliberately doesn't fall through to semantic search
+    assert result == []
+
+
+def test_get_product_karat_options_returns_empty_list_when_file_missing(monkeypatch, tmp_path):
+    # Arrange
+    missing_file = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(missing_file))
+
+    # Act / Assert: fails gracefully, not with an exception
+    assert product_tool.get_product_karat_options("Anything") == []

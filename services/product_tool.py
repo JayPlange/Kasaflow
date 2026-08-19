@@ -113,3 +113,51 @@ def get_product_price(product_name: str, material: str):
 
     logger.info("No product match at all for product_name=%s material=%s", product_name, material)
     return None
+
+
+def get_product_karat_options(product_name: str) -> list[dict]:
+    """All karat variants of one exact product name, sorted highest
+    karat first -- used once a specific product has already been
+    identified with confidence (e.g. a matched customer photo, see
+    services/photo_match_tool.py) and the customer needs the full
+    price-by-karat picture, not just one karat's price.
+
+    Deliberately does NOT fall back to semantic search the way
+    get_product_price() does: the caller already has an exact
+    product_name in hand from a confirmed match, so a fuzzy fallback
+    here would risk quietly mixing in a different, similarly-named
+    product's variants instead of just returning nothing.
+    """
+    try:
+        with open(settings.products_path, "r") as file:
+            products = json.load(file)
+    except FileNotFoundError:
+        logger.error("Products file not found at %s", settings.products_path)
+        return []
+    except json.JSONDecodeError as e:
+        logger.error("Products file at %s is not valid JSON: %s", settings.products_path, e)
+        return []
+
+    matches = [p for p in products if p["product"] == product_name]
+
+    # Dedupe by karat -- a sized product (rings) repeats the same karat
+    # across several size rows, all sharing one price (same "size
+    # doesn't affect price" fact already established in
+    # get_product_price()'s comment above). Showing "18k: X" three times
+    # over for three sizes would just repeat the same line.
+    seen_karats: set[str] = set()
+    deduped: list[dict] = []
+    for product in matches:
+        karat = _extract_karat(product.get("material"))
+        key = karat or (product.get("material") or "")
+        if key in seen_karats:
+            continue
+        seen_karats.add(key)
+        deduped.append(product)
+
+    def _sort_key(product: dict) -> int:
+        karat = _extract_karat(product.get("material"))
+        return -int(karat) if karat and karat.isdigit() else 0
+
+    deduped.sort(key=_sort_key)
+    return deduped

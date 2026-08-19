@@ -193,3 +193,125 @@ def test_demo_message_surfaces_a_clean_error_when_vision_service_fails(monkeypat
 
     assert "error" in result
     assert "vision API unreachable" in result["error"]
+
+
+# ---------------------------------------------------------------------
+# demo_message -- photo identification (identify_product_from_photo).
+# Confirmed live, 2026-08-17: a generic vision description routed
+# through the ordinary text pipeline only ever produces a category
+# browse, never a specific-item match. These tests cover the new
+# confident-match and honest-fallback paths built on top of that
+# finding.
+# ---------------------------------------------------------------------
+
+def test_demo_message_returns_full_karat_breakdown_on_a_confident_photo_match(monkeypatch):
+    monkeypatch.setattr(demo_routes, "describe_product_image", lambda image_bytes, mime_type=None: "gold pendant necklace")
+    monkeypatch.setattr(demo_routes, "identify_product_from_photo", lambda *a, **k: "Custom Adinkra Chains Gold Necklace")
+    monkeypatch.setattr(
+        demo_routes, "get_product_karat_options",
+        lambda name: [
+            {"material": "18k", "price": 45000.0, "image_url": "https://x/a.jpg"},
+            {"material": "14k", "price": 39000.0, "image_url": "https://x/a.jpg"},
+        ],
+    )
+    route_customer_mock = MagicMock()
+    monkeypatch.setattr(demo_routes, "route_customer", route_customer_mock)
+
+    result = _run_demo_message(image=_FakeUploadFile(b"fake-jpeg-bytes"))
+
+    # A confident match is answered deterministically -- the LLM-driven
+    # pipeline is never even called.
+    route_customer_mock.assert_not_called()
+    assert "Custom Adinkra Chains Gold Necklace" in result["reply_text"]
+    assert "*GH₵45,000.00*" in result["reply_text"]
+    assert "*GH₵39,000.00*" in result["reply_text"]
+    assert result["tool"] == "identify_product_from_photo"
+    assert result["image_url"].startswith("/demo/image-proxy?url=")
+
+
+def test_demo_message_falls_back_honestly_when_photo_has_no_confident_match(monkeypatch):
+    monkeypatch.setattr(demo_routes, "describe_product_image", lambda image_bytes, mime_type=None: "gold pendant necklace")
+    monkeypatch.setattr(demo_routes, "identify_product_from_photo", lambda *a, **k: None)
+    monkeypatch.setattr(
+        demo_routes, "route_customer",
+        lambda text, session_id: {"recommendations": [
+            {"product": "Necklace A", "material": "18k", "price": 20000.0, "category": "Necklaces", "image_url": None},
+        ]},
+    )
+
+    result = _run_demo_message(image=_FakeUploadFile(b"fake-jpeg-bytes"))
+
+    # Honest framing: doesn't claim identification succeeded
+    assert "couldn't confirm" in result["reply_text"].lower()
+    assert result["tool"] is None
+
+
+def test_demo_message_combines_a_typed_caption_with_the_photo(monkeypatch):
+    # Candidate narrowing is image-native now (services/photo_match_tool.py
+    # no longer takes a text query at all -- see its module docstring),
+    # so the caption's only remaining job is the fallback text pipeline
+    # and the "Read as" UI caption. Previously the elif chain dropped
+    # the caption entirely; this confirms it's no longer lost.
+    monkeypatch.setattr(demo_routes, "describe_product_image", lambda image_bytes, mime_type=None: "gold pendant necklace")
+    identify_mock = MagicMock(return_value=None)
+    monkeypatch.setattr(demo_routes, "identify_product_from_photo", identify_mock)
+    route_customer_mock = MagicMock(return_value={"recommendations": []})
+    monkeypatch.setattr(demo_routes, "route_customer", route_customer_mock)
+
+    _run_demo_message(text="is this the Adinkra necklace", image=_FakeUploadFile(b"fake-jpeg-bytes"))
+
+    routed_text = route_customer_mock.call_args[0][0]
+    assert "is this the Adinkra necklace" in routed_text
+    assert "gold pendant necklace" in routed_text
+
+
+def test_demo_message_calls_identify_product_from_photo_with_just_the_photo(monkeypatch):
+    # identify_product_from_photo()'s signature dropped query_text when
+    # narrowing moved from text search to image embeddings (2026-08-18)
+    # -- confirms the call site was updated to match, not left passing
+    # a third argument the function no longer accepts.
+    monkeypatch.setattr(demo_routes, "describe_product_image", lambda image_bytes, mime_type=None: "gold pendant necklace")
+    identify_mock = MagicMock(return_value=None)
+    monkeypatch.setattr(demo_routes, "identify_product_from_photo", identify_mock)
+    monkeypatch.setattr(demo_routes, "route_customer", lambda text, session_id: {"recommendations": []})
+
+    _run_demo_message(image=_FakeUploadFile(b"fake-jpeg-bytes"))
+
+    identify_mock.assert_called_once_with(b"fake-jpeg-bytes", "image/jpeg")
+
+
+def test_demo_message_remembers_the_identified_product_for_a_follow_up(monkeypatch):
+    # A confident photo match bypasses route_customer() entirely, so
+    # remember_context() -- normally called inside router.py for every
+    # LLM-driven tool call -- would otherwise never run. Without it, a
+    # follow-up "I'll take it" right after a photo match has nothing to
+    # resolve against (confirmed as a real gap, 2026-08-17).
+    monkeypatch.setattr(demo_routes, "describe_product_image", lambda image_bytes, mime_type=None: "gold pendant necklace")
+    monkeypatch.setattr(demo_routes, "identify_product_from_photo", lambda *a, **k: "Custom Adinkra Chains Gold Necklace")
+    monkeypatch.setattr(demo_routes, "get_product_karat_options", lambda name: [{"material": "18k", "price": 45000.0, "image_url": None}])
+    remember_mock = MagicMock()
+    monkeypatch.setattr(demo_routes, "remember_context", remember_mock)
+
+    _run_demo_message(image=_FakeUploadFile(b"fake-jpeg-bytes"))
+
+    # product_name remembered; material/category explicitly cleared so
+    # a stale karat from an earlier, different product in this session
+    # can't silently attach itself to this new one.
+    remember_mock.assert_called_once_with(
+        remember_mock.call_args[0][0],
+        {"product_name": "Custom Adinkra Chains Gold Necklace", "material": None, "category": None},
+    )
+
+
+def test_demo_message_does_not_remember_context_on_a_photo_fallback(monkeypatch):
+    # No confident match -- nothing was actually identified, so nothing
+    # should be remembered as if it had been.
+    monkeypatch.setattr(demo_routes, "describe_product_image", lambda image_bytes, mime_type=None: "gold pendant necklace")
+    monkeypatch.setattr(demo_routes, "identify_product_from_photo", lambda *a, **k: None)
+    monkeypatch.setattr(demo_routes, "route_customer", lambda text, session_id: {"recommendations": []})
+    remember_mock = MagicMock()
+    monkeypatch.setattr(demo_routes, "remember_context", remember_mock)
+
+    _run_demo_message(image=_FakeUploadFile(b"fake-jpeg-bytes"))
+
+    remember_mock.assert_not_called()

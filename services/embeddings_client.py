@@ -16,7 +16,11 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-client = OpenAI(api_key=settings.openai_api_key)
+# max_retries=0: see vision_tool.py's client for why -- this module
+# already implements its own retry/backoff loop, so the SDK's own
+# default internal retries only add compounding delay on top of it
+# without adding any real reliability.
+client = OpenAI(api_key=settings.openai_api_key, max_retries=0)
 
 # OpenAI's embeddings endpoint hard-rejects an `input` array longer than
 # 2048 entries (a single request, regardless of token count). Fine
