@@ -26,7 +26,11 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-client = OpenAI(api_key=settings.openai_api_key)
+# max_retries=0: see vision_tool.py's client for why -- this module
+# already implements its own retry/backoff loop (llm_max_retries), so
+# the SDK's own default internal retries only add compounding delay on
+# top of it without adding any real reliability.
+client = OpenAI(api_key=settings.openai_api_key, max_retries=0)
 
 # A customer message could in principle list many items -- this caps
 # how many distinct tool calls one message can trigger, so a single
@@ -99,7 +103,7 @@ Arguments:
 - delivery_address
 - delivery_option
 Use this when the customer clearly wants to PLACE an order, not just ask a price or a quote, and has given enough detail to price it. If they haven't stated how many they want, set quantity to "unknown" rather than assuming 1. If they haven't given a delivery address yet, set delivery_address to "unknown" -- never invent either one.
-`delivery_option` must be one of this store's three real delivery arrangements: "accra_rider" (rider delivery within Accra), "kumasi_rider" (rider delivery within Kumasi), or "international" (shipping outside Ghana). Infer it from the delivery address or an explicit statement -- "deliver to Accra"/an Accra address means "accra_rider"; "Kumasi" means "kumasi_rider"; anywhere outside Ghana, or an explicit "ship it"/"I'm not in Ghana", means "international". Set to "unknown" if you genuinely can't tell. This store doesn't price delivery automatically -- a human arranges the actual rider/shipping after the order is placed -- so this only needs to capture which of the three arrangements the customer wants, not a cost or time. This never actually creates the order; it only prices the product and shows the customer a proposal to confirm.
+`delivery_option` must be one of this store's three real delivery arrangements: "accra_rider" (rider delivery within Accra), "kumasi_rider" (rider delivery within Kumasi), or "international" (shipping outside Ghana). Infer it from the delivery address or an explicit statement -- "deliver to Accra"/an Accra address means "accra_rider"; "Kumasi" means "kumasi_rider"; an explicit "ship it"/"I'm not in Ghana"/a real address outside Ghana means "international". Ghana has many cities and towns besides Accra and Kumasi (Tamale, Cape Coast, Takoradi, Koforidua, Ho, and others) -- do not assume "international" just because the stated address isn't Accra or Kumasi; that's a real Ghanaian address, not an international one, even though this store has no dedicated rider zone for it. Set to "unknown" if you genuinely can't tell. This store doesn't price delivery automatically -- a human arranges the actual rider/shipping after the order is placed -- so this only needs to capture which of the three arrangements the customer wants, not a cost or time. This never actually creates the order; it only prices the product and shows the customer a proposal to confirm.
 
 7. confirm_order
 Arguments:
@@ -180,6 +184,7 @@ Rules:
 - If the customer's message is purely social (a greeting, thanks, a reaction, small talk) with no business question in it, use converse. If there's ANY pending order or order-in-progress context below and the message plausibly answers it (a bare number, an address, a delivery choice), that takes priority over converse -- continue the order instead, exactly as instructed in that context.
 - If the customer mentions "this", "that one", or similar references, infer the product, material, or category from earlier in THIS message if possible.
 - If a tool needs product_name, material, or category and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
+- If the customer refers to a photo/image they already sent earlier in THIS conversation ("the image I sent", "that photo", "order the one I sent a picture of") to identify which product they mean, do not say you can't view images -- a photo sent earlier in this conversation may already have been matched to a specific catalogue item and remembered. Treat it exactly like naming that product: use whichever tool their request actually needs (get_product_price, propose_order, generate_quote, ...) with product_name "unknown", and let the system's own memory resolve it. Only fall back to converse and explain you can't view images if the customer is sending or describing an image right now, in this message, with no earlier photo anywhere in the conversation to refer back to.
 
 Multiple requests in one message:
 
@@ -259,6 +264,8 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {last_action_outcome_state}
 
+{last_priced_product_state}
+
 Customer:
 {message}
 """
@@ -333,10 +340,19 @@ def _order_draft_state_line(order_draft: dict | None) -> str:
     return (
         f"This customer already has an order in progress. Known so far: {known_text}. "
         f"Still missing: {missing_text}. If their current message is short and only makes "
-        f"sense as answering one of the missing pieces (a bare number for quantity, a bare "
-        f"address, \"Accra\"/\"Kumasi\"/\"ship it\"/\"outside Ghana\" for delivery option), "
-        f"treat it as continuing this order: use propose_order, fill in the new piece from "
-        f"their message, and keep every OTHER already-known value exactly as given above. "
+        f"sense as answering one of the missing pieces, treat it as continuing this order: "
+        f"use propose_order, fill in the new piece from their message, and keep every OTHER "
+        f"already-known value exactly as given above. "
+        f"A bare number on its own (\"12\", \"18\") almost always means the karat if "
+        f"material is still missing -- e.g. \"12\" -> material \"12k\" -- NOT the quantity, "
+        f"even though quantity is also often given as a bare number; only read a bare number "
+        f"as quantity if material is already known, or if the message clearly states a "
+        f"separate count (\"2 please\", \"I want 3\", \"12k, 2 of them\"). Never use the "
+        f"same number from the message to fill two different fields -- if a digit already "
+        f"answered the karat, do not also copy that same digit into quantity unless the "
+        f"customer separately gave a count; leave quantity as \"unknown\" (never assume 1) "
+        f"if they didn't. A bare address, or \"Accra\"/\"Kumasi\"/\"ship it\"/\"outside "
+        f"Ghana\", answers delivery option. "
         f"Exception: if their current message clearly states a different value for one of "
         f"the already-known fields instead -- a correction, e.g. \"sorry, Kumasi not Accra\", "
         f"or a different quantity/address than what's listed above -- use their new value for "
@@ -416,12 +432,42 @@ def _last_action_outcome_state_line(last_action_outcome: dict | None) -> str:
     )
 
 
+def _last_priced_product_state_line(last_priced_product: str | None) -> str:
+    """Describes the specific product a get_product_price/generate_quote
+    call most recently resolved to, so a bare karat-only follow-up
+    ("what about in 18k") re-quotes the SAME product instead of falling
+    through to a category browse.
+
+    Exists because a message with a karat but no product name of its
+    own previously had no signal telling the model a specific product
+    was still the active topic -- confirmed live, 2026-08-18: after
+    being quoted the Big White Crown Stone Gold Ring at 14k, "what about
+    in 18k" returned four unrelated products instead of that same ring's
+    18k price. recommend_products's own canonical usage example
+    ("necklaces in 18k") is itself a bare-karat phrase, which pulled
+    ambiguous follow-ups like this toward a browse instead of a
+    continuation. See memory.set_last_priced_product()."""
+    if not last_priced_product:
+        return ""
+    return (
+        f"The last specific product this customer asked about was "
+        f"\"{last_priced_product}\". If their current message states only a "
+        f"material/karat with no product name of its own, and does not read as a "
+        f"fresh browse request for a whole category (\"what rings do you have\", "
+        f"\"show me your necklaces\"), treat it as asking about "
+        f"\"{last_priced_product}\" at that karat -- call get_product_price with "
+        f"product_name \"{last_priced_product}\" and the newly stated material, "
+        f"rather than recommend_products."
+    )
+
+
 def _build_prompt(
     message: str,
     pending_order: dict | None,
     order_draft: dict | None,
     pending_intent: str | None = None,
     last_action_outcome: dict | None = None,
+    last_priced_product: str | None = None,
 ) -> str:
     return _PROMPT_TEMPLATE.format(
         message=message,
@@ -429,6 +475,7 @@ def _build_prompt(
         order_draft_state=_order_draft_state_line(order_draft),
         pending_intent_state=_pending_intent_state_line(pending_intent),
         last_action_outcome_state=_last_action_outcome_state_line(last_action_outcome),
+        last_priced_product_state=_last_priced_product_state_line(last_priced_product),
     )
 
 
@@ -438,6 +485,7 @@ def _call_llm(
     order_draft: dict | None,
     pending_intent: str | None = None,
     last_action_outcome: dict | None = None,
+    last_priced_product: str | None = None,
 ) -> str:
     """Call the model with retries on transient failures only.
 
@@ -451,7 +499,9 @@ def _call_llm(
         try:
             response = client.responses.create(
                 model=settings.openai_model,
-                input=_build_prompt(message, pending_order, order_draft, pending_intent, last_action_outcome),
+                input=_build_prompt(
+                    message, pending_order, order_draft, pending_intent, last_action_outcome, last_priced_product
+                ),
                 timeout=settings.llm_timeout_seconds,
             )
             return response.output_text
@@ -525,6 +575,7 @@ def understand_customer(
     order_draft: dict | None = None,
     pending_intent: str | None = None,
     last_action_outcome: dict | None = None,
+    last_priced_product: str | None = None,
 ) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
@@ -542,11 +593,19 @@ def understand_customer(
     last_action_outcome is a different axis entirely -- not "still
     missing something", but a real business action that was already
     fully specified and still failed (see memory.get_last_action_outcome()
-    and _last_action_outcome_state_line())."""
+    and _last_action_outcome_state_line()).
+
+    last_priced_product is the specific product a recent
+    get_product_price/generate_quote call resolved to, so a bare
+    karat-only follow-up re-quotes that same product instead of falling
+    through to a category browse (see memory.get_last_priced_product()
+    and _last_priced_product_state_line())."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
-    raw_text = _call_llm(message, pending_order, order_draft, pending_intent, last_action_outcome)
+    raw_text = _call_llm(
+        message, pending_order, order_draft, pending_intent, last_action_outcome, last_priced_product
+    )
     logger.info("Raw LLM output: %s", raw_text)
 
     return _parse_tool_request(raw_text)

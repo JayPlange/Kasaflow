@@ -18,6 +18,14 @@ from services import llm
 from services.llm import ToolSelectionError
 
 
+def test_llm_client_disables_sdk_level_retries():
+    # This module already implements its own retry/backoff loop
+    # (llm_max_retries) -- the SDK's own default internal retries only
+    # add compounding delay on top of it, the same issue confirmed live
+    # in vision_tool.py, 2026-08-17.
+    assert llm.client.max_retries == 0
+
+
 # ---------------------------------------------------------------------
 # _parse_tool_request: pure function, no API involved, no mocking needed
 # ---------------------------------------------------------------------
@@ -244,6 +252,31 @@ def test_prompt_omits_order_draft_section_once_everything_is_known():
     assert "order in progress" not in prompt
 
 
+def test_prompt_disambiguates_a_bare_number_as_karat_not_quantity_when_material_missing():
+    # A bare "12" with material still missing must read as karat, not
+    # quantity -- confirmed live, 2026-08-18: "12" in reply to "What
+    # karat would you like that in?" wasn't registered, and the same
+    # question was asked again.
+    draft = {
+        "product_name": "Big White Crown Stone Gold Ring, 14g", "material": None,
+        "quantity": None, "delivery_address": None, "delivery_option": None,
+    }
+    prompt = llm._build_prompt("12", pending_order=None, order_draft=draft)
+    assert "almost always means the karat if material is still missing" in prompt
+
+
+def test_prompt_forbids_reusing_the_same_digit_for_two_fields():
+    # "12karat" must not fill material=12k AND quantity=12 from the same
+    # digit -- confirmed live, 2026-08-18: it did exactly that.
+    draft = {
+        "product_name": "Big White Crown Stone Gold Ring, 14g", "material": None,
+        "quantity": None, "delivery_address": None, "delivery_option": None,
+    }
+    prompt = llm._build_prompt("12karat", pending_order=None, order_draft=draft)
+    assert "never use the same number from the message to fill two different fields" in prompt.lower()
+    assert 'leave quantity as "unknown" (never assume 1)' in prompt
+
+
 def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatch):
     # Arrange
     fake_client = MagicMock()
@@ -282,6 +315,19 @@ def test_prompt_tells_the_model_to_use_recommend_products_for_category_photo_req
     # fall through to get_product_price("unknown") or converse
     prompt = llm._build_prompt("necklace images", pending_order=None, order_draft=None)
     assert "recommend_products with category" in prompt.lower() or "use recommend_products" in prompt.lower()
+
+
+def test_prompt_tells_the_model_not_to_deny_viewing_images_referred_back_to(monkeypatch):
+    # "order the image I sent recently" -- confirmed live, 2026-08-18:
+    # the customer had already had a photo matched to a specific
+    # product earlier in the same conversation (remembered via
+    # remember_context() in demo_routes.py), but the model still said
+    # "I can't view images" and repeated the claim after being
+    # corrected, even though a resolvable product_name was sitting in
+    # session memory the whole time.
+    prompt = llm._build_prompt("i would like to order the image i sent recently", pending_order=None, order_draft=None)
+    assert "do not say you can't view images" in prompt.lower()
+    assert "may already have been matched" in prompt.lower()
 
 
 # ---------------------------------------------------------------------
@@ -418,6 +464,44 @@ def test_understand_customer_passes_last_action_outcome_through_to_the_prompt(mo
     # Assert
     sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
     assert "reason given to the customer" in sent_prompt
+
+
+# ---------------------------------------------------------------------
+# last_priced_product -- the specific product a get_product_price/
+# generate_quote call most recently resolved to, so a bare karat-only
+# follow-up re-quotes the same item (see llm.py's
+# _last_priced_product_state_line())
+# ---------------------------------------------------------------------
+
+def test_prompt_omits_last_priced_product_section_when_none():
+    prompt = llm._build_prompt("what about in 18k", pending_order=None, order_draft=None, last_priced_product=None)
+    assert "The last specific product this customer asked about" not in prompt
+
+
+def test_prompt_describes_a_last_priced_product():
+    prompt = llm._build_prompt(
+        "what about in 18k",
+        pending_order=None, order_draft=None,
+        last_priced_product="Big White Crown Stone Gold Ring, 14g",
+    )
+    assert "Big White Crown Stone Gold Ring, 14g" in prompt
+    assert "call get_product_price with product_name" in prompt
+
+
+def test_understand_customer_passes_last_priced_product_through_to_the_prompt(monkeypatch):
+    # Arrange
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    llm.understand_customer("what about in 18k", last_priced_product="Big White Crown Stone Gold Ring, 14g")
+
+    # Assert
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "Big White Crown Stone Gold Ring, 14g" in sent_prompt
 
 
 def test_understand_customer_rejects_empty_message():

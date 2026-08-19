@@ -267,6 +267,7 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
         order_draft=None,
         pending_intent=None,
         last_action_outcome=None,
+        last_priced_product=None,
     )
 
 
@@ -285,6 +286,7 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
         order_draft=None,
         pending_intent=None,
         last_action_outcome=None,
+        last_priced_product=None,
     )
 
 
@@ -636,6 +638,155 @@ def test_route_customer_converse_does_not_touch_last_action_outcome(monkeypatch)
 
     # Assert: converse must never clear an outcome mid-explanation
     set_last_action_outcome.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# last_priced_product -- the specific product a get_product_price/
+# generate_quote call most recently resolved to (see
+# memory.set_last_priced_product()/get_last_priced_product() and llm.py's
+# _last_priced_product_state_line())
+# ---------------------------------------------------------------------
+
+def test_route_customer_passes_last_priced_product_to_understand_customer(monkeypatch):
+    # Arrange
+    understand = MagicMock(return_value={"tool": "converse", "arguments": {"reply": "..."}})
+    monkeypatch.setattr(router, "understand_customer", understand)
+    monkeypatch.setattr(router, "get_last_priced_product", MagicMock(return_value="Big White Crown Stone Gold Ring, 14g"))
+
+    # Act
+    router.route_customer("what about in 18k", "session-1")
+
+    # Assert
+    call_kwargs = understand.call_args.kwargs
+    assert call_kwargs["last_priced_product"] == "Big White Crown Stone Gold Ring, 14g"
+
+
+def test_route_customer_sets_last_priced_product_on_successful_price_lookup(monkeypatch):
+    # Arrange: get_product_price resolved a real item
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Big White Crown Stone Gold Ring, 14g", "material": "18k", "price": 1200}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("how much is the ring", "session-price-set")
+
+    # Assert
+    set_last_priced_product.assert_called_once_with("session-price-set", "Big White Crown Stone Gold Ring, 14g")
+
+
+def test_route_customer_sets_last_priced_product_on_successful_quote(monkeypatch):
+    # Arrange: generate_quote is the other tool that resolves a specific product
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "generate_quote", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Ring", "material": "18k", "price": 1200, "delivery_options": []}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("get me a quote for the ring", "session-quote-set")
+
+    # Assert
+    set_last_priced_product.assert_called_once_with("session-quote-set", "Ring")
+
+
+def test_route_customer_does_not_set_last_priced_product_when_lookup_found_nothing(monkeypatch):
+    # Arrange: a genuine miss must not overwrite whatever was priced before
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "unicorn pendant", "material": "unknown"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value=None))
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("how much is the unicorn pendant?", "session-price-miss")
+
+    # Assert
+    set_last_priced_product.assert_not_called()
+
+
+def test_route_customer_clears_last_priced_product_on_a_successful_category_browse(monkeypatch):
+    # Arrange: recommend_products succeeding means the topic has genuinely
+    # moved on from a single priced item to browsing a category
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"material": "unknown", "category": "Rings"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"recommendations": [{"product": "Ring A"}], "requested_category": "Rings"}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("what rings do you have?", "session-browse-clear")
+
+    # Assert
+    set_last_priced_product.assert_called_once_with("session-browse-clear", None)
+
+
+def test_route_customer_does_not_clear_last_priced_product_on_an_empty_category_browse(monkeypatch):
+    # Arrange: an empty recommend_products result is _found_nothing(), not
+    # a real success -- must not clear a genuinely still-active priced item
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"material": "unknown", "category": "Bracelets"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"recommendations": [], "requested_category": "Bracelets"}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("what bracelets do you have?", "session-browse-empty")
+
+    # Assert
+    set_last_priced_product.assert_not_called()
+
+
+def test_route_customer_converse_does_not_touch_last_priced_product(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "converse", "arguments": {"reply": "Hey!"}}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+    execute_tool = MagicMock()
+    monkeypatch.setattr(router, "execute_tool", execute_tool)
+
+    # Act
+    router.route_customer("hey", "session-converse-priced")
+
+    # Assert
+    set_last_priced_product.assert_not_called()
+    execute_tool.assert_not_called()
 
 
 def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypatch):

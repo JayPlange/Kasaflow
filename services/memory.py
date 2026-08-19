@@ -209,6 +209,38 @@ def get_last_action_outcome(session_id: str) -> dict | None:
     return _store.get(session_id, _LAST_ACTION_OUTCOME_KEY)
 
 
+_LAST_PRICED_PRODUCT_KEY = "last_priced_product"
+
+
+def set_last_priced_product(session_id: str, product_name: str | None) -> None:
+    """Records (or clears, with None) the exact catalogue product name a
+    get_product_price/generate_quote call most recently resolved to,
+    independent of _REMEMBERED_KEYS's "product_name" -- that one only
+    fills an argument the LLM already decided to pass as "unknown"; this
+    is the thing a NEW context line can offer the model proactively, the
+    same pattern _pending_intent_state_line() already uses.
+
+    Exists because a bare karat-only follow-up ("what about in 18k")
+    after a specific product was just priced has no product name of its
+    own for the LLM to work with, and previously had nothing telling it
+    one was still the active topic -- confirmed live, 2026-08-18: exactly
+    that message returned an unrelated 4-item recommendations list
+    instead of re-quoting the same product at 18k. See llm.py's
+    _last_priced_product_state_line().
+
+    Deliberately cleared on a successful recommend_products call (see
+    router.py's _execute_single()) -- a genuine category browse means
+    the topic has moved on from one specific item, so a later bare
+    karat message should mean "this category at that karat", not
+    silently re-attach itself to whatever was priced several turns
+    ago."""
+    _store.set(session_id, _LAST_PRICED_PRODUCT_KEY, product_name)
+
+
+def get_last_priced_product(session_id: str) -> str | None:
+    return _store.get(session_id, _LAST_PRICED_PRODUCT_KEY)
+
+
 def get_session_store() -> SessionStore:
     """Exposed so tests (and, later, a healthcheck or admin endpoint) can
     inspect the store without reaching into the module-level `_store`

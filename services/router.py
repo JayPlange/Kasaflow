@@ -10,10 +10,12 @@ from services.llm import ToolSelectionError, understand_customer
 from services.memory import (
     fill_missing_context,
     get_last_action_outcome,
+    get_last_priced_product,
     get_order_draft,
     get_pending_intent,
     remember_context,
     set_last_action_outcome,
+    set_last_priced_product,
     set_pending_intent,
 )
 from services.order_tool import get_pending_order_summary
@@ -52,6 +54,21 @@ _CONVERSATION_FALLBACK_REPLY = "Hey! How can I help you today?"
 # and llm.py's _pending_intent_state_line() for why that specific gap
 # needs to be tracked across turns.
 _PENDING_INTENT_TOOLS = {"get_product_price", "generate_quote"}
+
+# Both return {"product": <resolved catalogue name>, ...} on a genuine
+# match (see product_tool.get_product_price() and
+# quote_service.generate_quote()) -- the same two tools tracked by
+# _PENDING_INTENT_TOOLS above, but for the opposite case: a lookup that
+# DID resolve. See memory.set_last_priced_product() and llm.py's
+# _last_priced_product_state_line() for why a bare karat-only follow-up
+# needs this remembered.
+_PRICING_TOOLS = {"get_product_price", "generate_quote"}
+
+# A genuine category browse means the topic has moved on from one
+# specific priced item -- see memory.set_last_priced_product()'s
+# docstring for why this specifically clears rather than leaves the
+# old value in place.
+_RECOMMEND_TOOL = "recommend_products"
 
 
 def _found_nothing(result: dict | None) -> bool:
@@ -104,12 +121,20 @@ def route_customer(message: str, session_id: str) -> dict:
         # missing information. See memory.get_last_action_outcome() and
         # llm.py's _last_action_outcome_state_line().
         last_action_outcome = get_last_action_outcome(session_id)
+        # The specific product a get_product_price/generate_quote call
+        # most recently resolved to, so a bare karat-only follow-up
+        # ("what about in 18k") can re-quote the same item instead of
+        # falling through to recommend_products. See
+        # memory.get_last_priced_product() and llm.py's
+        # _last_priced_product_state_line().
+        last_priced_product = get_last_priced_product(session_id)
         tool_request = understand_customer(
             message,
             pending_order=pending_order,
             order_draft=order_draft,
             pending_intent=pending_intent,
             last_action_outcome=last_action_outcome,
+            last_priced_product=last_priced_product,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -155,6 +180,7 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
         remember_context(session_id, arguments)
 
     _update_pending_intent(session_id, tool_request["tool"], arguments, result)
+    _update_last_priced_product(session_id, tool_request["tool"], result)
 
     if _tool_succeeded(result):
         # A genuine success means whatever failed before is no longer
@@ -192,6 +218,17 @@ def _update_pending_intent(session_id: str, tool_name: str, arguments: dict, res
         # stale intent left behind would risk misreading an unrelated
         # later message as still answering it.
         set_pending_intent(session_id, None)
+
+
+def _update_last_priced_product(session_id: str, tool_name: str, result: dict | None) -> None:
+    if tool_name in _PRICING_TOOLS and _tool_succeeded(result):
+        # get_product_price/generate_quote's success shape always
+        # includes "product" -- see _found_nothing()'s "message" without
+        # "product" check above, which is exactly what rules the failure
+        # case out here.
+        set_last_priced_product(session_id, result.get("product"))
+    elif tool_name == _RECOMMEND_TOOL and _tool_succeeded(result):
+        set_last_priced_product(session_id, None)
 
 
 def _handle_conversation(arguments: dict) -> dict:

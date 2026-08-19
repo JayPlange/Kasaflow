@@ -10,9 +10,13 @@ the exact bug the old shared-dict version had.
 from services.memory import (
     SessionStore,
     fill_missing_context,
+    get_last_action_outcome,
+    get_last_priced_product,
     get_order_draft,
     get_pending_intent,
     remember_context,
+    set_last_action_outcome,
+    set_last_priced_product,
     set_pending_intent,
 )
 
@@ -221,6 +225,72 @@ def test_pending_intent_can_be_cleared(monkeypatch):
     set_pending_intent("session-1", None)
 
     assert get_pending_intent("session-1") is None
+
+
+# ---------------------------------------------------------------------
+# last_action_outcome
+# ---------------------------------------------------------------------
+
+def test_get_last_action_outcome_returns_none_when_nothing_set():
+    assert get_last_action_outcome("session-never-seen") is None
+
+
+def test_last_action_outcome_round_trips(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+    outcome = {"action": "propose_order", "customer_safe_explanation": "reason"}
+
+    set_last_action_outcome("session-1", outcome)
+
+    assert get_last_action_outcome("session-1") == outcome
+
+
+def test_last_action_outcome_can_be_cleared(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_action_outcome("session-1", {"action": "propose_order", "customer_safe_explanation": "reason"})
+    set_last_action_outcome("session-1", None)
+
+    assert get_last_action_outcome("session-1") is None
+
+
+# ---------------------------------------------------------------------
+# last_priced_product
+# ---------------------------------------------------------------------
+
+def test_get_last_priced_product_returns_none_when_nothing_set():
+    assert get_last_priced_product("session-never-seen") is None
+
+
+def test_last_priced_product_round_trips(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_priced_product("session-1", "Big White Crown Stone Gold Ring, 14g")
+
+    assert get_last_priced_product("session-1") == "Big White Crown Stone Gold Ring, 14g"
+
+
+def test_last_priced_product_can_be_cleared(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_priced_product("session-1", "Big White Crown Stone Gold Ring, 14g")
+    set_last_priced_product("session-1", None)
+
+    assert get_last_priced_product("session-1") is None
+
+
+def test_last_priced_product_sessions_stay_isolated(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_priced_product("session-a", "Ring A")
+    set_last_priced_product("session-b", "Ring B")
+
+    assert get_last_priced_product("session-a") == "Ring A"
+    assert get_last_priced_product("session-b") == "Ring B"
 
 
 def test_context_round_trips_across_two_simulated_turns(monkeypatch):
