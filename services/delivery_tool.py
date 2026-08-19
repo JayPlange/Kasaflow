@@ -24,6 +24,68 @@ DELIVERY_OPTIONS = [
 
 _VALID_KEYS = {option["key"] for option in DELIVERY_OPTIONS}
 
+# Ghana's 16 regional capitals, plus the country name itself. Exists
+# solely so delivery_option_matches_address() can catch "international"
+# wrongly picked for a real Ghanaian address outside Accra/Kumasi --
+# confirmed live, 2026-08-18: a customer who said they lived in Cape
+# Coast (a real Ghanaian city, Central Region's capital) was told their
+# order would ship "via shipping outside Ghana", which is simply false.
+# This business only actually offers three arrangements (see
+# DELIVERY_OPTIONS above), and Cape Coast is neither of the two rider
+# zones -- there's no real arrangement this system can assert with
+# confidence, so the honest answer is "let our team confirm", the same
+# "say you don't know rather than guess" principle
+# delivery_option_matches_address() already applies to accra_rider/
+# kumasi_rider below, not a guess dressed up as a real delivery option.
+_GHANA_PLACE_NAMES = {
+    "ghana",
+    "accra",
+    "kumasi",
+    "sekondi",
+    "takoradi",
+    "cape coast",
+    "koforidua",
+    "ho",
+    "tamale",
+    "bolgatanga",
+    "wa",
+    "sunyani",
+    "techiman",
+    "goaso",
+    "sefwi wiawso",
+    "dambai",
+    "nalerigu",
+    "damongo",
+    "mankessim",
+}
+
+# Real Accra/Kumasi neighbourhoods and suburbs -- what customers
+# actually type (Webb, 2026-08-19: "most customers would mention Accra
+# but will type East Legon... Suame is a smaller town in Kumasi").
+# Google Geocoding (services/geocoding_tool.py) resolves any of these
+# properly and is preferred whenever GOOGLE_MAPS_API_KEY is configured;
+# this curated list exists so accra_rider/kumasi_rider matching still
+# works for the common cases while that key is unavailable (Webb's
+# Google Cloud billing card needs sorting first, 2026-08-19), and it
+# keeps working as a zero-cost baseline afterwards too. Not
+# exhaustive -- an unlisted neighbourhood still falls through to a
+# "let our team confirm" mismatch rather than a wrong guess, same
+# conservative bias as everywhere else in this file.
+_ACCRA_NEIGHBOURHOODS = {
+    "east legon", "west legon", "north legon", "south legon",
+    "airport residential", "cantonments", "spintex", "dzorwulu",
+    "adenta", "madina", "tema", "achimota", "dansoman", "labone",
+    "osu", "labadi", "teshie", "nungua", "abelemkpe", "roman ridge",
+    "kaneshie", "circle", "lapaz", "haatso", "ashongman", "taifa",
+    "sowutuom", "weija", "abeka", "kwashieman", "odorkor",
+}
+
+_KUMASI_NEIGHBOURHOODS = {
+    "suame", "adum", "asokwa", "bantama", "ahodwo", "nhyiaeso",
+    "asafo", "santasi", "kwadaso", "atonsu", "ayigya", "bomso",
+    "asawase", "tafo", "oforikrom", "kotei",
+}
+
 
 def get_delivery_information() -> dict:
     """Lists the real delivery options rather than quoting a price/time
@@ -49,26 +111,45 @@ def delivery_option_matches_address(key: str | None, address: str | None) -> boo
     Tamale via rider delivery within Kumasi", which is not a real
     arrangement this business offers.
 
-    Deliberately conservative in one direction only: this can produce a
-    false "mismatch" for a real Accra/Kumasi address that doesn't
-    literally contain the city name (e.g. a neighbourhood name alone).
-    That failure mode routes the order to manual staff confirmation
+    Deliberately conservative in one direction only: this can still
+    produce a false "mismatch" for a real Accra/Kumasi address that
+    names neither the city nor one of the curated neighbourhoods in
+    _ACCRA_NEIGHBOURHOODS/_KUMASI_NEIGHBOURHOODS above (e.g. an
+    unlisted suburb, a landmark with no place name at all). That
+    failure mode routes the order to manual staff confirmation
     instead of asserting a wrong delivery arrangement -- the same
     "say you don't know rather than guess" principle the rest of this
     file already follows for pricing delivery itself. It never produces
     a false match, which is the direction that actually matters: it
     can't quietly clear a real mismatch.
 
-    "international" has no address-region constraint by definition, so
-    always matches; an unrecognised key isn't this function's job to
-    judge and also matches, so an already-invalid delivery_option
-    doesn't get flagged twice over by two different checks."""
-    if key not in ("accra_rider", "kumasi_rider"):
+    "international" has no address-region constraint in the sense that
+    it isn't tied to one specific city the way the two rider options
+    are -- but it still mismatches when the address is recognisably a
+    real Ghanaian place (see _GHANA_PLACE_NAMES above): "international"
+    given for an address that names an actual Ghanaian city is exactly
+    as wrong as "kumasi_rider" given for Tamale, and deserves the same
+    "let our team confirm" softening rather than asserting a shipping
+    arrangement that isn't real (confirmed live, 2026-08-18: a Cape
+    Coast address was told it would ship "outside Ghana"). This can
+    still miss a genuine Ghanaian address that isn't in the curated list
+    (a small town, a landmark with no city name) -- same conservative
+    bias as the rider checks below: it never produces a false "mismatch"
+    for an address that's actually outside Ghana, only a possible false
+    "match" for an unlisted Ghanaian one, which is the safer direction
+    to be wrong in.
+
+    An unrecognised key isn't this function's job to judge and also
+    matches, so an already-invalid delivery_option doesn't get flagged
+    twice over by two different checks."""
+    if key not in ("accra_rider", "kumasi_rider", "international"):
         return True
     address_lower = (address or "").lower()
     if key == "accra_rider":
-        return "accra" in address_lower
-    return "kumasi" in address_lower
+        return "accra" in address_lower or any(n in address_lower for n in _ACCRA_NEIGHBOURHOODS)
+    if key == "kumasi_rider":
+        return "kumasi" in address_lower or any(n in address_lower for n in _KUMASI_NEIGHBOURHOODS)
+    return not any(place in address_lower for place in _GHANA_PLACE_NAMES)
 
 
 def delivery_options_phrase(options: list[dict] | None = None) -> str:

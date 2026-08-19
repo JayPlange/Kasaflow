@@ -11,9 +11,30 @@
 #   4. fly secrets set OPENAI_API_KEY=... APP_API_KEY=... \
 #        WOOCOMMERCE_URL=... WOOCOMMERCE_CONSUMER_KEY=... WOOCOMMERCE_CONSUMER_SECRET=... \
 #        KHAYA_API_KEY=... \
-#        WHATSAPP_VERIFY_TOKEN=... WHATSAPP_ACCESS_TOKEN=... WHATSAPP_PHONE_NUMBER_ID=...
+#        WHATSAPP_VERIFY_TOKEN=... WHATSAPP_ACCESS_TOKEN=... WHATSAPP_PHONE_NUMBER_ID=... \
+#        COHERE_API_KEY=... GOOGLE_MAPS_API_KEY=...
 #      (secrets, not plain env vars -- fly encrypts these, never put real
 #      keys directly in this file or commit them anywhere)
+#
+#      COHERE_API_KEY powers photo identification (services/photo_match_tool.py) --
+#      optional like KHAYA_API_KEY/WooCommerce above, but without it a
+#      customer's photo can only get a generic category browse, never
+#      an exact-item match. Also run `python -m services.image_embeddings_sync`
+#      once (and after any catalogue photo changes) to build
+#      data/image_embeddings.json -- this isn't computed automatically
+#      on deploy, see that script's own docstring.
+#
+#      GOOGLE_MAPS_API_KEY powers delivery-address zone matching
+#      (services/geocoding_tool.py) -- optional like the rest above, but
+#      without it, addresses are only checked against a fixed list of
+#      Ghana's 16 regional capitals (services/delivery_tool.py's
+#      _GHANA_PLACE_NAMES), which misses real neighbourhood-level
+#      addresses ("East Legon", "Suame", "Mankessim") that customers
+#      actually give. Needs a Google Cloud project with billing enabled
+#      and the Geocoding API turned on; realistic volume for this
+#      business should stay within Google's free 10,000 requests/month
+#      tier (confirmed against Google's published pricing, 2026-08-19,
+#      not yet measured against this app's real traffic).
 #   5. fly deploy
 #
 # Once deployed, the app's URL (https://kasaflow.fly.dev or whatever

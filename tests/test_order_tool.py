@@ -103,6 +103,68 @@ def test_propose_order_carries_variation_id_when_present(monkeypatch):
     assert result["proposal"]["variation_id"] == 99
 
 
+# ---------------------------------------------------------------------
+# delivery_option/address mismatch -- see delivery_tool.
+# delivery_option_matches_address() for the underlying check. Confirmed
+# live, 2026-08-14 (Tamale/kumasi_rider) and 2026-08-18 (Cape Coast/
+# international): a mismatch must soften the customer-facing label
+# rather than assert a delivery arrangement that isn't real.
+# ---------------------------------------------------------------------
+
+def test_propose_order_softens_label_when_international_is_a_real_ghanaian_address(monkeypatch):
+    # Arrange: "international" wrongly picked for Cape Coast, a real
+    # Ghanaian city -- must not tell the customer it's shipping "outside
+    # Ghana" when it plainly isn't.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+
+    # Act
+    result = order_tool.propose_order("ring", "18k", 1, "Cape Coast", "international", "session-1")
+
+    # Assert: the raw key is preserved (it's still what the customer/LLM
+    # chose), but the label shown to the customer is softened
+    proposal = result["proposal"]
+    assert proposal["delivery_option"] == "international"
+    assert proposal["delivery_option_label"] == (
+        "a delivery arrangement to be confirmed by our team (this address doesn't "
+        "match our usual shipping outside Ghana zone)"
+    )
+
+
+def test_propose_order_calls_geocoding_tools_resolve_delivery_match(monkeypatch):
+    # Wiring check: propose_order must go through
+    # geocoding_tool.resolve_delivery_match() (which itself falls back
+    # to the offline heuristic when geocoding isn't configured), not
+    # delivery_tool.delivery_option_matches_address() directly -- see
+    # order_tool.py's import and the comment above this call site.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+    resolve_delivery_match = MagicMock(return_value=True)
+    monkeypatch.setattr(order_tool, "resolve_delivery_match", resolve_delivery_match)
+
+    order_tool.propose_order("ring", "18k", 1, "East Legon", "accra_rider", "session-1")
+
+    resolve_delivery_match.assert_called_once_with("accra_rider", "East Legon")
+
+
+def test_propose_order_does_not_soften_a_genuine_international_address(monkeypatch):
+    # Arrange: a real address outside Ghana -- "international" is correct here
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+
+    # Act
+    result = order_tool.propose_order("ring", "18k", 1, "221B Baker Street, London", "international", "session-1")
+
+    # Assert
+    assert result["proposal"]["delivery_option_label"] == "shipping outside Ghana"
+
+
 def test_propose_order_stores_pending_order_in_session(monkeypatch, fresh_session_store):
     # Arrange
     _mock_product_lookup(

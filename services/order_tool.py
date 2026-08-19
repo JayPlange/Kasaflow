@@ -71,10 +71,10 @@ import requests
 from app.config import settings
 from services.delivery_tool import (
     delivery_option_label,
-    delivery_option_matches_address,
     delivery_options_phrase,
     is_valid_delivery_option,
 )
+from services.geocoding_tool import resolve_delivery_match
 from services.memory import get_session_store, set_last_action_outcome
 from services.product_tool import get_product_price
 from services.whatsapp_client import WhatsAppError, send_text_message
@@ -190,15 +190,16 @@ def propose_order(
 
     # The customer picked one of the three real delivery arrangements,
     # but that doesn't guarantee it actually matches the address they
-    # gave -- see delivery_option_matches_address()'s docstring for the
-    # live case (Tamale address, Kumasi rider option) this closes.
-    # Rather than silently building a confirmation sentence that names
-    # two different cities, or blocking the order outright over a
-    # heuristic that can false-positive on a real Accra/Kumasi address,
-    # this only ever softens the *label* shown to the customer and
-    # staff -- delivery_option itself (the raw key) is stored unchanged,
-    # since it still reflects what the customer actually chose.
-    if delivery_option_matches_address(delivery_key, address_stripped):
+    # gave -- see geocoding_tool.resolve_delivery_match()'s docstring
+    # for the live cases (Tamale address/kumasi_rider, Cape Coast
+    # address/international) this closes. Rather than silently building
+    # a confirmation sentence that names two different places, or
+    # blocking the order outright over a heuristic that can
+    # false-positive on a real Accra/Kumasi address, this only ever
+    # softens the *label* shown to the customer and staff --
+    # delivery_option itself (the raw key) is stored unchanged, since it
+    # still reflects what the customer actually chose.
+    if resolve_delivery_match(delivery_key, address_stripped):
         resolved_label = delivery_option_label(delivery_key)
     else:
         resolved_label = (

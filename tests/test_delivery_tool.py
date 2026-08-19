@@ -87,11 +87,49 @@ def test_matches_is_case_insensitive():
     assert delivery_option_matches_address("kumasi_rider", "kumasi central market")
 
 
-def test_international_always_matches_regardless_of_address():
-    # No regional constraint by definition -- see the function's docstring
-    assert delivery_option_matches_address("international", "Tamale")
+def test_matches_accra_rider_for_a_real_accra_neighbourhood_without_the_word_accra():
+    # Webb, 2026-08-19: "most customers would mention Accra but will
+    # type East Legon, which is a smaller town in Accra." This is the
+    # curated no-API-key fallback for that exact case.
+    assert delivery_option_matches_address("accra_rider", "East Legon")
+    assert delivery_option_matches_address("accra_rider", "east legon")
+
+
+def test_matches_kumasi_rider_for_a_real_kumasi_neighbourhood_without_the_word_kumasi():
+    # Webb, 2026-08-19: "Suame is a smaller town in Kumasi."
+    assert delivery_option_matches_address("kumasi_rider", "Suame")
+
+
+def test_mismatches_kumasi_rider_for_an_accra_neighbourhood():
+    # A curated Accra neighbourhood must not also satisfy kumasi_rider
+    assert not delivery_option_matches_address("kumasi_rider", "East Legon")
+
+
+def test_international_matches_an_address_with_no_ghanaian_place_name():
+    # A real international address -- no reason to flag it
+    assert delivery_option_matches_address("international", "221B Baker Street, London")
     assert delivery_option_matches_address("international", "")
     assert delivery_option_matches_address("international", None)
+
+
+def test_international_mismatches_a_real_ghanaian_address():
+    # "international" picked for an address that's actually a real
+    # Ghanaian city is just as wrong as kumasi_rider picked for Tamale --
+    # confirmed live, 2026-08-18: a Cape Coast address was told it would
+    # ship "outside Ghana", which is false. See _GHANA_PLACE_NAMES.
+    assert not delivery_option_matches_address("international", "Cape Coast")
+    assert not delivery_option_matches_address("international", "Tamale")
+    assert not delivery_option_matches_address("international", "Adum, Kumasi")
+
+
+def test_international_mismatch_is_case_insensitive():
+    assert not delivery_option_matches_address("international", "CAPE COAST")
+
+
+def test_international_mismatches_mankessim():
+    # Webb, 2026-08-19: "Mankessim is a smaller town in Cape Coast."
+    # A real Ghanaian town, just not one of the two rider zones.
+    assert not delivery_option_matches_address("international", "Mankessim")
 
 
 def test_invalid_key_always_matches_rather_than_double_flagging():
