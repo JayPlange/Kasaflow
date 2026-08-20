@@ -1,5 +1,6 @@
 from services.delivery_tool import (
     DELIVERY_OPTIONS,
+    classify_zone_offline,
     delivery_option_label,
     delivery_option_matches_address,
     delivery_options_phrase,
@@ -143,3 +144,39 @@ def test_invalid_key_always_matches_rather_than_double_flagging():
 def test_mismatch_with_no_address_at_all():
     assert not delivery_option_matches_address("accra_rider", "")
     assert not delivery_option_matches_address("accra_rider", None)
+
+
+# ---------------------------------------------------------------------
+# classify_zone_offline -- the inference side of the same neighbourhood
+# knowledge, used by geocoding_tool.infer_delivery_option() so a
+# customer who's already named their neighbourhood never has to also
+# pick from a delivery-arrangement menu (Webb, 2026-08-19, live).
+# ---------------------------------------------------------------------
+
+def test_classify_zone_offline_resolves_accra_from_a_neighbourhood():
+    assert classify_zone_offline("East Legon") == "accra_rider"
+    assert classify_zone_offline("east legon") == "accra_rider"
+
+
+def test_classify_zone_offline_resolves_kumasi_from_a_neighbourhood():
+    assert classify_zone_offline("Suame") == "kumasi_rider"
+
+
+def test_classify_zone_offline_resolves_accra_kumasi_from_the_city_name_itself():
+    assert classify_zone_offline("12 Cantonments Road, Accra") == "accra_rider"
+    assert classify_zone_offline("Adum, Kumasi") == "kumasi_rider"
+
+
+def test_classify_zone_offline_returns_ghana_other_for_a_recognised_town_outside_both_zones():
+    assert classify_zone_offline("Cape Coast") == "ghana_other"
+    assert classify_zone_offline("Mankessim") == "ghana_other"
+
+
+def test_classify_zone_offline_returns_none_when_genuinely_unclear():
+    # Never guesses "international" -- see the function's own docstring
+    # for why an unrecognised address is no more likely to be
+    # international than an unlisted Ghanaian town.
+    assert classify_zone_offline("221B Baker Street, London") is None
+    assert classify_zone_offline("1 Unnamed Lane") is None
+    assert classify_zone_offline("") is None
+    assert classify_zone_offline(None) is None

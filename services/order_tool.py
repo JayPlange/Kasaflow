@@ -74,7 +74,7 @@ from services.delivery_tool import (
     delivery_options_phrase,
     is_valid_delivery_option,
 )
-from services.geocoding_tool import resolve_delivery_match
+from services.geocoding_tool import infer_delivery_option, resolve_delivery_match
 from services.memory import get_session_store, set_last_action_outcome
 from services.product_tool import get_product_price
 from services.whatsapp_client import WhatsAppError, send_text_message
@@ -153,8 +153,30 @@ def propose_order(
         return {"error": "What address should this be delivered to?"}
 
     delivery_key = str(delivery_option).strip().lower() if delivery_option else ""
+    team_confirm = False
     if not is_valid_delivery_option(delivery_key):
-        return {"error": f"Would you like {delivery_options_phrase()}?"}
+        # The model hasn't stated (or couldn't confidently infer) one of
+        # the three real arrangements -- try to infer it from the address
+        # itself before falling back to asking a question the customer
+        # may have already effectively answered. See
+        # geocoding_tool.infer_delivery_option()'s docstring: this is
+        # what actually closes the "east legon" case (Webb, 2026-08-19,
+        # live: told "east legon", still got asked "Would you like rider
+        # delivery within Accra, rider delivery within Kumasi, or
+        # shipping outside Ghana?", which the address already answered).
+        inferred = infer_delivery_option(address_stripped)
+        if inferred == "ghana_other":
+            # A real Ghanaian place, just not Accra or Kumasi -- there is
+            # no rider zone that fits and "international" would be
+            # actively wrong (the same category error resolve_delivery_match()
+            # exists to catch from the other direction). Proceed without
+            # asking; a human confirms the actual arrangement, exactly
+            # what Webb originally asked for delivery gaps like this.
+            team_confirm = True
+        elif inferred:
+            delivery_key = inferred
+        else:
+            return {"error": f"Would you like {delivery_options_phrase()}?"}
 
     product = get_product_price(product_name, material)
     if not product:
@@ -199,7 +221,12 @@ def propose_order(
     # softens the *label* shown to the customer and staff --
     # delivery_option itself (the raw key) is stored unchanged, since it
     # still reflects what the customer actually chose.
-    if resolve_delivery_match(delivery_key, address_stripped):
+    if team_confirm:
+        resolved_label = (
+            "a delivery arrangement to be confirmed by our team (we don't have automatic "
+            "rider coverage for that address yet)"
+        )
+    elif resolve_delivery_match(delivery_key, address_stripped):
         resolved_label = delivery_option_label(delivery_key)
     else:
         resolved_label = (
@@ -219,7 +246,7 @@ def propose_order(
         "subtotal": subtotal,
         "total": subtotal,
         "delivery_address": delivery_address,
-        "delivery_option": delivery_key,
+        "delivery_option": "team_confirm" if team_confirm else delivery_key,
         "delivery_option_label": resolved_label,
     }
 

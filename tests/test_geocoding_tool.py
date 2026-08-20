@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from services import geocoding_tool
-from services.geocoding_tool import GeocodingError, classify_ghana_address, resolve_delivery_match
+from services.geocoding_tool import GeocodingError, classify_ghana_address, infer_delivery_option, resolve_delivery_match
 
 
 def _mock_geocode_response(status="OK", results=None):
@@ -231,3 +231,75 @@ def test_resolve_delivery_match_returns_true_for_an_invalid_key_without_geocodin
     assert resolve_delivery_match("nonsense", "Accra") is True
     assert resolve_delivery_match(None, "Accra") is True
     fake_get.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# infer_delivery_option -- what order_tool.py actually calls when the
+# customer/LLM hasn't stated a delivery_option explicitly. Confirmed
+# live, 2026-08-19 (Webb): told "east legon", the assistant still asked
+# "Would you like rider delivery within Accra, rider delivery within
+# Kumasi, or shipping outside Ghana?" -- redundant once the address
+# itself answers it.
+# ---------------------------------------------------------------------
+
+def test_infer_delivery_option_returns_none_for_a_blank_address():
+    assert infer_delivery_option("") is None
+    assert infer_delivery_option(None) is None
+
+
+def test_infer_delivery_option_falls_back_to_offline_classification_when_not_configured(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key=None)
+    fake_get = MagicMock()
+    monkeypatch.setattr(geocoding_tool.requests, "get", fake_get)
+
+    assert infer_delivery_option("East Legon") == "accra_rider"
+    assert infer_delivery_option("Suame") == "kumasi_rider"
+    assert infer_delivery_option("Cape Coast") == "ghana_other"
+    assert infer_delivery_option("221B Baker Street, London") is None  # offline never asserts international
+    fake_get.assert_not_called()
+
+
+def test_infer_delivery_option_resolves_accra_via_geocoding(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key="fake-key")
+    monkeypatch.setattr(geocoding_tool.requests, "get", MagicMock(return_value=_mock_geocode_response(results=[_EAST_LEGON_RESULT])))
+
+    assert infer_delivery_option("East Legon") == "accra_rider"
+
+
+def test_infer_delivery_option_resolves_kumasi_via_geocoding(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key="fake-key")
+    monkeypatch.setattr(geocoding_tool.requests, "get", MagicMock(return_value=_mock_geocode_response(results=[_SUAME_RESULT])))
+
+    assert infer_delivery_option("Suame") == "kumasi_rider"
+
+
+def test_infer_delivery_option_resolves_ghana_other_via_geocoding(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key="fake-key")
+    monkeypatch.setattr(geocoding_tool.requests, "get", MagicMock(return_value=_mock_geocode_response(results=[_CAPE_COAST_RESULT])))
+
+    assert infer_delivery_option("Cape Coast") == "ghana_other"
+
+
+def test_infer_delivery_option_resolves_international_via_geocoding(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key="fake-key")
+    monkeypatch.setattr(geocoding_tool.requests, "get", MagicMock(return_value=_mock_geocode_response(results=[_LONDON_RESULT])))
+
+    assert infer_delivery_option("221B Baker Street, London") == "international"
+
+
+def test_infer_delivery_option_falls_back_to_offline_on_zero_results(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key="fake-key")
+    monkeypatch.setattr(geocoding_tool.requests, "get", MagicMock(return_value=_mock_geocode_response(status="ZERO_RESULTS")))
+
+    assert infer_delivery_option("Suame") == "kumasi_rider"  # offline still catches this
+
+
+def test_infer_delivery_option_falls_back_to_offline_on_geocoding_error(monkeypatch):
+    _settings_with(monkeypatch, google_maps_api_key="fake-key")
+    monkeypatch.setattr(
+        geocoding_tool.requests, "get",
+        MagicMock(side_effect=geocoding_tool.requests.exceptions.Timeout("slow")),
+    )
+
+    assert infer_delivery_option("East Legon") == "accra_rider"  # offline still catches this
+    assert infer_delivery_option("1 Unnamed Lane") is None

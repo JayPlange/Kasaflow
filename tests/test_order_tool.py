@@ -240,14 +240,19 @@ def test_propose_order_rejects_missing_delivery_address(monkeypatch, address):
     lookup.assert_not_called()
 
 
-@pytest.mark.parametrize("delivery_option", ["", "   ", "unknown", "UNKNOWN", None, "accra", "lagos"])
-def test_propose_order_rejects_missing_or_invalid_delivery_option(monkeypatch, delivery_option):
-    # Arrange: product lookup should never even be reached -- this is
-    # asked before we bother looking anything up, same as quantity/address
+@pytest.mark.parametrize("delivery_option", ["", "   ", "unknown", "UNKNOWN", None, "lagos"])
+def test_propose_order_rejects_missing_or_invalid_delivery_option_when_address_is_unresolvable(monkeypatch, delivery_option):
+    # Arrange: an address with no Ghana/Accra/Kumasi signal at all, so
+    # infer_delivery_option() genuinely can't resolve it either -- this
+    # must still ask, same as before the inference fallback existed
+    # (see the inference-success tests below for the cases this no
+    # longer rejects, e.g. delivery_option missing but address="Accra").
+    # Product lookup should never even be reached -- this is asked
+    # before we bother looking anything up, same as quantity/address
     lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
 
     # Act
-    result = order_tool.propose_order("ring", "18k", 1, "Accra", delivery_option, "session-1")
+    result = order_tool.propose_order("ring", "18k", 1, "1 Unnamed Lane", delivery_option, "session-1")
 
     # Assert: asks using the real option labels, doesn't invent its own wording
     assert "error" in result
@@ -256,6 +261,90 @@ def test_propose_order_rejects_missing_or_invalid_delivery_option(monkeypatch, d
     assert "shipping outside Ghana" in result["error"]
     assert "or shipping outside Ghana" in result["error"]  # not a bare comma list
     lookup.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# delivery_option inference from the address -- see
+# geocoding_tool.infer_delivery_option()'s docstring. Confirmed live,
+# 2026-08-19 (Webb): told "east legon", the assistant still asked "Would
+# you like rider delivery within Accra, rider delivery within Kumasi, or
+# shipping outside Ghana?" even though the address already answered it.
+# These cases must now proceed without asking.
+# ---------------------------------------------------------------------
+
+def test_propose_order_infers_accra_rider_when_delivery_option_is_unstated(monkeypatch):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+
+    result = order_tool.propose_order("ring", "18k", 1, "East Legon", "unknown", "session-1")
+
+    proposal = result["proposal"]
+    assert proposal["delivery_option"] == "accra_rider"
+    assert proposal["delivery_option_label"] == "rider delivery within Accra"
+
+
+def test_propose_order_infers_kumasi_rider_when_delivery_option_is_unstated(monkeypatch):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+
+    result = order_tool.propose_order("ring", "18k", 1, "Suame", "unknown", "session-1")
+
+    proposal = result["proposal"]
+    assert proposal["delivery_option"] == "kumasi_rider"
+    assert proposal["delivery_option_label"] == "rider delivery within Kumasi"
+
+
+def test_propose_order_escalates_to_team_confirm_for_a_real_ghana_town_outside_both_rider_zones(monkeypatch):
+    # Cape Coast is a real Ghanaian city, just not Accra or Kumasi -- no
+    # rider zone fits, and "international" would be exactly as wrong as
+    # asserting kumasi_rider for Tamale. Must proceed without asking,
+    # not silently guess a real arrangement that doesn't exist.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+
+    result = order_tool.propose_order("ring", "18k", 1, "Cape Coast", "unknown", "session-1")
+
+    proposal = result["proposal"]
+    assert proposal["delivery_option"] == "team_confirm"
+    assert proposal["delivery_option_label"] == (
+        "a delivery arrangement to be confirmed by our team (we don't have automatic "
+        "rider coverage for that address yet)"
+    )
+
+
+def test_propose_order_still_asks_when_address_gives_no_inference_signal(monkeypatch):
+    # Not a Ghana/Accra/Kumasi address by any known name -- the honest
+    # fallback is still to ask, the same "don't guess" bias as everywhere
+    # else in this delivery-matching code.
+    lookup = _mock_product_lookup(monkeypatch, {"id": 1, "product": "Ring", "material": "18k", "price": 100})
+
+    result = order_tool.propose_order("ring", "18k", 1, "1 Unnamed Lane", "unknown", "session-1")
+
+    assert "error" in result
+    assert "rider delivery within Accra" in result["error"]
+    lookup.assert_not_called()
+
+
+def test_propose_order_does_not_infer_when_delivery_option_was_explicitly_stated(monkeypatch):
+    # An explicit (even if mismatched) delivery_option takes the
+    # existing resolve_delivery_match()-softening path, not inference --
+    # inference only kicks in when delivery_option itself is missing/invalid.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 1200.0},
+    )
+    infer = MagicMock()
+    monkeypatch.setattr(order_tool, "infer_delivery_option", infer)
+
+    order_tool.propose_order("ring", "18k", 1, "East Legon", "accra_rider", "session-1")
+
+    infer.assert_not_called()
 
 
 def test_propose_order_returns_error_when_product_not_found(monkeypatch):

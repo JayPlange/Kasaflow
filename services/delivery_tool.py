@@ -152,6 +152,43 @@ def delivery_option_matches_address(key: str | None, address: str | None) -> boo
     return not any(place in address_lower for place in _GHANA_PLACE_NAMES)
 
 
+def classify_zone_offline(address: str | None) -> str | None:
+    """Best-effort classification of a free-text address into one of
+    four buckets: "accra_rider", "kumasi_rider", "ghana_other" (a real
+    Ghanaian place, just not one of the two rider zones), or None
+    (genuinely unclear -- could be an unlisted Ghanaian town, could be
+    international, this function doesn't guess).
+
+    Exists so a customer who names a real neighbourhood ("East Legon",
+    "Suame") never has to pick a delivery arrangement from a menu they
+    already effectively answered by saying where they live (Webb,
+    2026-08-19, live: told "east legon", the assistant still asked
+    "Would you like rider delivery within Accra, rider delivery within
+    Kumasi, or shipping outside Ghana?" -- clunky and redundant when the
+    address alone already resolves it). geocoding_tool.infer_delivery_option()
+    is the geocoding-backed version of this same idea, and is what
+    order_tool.py actually calls; this offline version is its fallback,
+    same relationship as delivery_option_matches_address() has with
+    resolve_delivery_match().
+
+    Deliberately never returns "international" -- unlike the other two
+    zones, there's no positive offline signal for "this is genuinely
+    outside Ghana" (an unrecognised address is just as likely to be an
+    unlisted Ghanaian town as a foreign one). Same conservative bias as
+    delivery_option_matches_address(): only ever asserts a zone it has
+    real evidence for."""
+    address_lower = (address or "").lower().strip()
+    if not address_lower:
+        return None
+    if "accra" in address_lower or any(n in address_lower for n in _ACCRA_NEIGHBOURHOODS):
+        return "accra_rider"
+    if "kumasi" in address_lower or any(n in address_lower for n in _KUMASI_NEIGHBOURHOODS):
+        return "kumasi_rider"
+    if any(place in address_lower for place in _GHANA_PLACE_NAMES):
+        return "ghana_other"
+    return None
+
+
 def delivery_options_phrase(options: list[dict] | None = None) -> str:
     """"rider delivery within Accra, rider delivery within Kumasi, or
     shipping outside Ghana" -- the one place this phrasing is built, so

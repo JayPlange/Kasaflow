@@ -44,7 +44,7 @@ import logging
 import requests
 
 from app.config import settings
-from services.delivery_tool import delivery_option_matches_address
+from services.delivery_tool import classify_zone_offline, delivery_option_matches_address
 
 logger = logging.getLogger(__name__)
 
@@ -179,3 +179,59 @@ def resolve_delivery_match(key: str | None, address: str | None) -> bool:
     if key == "kumasi_rider":
         return classification["matches_kumasi"]
     return not classification["in_ghana"]
+
+
+def infer_delivery_option(address: str | None) -> str | None:
+    """Best-effort inference of which of this business's real delivery
+    arrangements an address maps to, so a customer who's already named
+    their neighbourhood never has to additionally pick from a menu
+    (Webb, 2026-08-19, live: told "east legon" -- unambiguously in
+    Accra -- the assistant still asked "Would you like rider delivery
+    within Accra, rider delivery within Kumasi, or shipping outside
+    Ghana?", which is redundant once the address itself answers it).
+
+    Returns one of:
+    - "accra_rider" / "kumasi_rider" / "international": confident
+      enough to proceed without asking.
+    - "ghana_other": a real Ghanaian place, just not Accra or Kumasi --
+      this business has no rider zone there and it is NOT
+      "international" (that would be actively wrong, the same category
+      error resolve_delivery_match() above exists to catch on the
+      other side of this same problem). order_tool.py treats this as
+      "let our team confirm delivery", never as a guess dressed up as
+      a real arrangement.
+    - None: genuinely unclear either way -- order_tool.py falls back
+      to asking, same last-resort behaviour as today.
+
+    Prefers Google Geocoding when configured (resolves neighbourhood-
+    level addresses precisely, including telling a genuine "ghana_other"
+    apart from a genuine "international" one); falls back to the
+    offline curated-list classifier (delivery_tool.classify_zone_offline())
+    otherwise, or on any geocoding failure -- same fallback relationship
+    resolve_delivery_match() already has with delivery_option_matches_address().
+    The offline path never returns "international" (see that function's
+    own docstring for why), so an address that's actually international
+    but unrecognised offline falls through to None (ask), not a wrong
+    domestic guess."""
+    if not address or not address.strip():
+        return None
+
+    if not settings.google_maps_api_key:
+        return classify_zone_offline(address)
+
+    try:
+        classification = classify_ghana_address(address)
+    except GeocodingError as e:
+        logger.warning("Geocoding failed for address %r, falling back to offline classification: %s", address, e)
+        return classify_zone_offline(address)
+
+    if classification is None:
+        return classify_zone_offline(address)
+
+    if not classification["in_ghana"]:
+        return "international"
+    if classification["matches_accra"]:
+        return "accra_rider"
+    if classification["matches_kumasi"]:
+        return "kumasi_rider"
+    return "ghana_other"
