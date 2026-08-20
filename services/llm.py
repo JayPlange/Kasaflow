@@ -355,10 +355,13 @@ def _order_draft_state_line(order_draft: dict | None) -> str:
         f"Ghana\", answers delivery option. "
         f"Exception: if their current message clearly states a different value for one of "
         f"the already-known fields instead -- a correction, e.g. \"sorry, Kumasi not Accra\", "
-        f"or a different quantity/address than what's listed above -- use their new value for "
-        f"that field, not the old one; do not silently keep a value they just corrected. Don't "
-        f"ask them to repeat anything they haven't changed, and don't restart with a different "
-        f"tool."
+        f"\"wait, 14k rather\", \"actually make that 5\", \"I'll take the white gold instead\", "
+        f"\"use my other address\" -- use their new value for that field, not the old one; do "
+        f"not silently keep a value they just corrected. If the SAME message states two values "
+        f"for the same field in sequence (\"7 pieces, actually make that 5\", \"14k, no wait "
+        f"18k\"), only the final one is their answer -- resolve it yourself before returning "
+        f"your arguments; never return the earlier, superseded value. Don't ask them to repeat "
+        f"anything they haven't changed, and don't restart with a different tool."
     )
 
 
