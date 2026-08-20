@@ -49,6 +49,9 @@ tests/                     # 66 tests: unit, integration, and prompt regression
 
 ## Key Engineering Decisions
 
+**The LLM proposes, the application owns state**
+The model may decide what a customer's message means and which tool to call. It never validates state, calculates money, or decides whether an order can actually be created — that's `order_tool.py`'s job (see its own module docstring for the propose/confirm split this enforces), and `services/router.py`/`services/memory.py`'s for tracking what's already been said across turns. Concretely: `propose_order()` is a pure, deterministic lookup and multiplication, never the model; `confirm_order()` only ever acts on a proposal that function already priced and stored, never on arguments the model hands it directly; and a field the model can't determine is returned as the literal string `"unknown"`, not omitted or guessed, so the system's own memory can resolve it rather than the model inventing a value. This is a hard invariant, not a style preference — every "the AI got an order detail wrong" bug this project has hit traces back to somewhere that boundary was blurred.
+
 **Tool Registry + Tool Executor, not a big if/else**
 Five tools (`get_product_price`, `get_delivery_information`, `generate_quote`, `recommend_products`, `answer_policy_question`) are registered by name in one dict and dispatched generically. Adding a sixth tool means writing the function and registering it — nothing else in the request path changes.
 
