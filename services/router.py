@@ -70,6 +70,18 @@ _PRICING_TOOLS = {"get_product_price", "generate_quote"}
 # old value in place.
 _RECOMMEND_TOOL = "recommend_products"
 
+# propose_order is the only tool whose arguments can genuinely "correct"
+# something the customer already gave earlier in the same order -- see
+# _describe_order_corrections() below.
+_ORDER_TOOL = "propose_order"
+
+_ORDER_CORRECTION_FIELDS = {
+    "product_name": "the item",
+    "material": "the karat",
+    "quantity": "the quantity",
+    "delivery_address": "the delivery address",
+}
+
 
 def _found_nothing(result: dict | None) -> bool:
     """True when a tool ran successfully but didn't actually find what
@@ -167,6 +179,15 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
     if tool_request["tool"] in _SESSION_AWARE_TOOLS:
         arguments = {**arguments, "session_id": session_id}
 
+    # Read BEFORE execute_tool()/remember_context() below overwrite it --
+    # this is deliberately the state as it was going into this call, so
+    # it can be compared against `arguments` (this call's resolved
+    # values) to detect a genuine correction. See
+    # _describe_order_corrections()'s docstring.
+    correction_note = None
+    if tool_request["tool"] == _ORDER_TOOL:
+        correction_note = _describe_order_corrections(get_order_draft(session_id), arguments)
+
     try:
         result = execute_tool(tool_request["tool"], **arguments)
     except ToolExecutionError as e:
@@ -192,7 +213,55 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
         # outcome on the exact same call that just set it.
         set_last_action_outcome(session_id, None)
 
+    if correction_note and isinstance(result, dict):
+        result = {**result, "correction_note": correction_note}
+
     return result
+
+
+def _describe_order_corrections(old_draft: dict | None, arguments: dict) -> str | None:
+    """Builds a short acknowledgement sentence when this propose_order
+    call changes a field the customer had already given earlier in the
+    same order (e.g. "wait, 14k rather" after material was already
+    "12k") -- confirmed live, 2026-08-19 (Webb): the correction was
+    applied to session memory correctly, but the very next reply just
+    asked for the next missing field with no acknowledgement anything
+    had changed, which read as the assistant not having registered the
+    change at all.
+
+    Deliberately doesn't force a "please confirm this change" round
+    trip -- an extra yes/no turn for an unambiguous correction is
+    friction a real assistant wouldn't add (Webb and a second AI's
+    review of the same transcript both flagged this independently,
+    2026-08-19). This just states what changed; response_formatter.py
+    prepends it to whatever reply would already be sent (the next
+    missing-field question, or the full proposal if everything's now
+    known), so the conversation continues normally afterwards.
+
+    Returns None when there's nothing to acknowledge: no prior draft at
+    all (a fresh order, not a correction -- see get_order_draft()'s
+    None case), or none of the fields this call resolved actually
+    differ from what was already known."""
+    if not old_draft:
+        return None
+
+    changed = []
+    for key, label in _ORDER_CORRECTION_FIELDS.items():
+        old_value = old_draft.get(key)
+        new_value = arguments.get(key)
+        if old_value is None or new_value is None:
+            continue
+        if isinstance(new_value, str) and new_value.strip().lower() == "unknown":
+            continue
+        if str(old_value).strip().lower() == str(new_value).strip().lower():
+            continue
+        changed.append(f"{label} to {new_value}")
+
+    if not changed:
+        return None
+    if len(changed) == 1:
+        return f"Got it, I've updated {changed[0]}."
+    return f"Got it, I've updated {' and '.join(changed)}."
 
 
 def _tool_succeeded(result: dict | None) -> bool:

@@ -17,6 +17,27 @@ def test_formats_error_shape():
     assert format_for_customer({"error": "Something went wrong."}) == "Something went wrong."
 
 
+def test_correction_note_is_prepended_to_an_error_shape():
+    # router.py's propose_order correction acknowledgement (see
+    # _describe_order_corrections()) -- prepended to whatever reply the
+    # underlying result would already produce, an error/question here.
+    result = {"error": "What address should this be delivered to?", "correction_note": "Got it, I've updated the karat to 14k."}
+    assert format_for_customer(result) == "Got it, I've updated the karat to 14k. What address should this be delivered to?"
+
+
+def test_correction_note_is_prepended_to_a_proposal_shape():
+    result = {
+        "correction_note": "Got it, I've updated the karat to 14k.",
+        "proposal": {
+            "quantity": 7, "material": "14k", "product": "Ring", "total": 45000.0,
+            "delivery_address": "East Legon", "delivery_option_label": "rider delivery within Accra",
+        },
+    }
+    formatted = format_for_customer(result)
+    assert formatted.startswith("Got it, I've updated the karat to 14k. ")
+    assert "*7 x 14k Ring*" in formatted
+
+
 def test_formats_conversation_reply_shape():
     # router.py's converse shape -- the LLM already wrote the reply
     # itself, passed straight through untouched, not reformatted.

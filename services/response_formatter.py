@@ -165,6 +165,20 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
 
 
 def format_for_customer(result: dict | None) -> str:
+    if result is not None and "correction_note" in result:
+        # router.py's propose_order correction acknowledgement (see
+        # _describe_order_corrections()) -- prepended to whatever reply
+        # this same result would otherwise produce (the next
+        # missing-field question, or a full proposal), so a correction
+        # like "wait, 14k rather" gets acknowledged instead of silently
+        # applied. Formatted via a plain recursive call on the same
+        # result with the note key stripped, rather than a special case
+        # per shape below, so this works no matter what propose_order's
+        # underlying reply shape is.
+        note = result["correction_note"]
+        remainder = {k: v for k, v in result.items() if k != "correction_note"}
+        return f"{note} {format_for_customer(remainder)}"
+
     if result is not None and "results" in result:
         # router.py's multi-request shape -- a message that contained
         # more than one distinct ask. Format each sub-result exactly

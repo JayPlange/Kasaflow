@@ -810,3 +810,113 @@ def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypat
 
     # Assert
     assert "session_id" not in captured_calls[0]
+
+
+# ---------------------------------------------------------------------
+# _describe_order_corrections / correction_note wiring -- confirmed
+# live, 2026-08-19 (Webb): "wait i want to order the 14k rather" after
+# material was already "12k" changed the session's remembered material
+# correctly, but the very next reply just asked for the next missing
+# field (address) with no acknowledgement anything had changed.
+# ---------------------------------------------------------------------
+
+def test_describe_order_corrections_returns_none_with_no_prior_draft():
+    # A fresh order -- nothing to compare against, so nothing to
+    # acknowledge as "changed".
+    assert router._describe_order_corrections(None, {"material": "14k"}) is None
+
+
+def test_describe_order_corrections_returns_none_when_nothing_actually_changed():
+    old_draft = {"product_name": "Ring", "material": "18k", "quantity": 2, "delivery_address": None, "delivery_option": None}
+    arguments = {"product_name": "Ring", "material": "18k", "quantity": 2}
+    assert router._describe_order_corrections(old_draft, arguments) is None
+
+
+def test_describe_order_corrections_describes_a_single_field_change():
+    old_draft = {"product_name": "Ring", "material": "12k", "quantity": 7, "delivery_address": None, "delivery_option": None}
+    arguments = {"product_name": "Ring", "material": "14k", "quantity": 7}
+
+    note = router._describe_order_corrections(old_draft, arguments)
+
+    assert note == "Got it, I've updated the karat to 14k."
+
+
+def test_describe_order_corrections_describes_multiple_field_changes_in_one_sentence():
+    # "Actually 14k, make it 6 instead" -- both changed in one message,
+    # acknowledged together, not one at a time.
+    old_draft = {"product_name": "Ring", "material": "12k", "quantity": 7, "delivery_address": None, "delivery_option": None}
+    arguments = {"product_name": "Ring", "material": "14k", "quantity": 6}
+
+    note = router._describe_order_corrections(old_draft, arguments)
+
+    assert note == "Got it, I've updated the karat to 14k and the quantity to 6."
+
+
+def test_describe_order_corrections_ignores_a_field_still_unknown():
+    # material was never known before, and this call still doesn't know
+    # it either -- not a correction, nothing to say.
+    old_draft = {"product_name": "Ring", "material": None, "quantity": 7, "delivery_address": None, "delivery_option": None}
+    arguments = {"product_name": "Ring", "material": "unknown", "quantity": 7}
+
+    assert router._describe_order_corrections(old_draft, arguments) is None
+
+
+def test_describe_order_corrections_ignores_a_field_answered_for_the_first_time():
+    # delivery_address was never known before -- this is propose_order's
+    # normal "answering the next missing question" flow, not a
+    # correction, even though the value technically differs from None.
+    old_draft = {"product_name": "Ring", "material": "18k", "quantity": 7, "delivery_address": None, "delivery_option": None}
+    arguments = {"product_name": "Ring", "material": "18k", "quantity": 7, "delivery_address": "East Legon"}
+
+    assert router._describe_order_corrections(old_draft, arguments) is None
+
+
+def test_route_customer_attaches_correction_note_to_the_result(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "propose_order",
+            "arguments": {"product_name": "Ring", "material": "14k", "quantity": 7},
+        }),
+    )
+    monkeypatch.setattr(router, "get_pending_order_summary", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        router,
+        "get_order_draft",
+        MagicMock(return_value={
+            "product_name": "Ring", "material": "12k", "quantity": 7,
+            "delivery_address": None, "delivery_option": None,
+        }),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"error": "What address should this be delivered to?"}))
+
+    result = router.route_customer("wait i want to order the 14k rather", "session-correction")
+
+    assert result["correction_note"] == "Got it, I've updated the karat to 14k."
+    assert result["error"] == "What address should this be delivered to?"
+
+
+def test_route_customer_omits_correction_note_when_nothing_changed(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "propose_order",
+            "arguments": {"product_name": "Ring", "material": "18k", "quantity": 7, "delivery_address": "East Legon"},
+        }),
+    )
+    monkeypatch.setattr(router, "get_pending_order_summary", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        router,
+        "get_order_draft",
+        MagicMock(return_value={
+            "product_name": "Ring", "material": "18k", "quantity": 7,
+            "delivery_address": None, "delivery_option": None,
+        }),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"proposal": {}}))
+
+    result = router.route_customer("east legon", "session-no-correction")
+
+    assert "correction_note" not in result
