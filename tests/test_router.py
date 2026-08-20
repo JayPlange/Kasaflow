@@ -897,6 +897,52 @@ def test_route_customer_attaches_correction_note_to_the_result(monkeypatch):
     assert result["error"] == "What address should this be delivered to?"
 
 
+def test_route_customer_omits_correction_note_when_a_pending_order_already_exists(monkeypatch):
+    # Confirmed live, 2026-08-20: with an unconfirmed Tamale order still
+    # pending, a customer's complete new order (different product,
+    # deliver to Accra) got a correction_note referencing the OLD
+    # pending order's product -- built from a draft the LLM itself was
+    # never even shown this turn (route_customer() already withholds
+    # order_draft from the prompt once a pending_order exists -- see its
+    # own "None if pending_order else get_order_draft()" line). This
+    # mirrors that same rule on the correction-note side.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "Solid Cross Chains White Gold Necklace, 20g", "material": "14k",
+                "quantity": 1, "delivery_address": "Accra", "delivery_option": "accra_rider",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        router,
+        "get_pending_order_summary",
+        MagicMock(return_value={
+            "product": "Custom Gye Nyame Gold Necklace with Earrings, 20g",
+            "material": "14k", "quantity": 1, "total": 26000.0,
+        }),
+    )
+    monkeypatch.setattr(
+        router,
+        "get_order_draft",
+        MagicMock(return_value={
+            "product_name": "Custom Gye Nyame Gold Necklace with Earrings, 20g", "material": "14k",
+            "quantity": 1, "delivery_address": "Tamale", "delivery_option": "kumasi_rider",
+        }),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"proposal": {}}))
+
+    result = router.route_customer(
+        "I'd like to order 1 Solid Cross Chains White Gold Necklace, 20g in 14k, deliver to Accra, "
+        "rider delivery within Accra", "session-with-pending-order",
+    )
+
+    assert "correction_note" not in result
+
+
 def test_route_customer_omits_correction_note_when_nothing_changed(monkeypatch):
     monkeypatch.setattr(
         router,

@@ -184,8 +184,20 @@ def _execute_single(tool_request: dict, session_id: str) -> dict:
     # it can be compared against `arguments` (this call's resolved
     # values) to detect a genuine correction. See
     # _describe_order_corrections()'s docstring.
+    #
+    # Only when there's no pending_order already: matches
+    # route_customer()'s own rule for order_draft ("None if pending_order
+    # else get_order_draft(session_id)") -- once a real proposal exists,
+    # the earlier draft is superseded, not something a NEW propose_order
+    # call should be diffed against. Confirmed live, 2026-08-20: with an
+    # unconfirmed Tamale order still pending, a customer's complete new
+    # order (different product, Accra) got a correction_note referencing
+    # the OLD pending order's product -- something this message never
+    # even mentioned correcting, built from a draft the LLM itself was
+    # never even shown this turn (route_customer() had already withheld
+    # it from the prompt for the same reason).
     correction_note = None
-    if tool_request["tool"] == _ORDER_TOOL:
+    if tool_request["tool"] == _ORDER_TOOL and get_pending_order_summary(session_id) is None:
         correction_note = _describe_order_corrections(get_order_draft(session_id), arguments)
 
     try:

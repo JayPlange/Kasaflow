@@ -182,6 +182,18 @@ def test_prompt_describes_a_real_pending_order():
     assert "2,425.00" in prompt
 
 
+def test_prompt_tells_the_model_a_new_order_description_is_not_an_update():
+    # Confirmed live, 2026-08-20: a customer with an unconfirmed Tamale
+    # order still pending gave a complete new order (different product,
+    # deliver to Accra) -- the resulting proposal wrongly kept the old
+    # product and address, because part of the new message's own detail
+    # got treated as unknown instead of read from the message itself.
+    pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
+    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None)
+    assert "treat it as a completely fresh propose_order" in prompt
+    assert "Do not leave a field \"unknown\" just because you're unsure" in prompt
+
+
 def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypatch):
     # Arrange
     fake_client = MagicMock()
