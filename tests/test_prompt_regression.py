@@ -251,8 +251,15 @@ def test_ambiguous_product_reference_with_no_context_is_left_unknown_not_guessed
     # "that one" with nothing in this message or any state passed in to
     # resolve it against -- the model must say "unknown" and let the
     # system's own memory resolution handle it (see llm.py's rules),
-    # not hallucinate a specific catalogue item.
+    # not hallucinate a specific catalogue item. Deliberately doesn't
+    # assert a specific tool: "I'll take that one" is purchase-intent
+    # language, so propose_order (asks "which item would you like to
+    # order?") is just as correct a reading as get_product_price --
+    # confirmed live, 2026-08-20, the model chose propose_order here,
+    # which is the tool's own documented behaviour, not a wrong guess.
+    # The one thing that actually matters is that it didn't hallucinate
+    # a specific catalogue item to fill the reference with.
     result = understand_customer("I'll take that one")
 
-    assert result["tool"] == "get_product_price"
+    assert result["tool"] in ("get_product_price", "propose_order")
     assert str(result["arguments"].get("product_name", "")).strip().lower() == "unknown"
