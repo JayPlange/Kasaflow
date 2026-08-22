@@ -101,6 +101,11 @@ def test_matches_kumasi_rider_for_a_real_kumasi_neighbourhood_without_the_word_k
     assert delivery_option_matches_address("kumasi_rider", "Suame")
 
 
+def test_matches_accra_rider_for_kasoa():
+    # 2026-08-20 architecture audit, failure #7.
+    assert delivery_option_matches_address("accra_rider", "Kasoa")
+
+
 def test_mismatches_kumasi_rider_for_an_accra_neighbourhood():
     # A curated Accra neighbourhood must not also satisfy kumasi_rider
     assert not delivery_option_matches_address("kumasi_rider", "East Legon")
@@ -177,6 +182,43 @@ def test_classify_zone_offline_returns_none_when_genuinely_unclear():
     # for why an unrecognised address is no more likely to be
     # international than an unlisted Ghanaian town.
     assert classify_zone_offline("221B Baker Street, London") is None
+
+
+def test_classify_zone_offline_resolves_kasoa_to_accra():
+    # 2026-08-20 architecture audit, failure #7: Kasoa is a real,
+    # populous Greater Accra town that was previously absent from every
+    # list in this file, so it fell through to None (and the customer
+    # got asked the redundant three-way delivery question) instead of
+    # getting the same treatment Tema/Madina already get.
+    assert classify_zone_offline("Kasoa") == "accra_rider"
+    assert classify_zone_offline("Millennium City, Kasoa") == "accra_rider"
+
+
+def test_classify_zone_offline_resolves_realistic_kasoa_variants():
+    # Webb, 2026-08-20: real WhatsApp addresses won't always be clean
+    # canonical names -- test the messy variants, not just the bare word.
+    assert classify_zone_offline("Kasoa, Ghana") == "accra_rider"
+    assert classify_zone_offline("near Kasoa") == "accra_rider"
+    assert classify_zone_offline("Kasoa Central") == "accra_rider"
+    assert classify_zone_offline("I stay around Kasoa somewhere") == "accra_rider"
+
+
+def test_classify_zone_offline_does_not_false_positive_on_short_place_names():
+    # 2026-08-20 architecture audit, failure #7: "ho" and "wa" (both real
+    # Ghanaian regional capitals) are also ordinary two-letter sequences
+    # -- a bare substring check would wrongly match them inside unrelated
+    # words. Neither of these addresses names a real Ghanaian place.
+    assert classify_zone_offline("456 Workshop Lane, Lagos") is None
+    assert classify_zone_offline("12 Wardrobe Street, London") is None
+    assert classify_zone_offline("The Showroom, Manchester") is None
+
+
+def test_classify_zone_offline_still_resolves_the_real_ho_and_wa():
+    # The word-boundary fix must not break the genuine case -- Ho and Wa
+    # are real regional capitals and must still resolve as Ghanaian.
+    assert classify_zone_offline("Ho") == "ghana_other"
+    assert classify_zone_offline("Wa") == "ghana_other"
+    assert classify_zone_offline("Bank Street, Ho") == "ghana_other"
     assert classify_zone_offline("1 Unnamed Lane") is None
     assert classify_zone_offline("") is None
     assert classify_zone_offline(None) is None

@@ -103,6 +103,29 @@ def get_product_price(product_name: str, material: str):
 
     if matches:
         best = matches[0]
+        # A karat was explicitly stated but semantic search (not the
+        # exact/karat-match paths above, both of which already require an
+        # exact product_name) is reached only when product_name itself
+        # didn't literally match anything in the catalogue -- a mangled
+        # or slightly-off name from the model, most likely. In that case
+        # the embedding match can easily land on the RIGHT product at the
+        # WRONG karat (its nearest neighbour by meaning, not by the
+        # specific variant asked for), and nothing before this point ever
+        # checks that. Confirmed live, 2026-08-20: a customer's explicit
+        # "change the karat to 18" produced a correction_note claiming
+        # "updated the karat to 18k" while the actual proposal silently
+        # priced at 12k -- the requested karat and the returned product's
+        # karat had quietly diverged. Refusing a karat-mismatched
+        # semantic match turns that into an honest "couldn't find that
+        # product" instead of a silently wrong price.
+        if target_karat and _extract_karat(best.get("material")) != target_karat:
+            logger.warning(
+                "Semantic match %r (material=%s) doesn't match the requested karat=%s for "
+                "product_name=%s -- refusing the mismatch rather than silently pricing at "
+                "the wrong karat.",
+                best["product"], best.get("material"), target_karat, product_name,
+            )
+            return None
         logger.info(
             "Semantic match: %r (score=%.3f) for query %r",
             best["product"],
@@ -112,6 +135,66 @@ def get_product_price(product_name: str, material: str):
         return {k: v for k, v in best.items() if k != "score"}
 
     logger.info("No product match at all for product_name=%s material=%s", product_name, material)
+    return None
+
+
+def get_product_price_by_id(product_id, material):
+    """Same karat-aware lookup as get_product_price(), but keyed on the
+    catalogue's own numeric `id` instead of a restated product_name
+    string.
+
+    Exists for order_tool.propose_order()'s correction-recovery fallback
+    (see that function's docstring): `id` is stable across every
+    karat/size variant of one named product in this catalogue (confirmed
+    against the real data, 2026-08-21 -- "Big White Crown Stone Gold
+    Ring, 14g" has 33 rows, one per karat+size combination, every one of
+    them sharing id=5892; only variation_id changes per row), so a
+    session that already has a verified id for its active product can
+    reprice a karat/material correction against that id directly,
+    without ever depending on the model correctly restating the full
+    product_name string again.
+
+    Deliberately does NOT fall back to semantic search, same reasoning
+    as get_product_karat_options() above: the caller already has a
+    specific, previously-verified id in hand, so a fuzzy fallback here
+    would risk quietly mixing in a different product's variant instead
+    of just returning nothing. A caller with only a name and no id
+    should use get_product_price() instead."""
+    try:
+        with open(settings.products_path, "r") as file:
+            products = json.load(file)
+    except FileNotFoundError:
+        logger.error("Products file not found at %s", settings.products_path)
+        return None
+    except json.JSONDecodeError as e:
+        logger.error("Products file at %s is not valid JSON: %s", settings.products_path, e)
+        return None
+
+    matches = [product for product in products if product.get("id") == product_id]
+    if not matches:
+        return None
+
+    # Same two-tier match as get_product_price(): a plain exact material
+    # match first (covers non-sized products, whose material is a bare
+    # "18k" rather than the sized "{karat} / {size} (mm)" format), then
+    # karat-extraction for sized products.
+    for product in matches:
+        if product.get("material") == material:
+            return product
+
+    target_karat = _extract_karat(material)
+    if target_karat:
+        karat_matches = [
+            product for product in matches
+            if _extract_karat(product.get("material")) == target_karat
+        ]
+        if karat_matches:
+            return karat_matches[0]
+
+    logger.info(
+        "No karat match for product_id=%s material=%s among %d known variant(s)",
+        product_id, material, len(matches),
+    )
     return None
 
 

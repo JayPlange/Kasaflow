@@ -12,16 +12,25 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from services import order_tool
+from services import memory, order_tool
 from services.memory import SessionStore
 
 
 @pytest.fixture(autouse=True)
 def fresh_session_store(monkeypatch):
     """Every test gets an empty store -- propose_order/confirm_order
-    read and write session state, so tests must not see each other's."""
+    read and write session state, so tests must not see each other's.
+
+    Patches BOTH order_tool._store and memory._store to the same fresh
+    instance -- in production they're the same singleton object
+    (order_tool.py's _store = get_session_store()), and clear_order_state()
+    /set_last_action_outcome() etc. are memory.py functions that close
+    over memory.py's own _store global, not order_tool.py's reference to
+    it. Patching only one leaves the other pointing at the real,
+    cross-test-polluted store."""
     store = SessionStore()
     monkeypatch.setattr(order_tool, "_store", store)
+    monkeypatch.setattr(memory, "_store", store)
     return store
 
 
@@ -101,6 +110,294 @@ def test_propose_order_carries_variation_id_when_present(monkeypatch):
 
     # Assert
     assert result["proposal"]["variation_id"] == 99
+
+
+# ---------------------------------------------------------------------
+# Price/variant invariant: a proposal's price must always match the
+# karat actually selected. Requested by Webb, 2026-08-21, as a hard,
+# LLM-independent check at the point a proposal is built -- not just a
+# test, and not just get_product_price()'s own internal guard (task
+# #90). See propose_order()'s inline comment for the exact live case
+# this closes: "updated the karat to 18k" acknowledged, total still
+# priced at 12k.
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("karat, price", [("12k", 4000.0), ("14k", 5500.0), ("18k", 7200.0)])
+def test_propose_order_prices_at_the_karat_actually_selected(monkeypatch, karat, price):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": karat, "price": price},
+    )
+
+    result = order_tool.propose_order("Ring", karat, 1, "Accra", "accra_rider", "session-1")
+
+    proposal = result["proposal"]
+    assert proposal["material"] == karat
+    assert proposal["unit_price"] == price
+    assert proposal["total"] == price
+
+
+def test_propose_order_reprices_at_the_new_karat_after_a_correction(monkeypatch):
+    # First proposal at 12k...
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "12k", "price": 4000.0},
+    )
+    first = order_tool.propose_order("Ring", "12k", 6, "Accra", "accra_rider", "session-1")
+    assert first["proposal"]["total"] == 24000.0
+
+    # ...then the customer corrects to 18k. A fresh propose_order() call
+    # (exactly what router.py's fill_missing_context/remember_context
+    # produce for a stated correction) must price at 18k throughout, not
+    # silently keep the 12k unit_price from the first call.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "18k", "price": 7200.0},
+    )
+    second = order_tool.propose_order("Ring", "18k", 6, "Accra", "accra_rider", "session-1")
+
+    assert second["proposal"]["material"] == "18k"
+    assert second["proposal"]["unit_price"] == 7200.0
+    assert second["proposal"]["total"] == 43200.0
+
+
+def test_propose_order_refuses_a_proposal_when_the_priced_karat_disagrees_with_the_selected_karat(monkeypatch):
+    # The exact live failure this guards against: the customer selected
+    # 18k, but whatever get_product_price() returned (however it got
+    # there) is actually the 12k variant. Rather than build a proposal
+    # that prices at 12k while claiming 18k, propose_order() must refuse
+    # outright -- the same "couldn't find that product" a genuine
+    # not-found gets, not a silently wrong price.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Ring", "material": "12k", "price": 4000.0},
+    )
+
+    result = order_tool.propose_order("Ring", "18k", 6, "Accra", "accra_rider", "session-1")
+
+    assert result == {"error": "Sorry, we couldn't find that product."}
+
+
+def test_propose_order_does_not_refuse_when_selected_material_has_no_extractable_karat(monkeypatch):
+    # Some catalogue items aren't karat-varianted at all (e.g. a single-
+    # option product where "material" doesn't start with a digit) -- the
+    # invariant must not fire (selected_karat is None) and must not block
+    # a perfectly legitimate proposal for that kind of product.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Silver Bracelet", "material": "Sterling Silver", "price": 900.0},
+    )
+
+    result = order_tool.propose_order(
+        "Silver Bracelet", "Sterling Silver", 1, "Accra", "accra_rider", "session-1",
+    )
+
+    assert "proposal" in result
+    assert result["proposal"]["material"] == "Sterling Silver"
+
+
+# ---------------------------------------------------------------------
+# Correction-recovery via product_id: when a correction's restated
+# product_name doesn't match the catalogue at all, but this session
+# already has a verified, active product from an earlier proposal,
+# reprice against that product's id instead of refusing outright.
+#
+# Confirmed live, 2026-08-21 (Webb, real OpenAI-backed /demo run):
+# "actually change the karat to 18" for a previously-selected "Big White
+# Crown Stone Gold Ring, 14g" (product_id 5892) restated product_name as
+# just "Big White Crown Stone Gold Ring" (the ", 14g" weight suffix
+# dropped) -- get_product_price()'s exact-match-first design can never
+# recover from that, and the customer was told "Sorry, we couldn't find
+# that product" for a correction they'd done nothing wrong to cause.
+#
+# Deliberately does NOT use a catalogue-wide prefix match (Webb/GPT
+# explicitly rejected that, 2026-08-21) -- only ever compares the
+# restated name against the ONE product already active in this session,
+# confirmed safe against the real near-duplicate-name collisions in
+# data/products.json (see test_product_tool.py's
+# test_get_product_price_by_id_never_crosses_into_a_different_id).
+# ---------------------------------------------------------------------
+
+def _mock_product_lookup_by_id(monkeypatch, product=None):
+    fake = MagicMock(return_value=product)
+    monkeypatch.setattr(order_tool, "get_product_price_by_id", fake)
+    return fake
+
+
+def test_propose_order_recovers_via_product_id_when_the_restated_name_is_truncated(monkeypatch):
+    # First, a full proposal succeeds normally and seeds this session's
+    # active product identity (product_id=5892).
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "variation_id": 5920, "product": "Big White Crown Stone Gold Ring, 14g",
+         "material": "12k", "price": 88242.0},
+    )
+    first = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+    assert "proposal" in first
+
+    # Then a correction restates the name truncated (", 14g" dropped) --
+    # the primary name-based lookup finds nothing at all.
+    get_product_price = _mock_product_lookup(monkeypatch, None)
+    get_product_price_by_id = _mock_product_lookup_by_id(
+        monkeypatch,
+        {"id": 5892, "variation_id": 5921, "product": "Big White Crown Stone Gold Ring, 14g",
+         "material": "18k", "price": 132000.0},
+    )
+
+    result = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring", "18k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    # Assert: recovered via the known id, not refused
+    assert "proposal" in result
+    assert result["proposal"]["material"] == "18k"
+    assert result["proposal"]["unit_price"] == 132000.0
+    assert result["proposal"]["total"] == 660000.0
+    get_product_price.assert_called_once_with("Big White Crown Stone Gold Ring", "18k")
+    get_product_price_by_id.assert_called_once_with(5892, "18k")
+
+
+def test_propose_order_does_not_recover_when_the_restated_name_is_not_a_prefix_of_the_active_product(monkeypatch):
+    # The collision-safety case: a genuinely different (or genuinely
+    # unmatched) product_name must not be silently redirected to the
+    # OLD active product just because a product_id happens to be sitting
+    # in memory. Only an actual PREFIX of the active product's exact
+    # name is ever treated as a truncation.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    _mock_product_lookup(monkeypatch, None)
+    get_product_price_by_id = _mock_product_lookup_by_id(monkeypatch, None)
+
+    result = order_tool.propose_order(
+        "Some Completely Different Pendant", "18k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    assert result == {"error": "Sorry, we couldn't find that product."}
+    get_product_price_by_id.assert_not_called()
+
+
+def test_propose_order_does_not_attempt_recovery_with_no_prior_active_product(monkeypatch):
+    # A fresh session with no proposal yet at all -- there is nothing to
+    # recover against, so a genuinely unmatched product must still fail
+    # exactly as before this fix existed.
+    _mock_product_lookup(monkeypatch, None)
+    get_product_price_by_id = _mock_product_lookup_by_id(monkeypatch, None)
+
+    result = order_tool.propose_order(
+        "Nonexistent Item", "18k", 1, "Accra", "accra_rider", "session-never-seen",
+    )
+
+    assert result == {"error": "Sorry, we couldn't find that product."}
+    get_product_price_by_id.assert_not_called()
+
+
+def test_propose_order_an_explicit_switch_to_a_different_valid_product_never_uses_the_fallback(monkeypatch):
+    # A genuine product switch that DOES resolve by name must go through
+    # the ordinary path unchanged -- the id-recovery fallback only ever
+    # runs after the primary name-based lookup has already failed.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 1, "product": "Product A", "material": "18k", "price": 1000.0},
+    )
+    order_tool.propose_order("Product A", "18k", 1, "Accra", "accra_rider", "session-1")
+
+    get_product_price = _mock_product_lookup(
+        monkeypatch,
+        {"id": 2, "product": "Product B", "material": "18k", "price": 2000.0},
+    )
+    get_product_price_by_id = _mock_product_lookup_by_id(monkeypatch, None)
+
+    result = order_tool.propose_order("Product B", "18k", 1, "Accra", "accra_rider", "session-1")
+
+    assert result["proposal"]["product_id"] == 2
+    get_product_price.assert_called_once_with("Product B", "18k")
+    get_product_price_by_id.assert_not_called()
+
+
+def test_propose_order_does_not_recover_a_dropped_weight_suffix_as_a_product_switch(monkeypatch):
+    # Documents a deliberate, accepted limitation -- Webb, 2026-08-21,
+    # reviewing the live-verification replay of the 5892 karat-correction
+    # fix: this fallback exists ONLY to survive a karat correction whose
+    # restated name got truncated, because id is stable across every
+    # karat/size variant of one product in this catalogue. It is NOT
+    # stable across a weight/size variant of the same base name -- "...,
+    # 12g" and "..., 20g" are different WooCommerce products in the real
+    # catalogue (id 6520 vs 6800, confirmed against data/products.json).
+    #
+    # If a customer explicitly wants the 20g version and the model drops
+    # the weight suffix entirely, this prefix check cannot distinguish
+    # that from a karat-style truncation of the SAME item -- it will
+    # currently keep resolving the OLD, still-active id rather than the
+    # customer's actual new choice. That is intentional: silently
+    # "fixing" this by broadening the prefix match would turn a
+    # narrowly-safe recovery mechanism into a product-substitution
+    # mechanism, and reopen the wrong-SKU risk the catalogue-wide-prefix
+    # idea was rejected for (see the fallback's own inline comment in
+    # order_tool.py). This test exists as a canary: if it starts
+    # asserting the CORRECTED id, someone has broadened the match, and
+    # that change needs to be deliberate, not accidental.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 6520, "product": "Custom Gye Nyame Gold Necklace with Earrings, 12g",
+         "material": "18k", "price": 150000.0},
+    )
+    order_tool.propose_order(
+        "Custom Gye Nyame Gold Necklace with Earrings, 12g", "18k", 1, "Accra", "accra_rider", "session-1",
+    )
+
+    # The customer means the 20g product (id 6800), but the model's
+    # restated name drops the weight suffix entirely -- indistinguishable,
+    # by name alone, from a karat-only correction of the 12g item.
+    _mock_product_lookup(monkeypatch, None)
+    get_product_price_by_id = _mock_product_lookup_by_id(
+        monkeypatch,
+        {"id": 6520, "product": "Custom Gye Nyame Gold Necklace with Earrings, 12g",
+         "material": "18k", "price": 150000.0},
+    )
+
+    result = order_tool.propose_order(
+        "Custom Gye Nyame Gold Necklace with Earrings", "18k", 1, "Accra", "accra_rider", "session-1",
+    )
+
+    # Known limitation, asserted explicitly: stays on the OLD id (6520),
+    # does not silently jump to the customer's actually-intended 6800.
+    assert result["proposal"]["product_id"] == 6520
+    get_product_price_by_id.assert_called_once_with(6520, "18k")
+
+
+def test_propose_order_recovery_reprices_against_the_canonical_id_not_the_restated_text(monkeypatch):
+    # Explicit check that a successful recovery's proposal is built from
+    # whatever get_product_price_by_id() actually returned (the real
+    # catalogue row for the known id), not from the customer's restated,
+    # unmatched product_name string.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 77, "product": "Heart Twin Gold Ring, 16g", "material": "12k", "price": 5000.0},
+    )
+    order_tool.propose_order("Heart Twin Gold Ring, 16g", "12k", 1, "Accra", "accra_rider", "session-1")
+
+    _mock_product_lookup(monkeypatch, None)
+    _mock_product_lookup_by_id(
+        monkeypatch,
+        {"id": 77, "variation_id": 900, "product": "Heart Twin Gold Ring, 16g", "material": "14k", "price": 6200.0},
+    )
+
+    result = order_tool.propose_order("Heart Twin Gold Ring", "14k", 1, "Accra", "accra_rider", "session-1")
+
+    proposal = result["proposal"]
+    assert proposal["product_id"] == 77
+    assert proposal["variation_id"] == 900
+    # The canonical catalogue name, not the customer's truncated text
+    assert proposal["product"] == "Heart Twin Gold Ring, 16g"
+    assert proposal["unit_price"] == 6200.0
 
 
 # ---------------------------------------------------------------------
@@ -465,6 +762,107 @@ def test_confirm_order_returns_error_when_nothing_pending():
     assert "anything pending to confirm" in result["error"].lower()
 
 
+# ---------------------------------------------------------------------
+# Confirmation invariant: a bare "yes" may only confirm the proposal
+# that was the actual last thing this session did. Requested by Webb,
+# 2026-08-21, as an explicit, code-enforced check -- not merely inferred
+# from pending_order existing. router.py passes confirmation_allowed as
+# memory.is_awaiting_confirmation()'s pre-turn value; these tests drive
+# confirm_order() directly at the boundary, the same way the rest of
+# this file already tests order_tool.py's functions in isolation from
+# router.py's wiring (see test_order_conversations.py for the
+# end-to-end version of the same invariant).
+# ---------------------------------------------------------------------
+
+def test_confirm_order_refuses_a_pending_order_when_confirmation_was_not_allowed(
+    monkeypatch, fresh_session_store,
+):
+    fake_post = _mock_post(monkeypatch)
+    _woocommerce_settings(monkeypatch)
+    fresh_session_store.set(
+        "session-1",
+        order_tool._PENDING_ORDER_KEY,
+        {
+            "token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+            "product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0,
+            "delivery_address": "Accra", "delivery_option": "accra_rider",
+            "delivery_option_label": "rider delivery within Accra",
+        },
+    )
+
+    result = order_tool.confirm_order("session-1", confirmation_allowed=False)
+
+    assert "anything pending to confirm" in result["error"].lower()
+    # Nothing was actually placed, and the stale proposal is still there
+    # for a genuine "yes" to confirm afterwards -- this only refuses the
+    # confirmation itself, it doesn't discard the pending order (that's
+    # order_tool.propose_order()'s job, for a genuine product switch).
+    fake_post.assert_not_called()
+    assert fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY) is not None
+
+
+def test_confirm_order_still_works_when_confirmation_is_allowed(monkeypatch, fresh_session_store):
+    _woocommerce_settings(monkeypatch)
+    fake_post = _mock_post(monkeypatch, order_id=777)
+    fresh_session_store.set(
+        "session-1",
+        order_tool._PENDING_ORDER_KEY,
+        {
+            "token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+            "product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0,
+            "delivery_address": "Accra", "delivery_option": "accra_rider",
+            "delivery_option_label": "rider delivery within Accra",
+        },
+    )
+
+    result = order_tool.confirm_order("session-1", confirmation_allowed=True)
+
+    assert result["order_confirmation"]["order_id"] == 777
+    fake_post.assert_called_once()
+
+
+def test_confirm_order_defaults_to_allowed_for_direct_callers(monkeypatch, fresh_session_store):
+    # Every other caller in this file (and any future direct call that
+    # doesn't pass confirmation_allowed at all) must keep working exactly
+    # as before -- only router.py, which actually knows whether this
+    # turn was preceded by proposing the current order, opts into the
+    # stricter check.
+    _woocommerce_settings(monkeypatch)
+    _mock_post(monkeypatch, order_id=778)
+    fresh_session_store.set(
+        "session-1",
+        order_tool._PENDING_ORDER_KEY,
+        {
+            "token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+            "product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0,
+            "delivery_address": "Accra", "delivery_option": "accra_rider",
+            "delivery_option_label": "rider delivery within Accra",
+        },
+    )
+
+    result = order_tool.confirm_order("session-1")
+
+    assert result["order_confirmation"]["order_id"] == 778
+
+
+def test_confirm_order_still_resends_a_duplicate_confirmation_when_not_allowed(
+    monkeypatch, fresh_session_store,
+):
+    # confirmation_allowed only gates the "there's a pending order"
+    # branch -- the separate, already-existing duplicate-webhook-retry
+    # path (pending is None, a last_confirmed order already exists) must
+    # be untouched: that one isn't a stale proposal being wrongly
+    # resurrected, it's the SAME confirmation being safely re-sent.
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 555, "total": 2400.0, "delivery_address": "Accra", "delivery_option_label": "rider delivery within Accra"},
+    )
+
+    result = order_tool.confirm_order("session-1", confirmation_allowed=False)
+
+    assert result["order_confirmation"]["order_id"] == 555
+
+
 def test_confirm_order_creates_order_and_clears_pending_state(monkeypatch, fresh_session_store):
     # Arrange
     _woocommerce_settings(monkeypatch)
@@ -506,6 +904,42 @@ def test_confirm_order_creates_order_and_clears_pending_state(monkeypatch, fresh
     assert result["order_confirmation"]["delivery_option_label"] == "rider delivery within Accra"
     assert fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY) is None
     assert fresh_session_store.get("session-1", order_tool._LAST_CONFIRMED_KEY)["order_id"] == 555
+
+
+def test_confirm_order_clears_remembered_order_fields(monkeypatch, fresh_session_store):
+    # 2026-08-20 architecture audit, failure #3: confirm_order previously
+    # cleared only its own pending-order key -- product_name, material,
+    # quantity, delivery_address, delivery_option, and last_priced_product
+    # all sat untouched afterward, ready to bleed into a later, unrelated
+    # order. See memory.clear_order_state().
+    _woocommerce_settings(monkeypatch)
+    _mock_post(monkeypatch, order_id=556)
+    fresh_session_store.set(
+        "session-1",
+        order_tool._PENDING_ORDER_KEY,
+        {
+            "token": "abc-123", "status": "pending", "product_id": 42, "variation_id": None,
+            "product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0,
+            "delivery_address": "Accra", "delivery_option": "accra_rider",
+            "delivery_option_label": "rider delivery within Accra",
+        },
+    )
+    # Simulate what a real order-taking conversation would have left in
+    # the remembered-context slots (services/memory.py's _REMEMBERED_KEYS)
+    # by the time the order gets confirmed.
+    for key, value in {
+        "product_name": "Ring", "material": "18k", "quantity": 2,
+        "delivery_address": "Accra", "delivery_option": "accra_rider",
+        "last_priced_product": "Ring",
+    }.items():
+        fresh_session_store.set("session-1", key, value)
+
+    # Act
+    order_tool.confirm_order("session-1")
+
+    # Assert: every order-relevant remembered field is gone
+    for key in ("product_name", "material", "quantity", "delivery_address", "delivery_option", "last_priced_product"):
+        assert fresh_session_store.get("session-1", key) is None, f"{key!r} was not cleared after confirmation"
 
 
 def test_confirm_order_includes_variation_id_when_present(monkeypatch, fresh_session_store):

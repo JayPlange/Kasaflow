@@ -36,6 +36,49 @@ logger = logging.getLogger(__name__)
 # document happened to score highest.
 _DEFAULT_MIN_SCORE = 0.15
 
+# Second, independent gate on top of the similarity score -- 2026-08-20
+# architecture audit, failure #6: with only ~6 short documents and a
+# 0.15 threshold, a coincidentally above-threshold match against the
+# WRONG document is a structural risk, not a one-off (this is exactly
+# what happened live: a customer disputing which karat their order used
+# scored above 0.15 against warranty_policy and got warranty text back).
+# A document is only actually returned if the query also contains a
+# plausible keyword for that document's real topic -- "I found a
+# document" is not the same claim as "I found an answer to this
+# question". Deliberately hand-written and short rather than derived
+# from the document text automatically: the failure mode here is
+# semantic near-misses, so the second gate needs to be a different kind
+# of signal (literal topic words), not another embedding comparison that
+# would share the same blind spot. A document with no entry here fails
+# open (see _topic_matches()) rather than silently becoming unreachable
+# the moment it's added to policies.json without this table being
+# updated too -- add an entry here whenever a new policy document is added.
+_TOPIC_KEYWORDS: dict[str, set[str]] = {
+    "returns_policy": {"return", "returns", "refund", "refunds", "money back", "send back", "exchange"},
+    "warranty_policy": {
+        "warranty", "warrantee", "guarantee", "defect", "defective", "broken", "repair",
+        "replace", "replacement", "faulty", "malfunction",
+    },
+    "ring_sizing": {"size", "sizes", "sizing", "resize", "resizing", "fit", "too big", "too small", "finger"},
+    "jewellery_care": {
+        "clean", "cleaning", "care", "store", "storage", "tarnish", "polish", "shower",
+        "swim", "swimming", "chemical", "lotion", "perfume",
+    },
+    "custom_engraving": {"engrave", "engraving", "engraved", "inscription", "personalise", "personalize", "personalised", "personalized"},
+    "payment_methods": {
+        "pay", "payment", "payments", "card", "cards", "mobile money", "momo",
+        "instalment", "instalments", "installment", "installments", "afterpay",
+        "buy now pay later", "checkout",
+    },
+}
+
+
+def _topic_matches(doc_id: str, query_lower: str) -> bool:
+    keywords = _TOPIC_KEYWORDS.get(doc_id)
+    if not keywords:
+        return True
+    return any(keyword in query_lower for keyword in keywords)
+
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
@@ -74,7 +117,9 @@ class KnowledgeBase:
 
     def retrieve(self, query: str, top_k: int = 2, min_score: float = _DEFAULT_MIN_SCORE) -> list[dict]:
         """Return up to top_k documents whose embedding is closest to the query's,
-        each annotated with its similarity score, filtered to min_score and above.
+        each annotated with its similarity score, filtered to min_score and above,
+        AND filtered again by _topic_matches() -- see that function's comment
+        for why a similarity score alone isn't trusted as "this is the answer".
         """
         self._ensure_loaded()
         if not self._documents:
@@ -86,7 +131,11 @@ class KnowledgeBase:
             for doc, doc_embedding in zip(self._documents, self._embeddings)
         ]
         scored.sort(key=lambda d: d["score"], reverse=True)
-        return [doc for doc in scored[:top_k] if doc["score"] >= min_score]
+        query_lower = query.lower()
+        return [
+            doc for doc in scored[:top_k]
+            if doc["score"] >= min_score and _topic_matches(doc["id"], query_lower)
+        ]
 
     def reload(self) -> None:
         """Force re-reading the documents file and re-embedding on next use.

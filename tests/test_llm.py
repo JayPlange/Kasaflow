@@ -176,7 +176,7 @@ def test_prompt_tells_the_model_nothing_is_pending_by_default():
 
 def test_prompt_describes_a_real_pending_order():
     pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
-    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None)
+    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None, awaiting_confirmation=True)
     assert "pending order awaiting confirmation" in prompt
     assert "2 x 18k Ring" in prompt
     assert "2,425.00" in prompt
@@ -189,9 +189,44 @@ def test_prompt_tells_the_model_a_new_order_description_is_not_an_update():
     # product and address, because part of the new message's own detail
     # got treated as unknown instead of read from the message itself.
     pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
-    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None)
+    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None, awaiting_confirmation=True)
     assert "treat it as a completely fresh propose_order" in prompt
     assert "Do not leave a field \"unknown\" just because you're unsure" in prompt
+
+
+def test_prompt_refuses_bare_agreement_when_something_else_was_asked_since():
+    # P0 fix: a pending order can sit unconfirmed for the rest of the
+    # session while the assistant goes on to ask/offer something else
+    # ("want to see a few cheaper options?"). A bare "yeah" answering
+    # THAT must not be read as confirming the stale order -- that would
+    # place a real order the customer never meant to place.
+    pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
+    prompt = llm._build_prompt("yh", pending_order=pending, order_draft=None, awaiting_confirmation=False)
+    assert "do NOT use confirm_order for a bare agreement alone" in prompt
+    assert "EARLIER order still sitting unconfirmed" in prompt
+    # And the unconditional "clearly confirms this" instruction from the
+    # awaiting_confirmation=True branch must NOT leak into this one.
+    assert "proposed just now with nothing else asked or offered since" not in prompt
+
+
+def test_prompt_omits_just_confirmed_order_section_by_default():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "was JUST confirmed and placed" not in prompt
+
+
+def test_prompt_describes_a_just_confirmed_order():
+    # 2026-08-20 architecture audit, failure #3: nothing told the model
+    # an order had just been placed, so a following unrelated message
+    # risked being read against nothing, and "what's my order number?"
+    # got no better an answer than a completely fresh question would.
+    confirmation = {"order_id": 777, "total": 2400.0}
+    prompt = llm._build_prompt(
+        "what's my order number", pending_order=None, order_draft=None,
+        just_confirmed_order=confirmation,
+    )
+    assert "was JUST confirmed and placed" in prompt
+    assert "#777" in prompt
+    assert "2,400.00" in prompt
 
 
 def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypatch):
@@ -251,6 +286,34 @@ def test_prompt_lets_the_model_correct_an_already_known_order_draft_field():
     prompt = llm._build_prompt("sorry, delivery within kumasi", pending_order=None, order_draft=draft)
     assert "clearly states a different value" in prompt
     assert "do not silently keep a value they just corrected" in prompt
+
+
+def test_prompt_tells_the_model_material_has_no_default_karat():
+    # Confirmed live, 2026-08-20: a customer ordered a product and gave a
+    # quantity, but never stated a karat -- propose_order's own tool
+    # description told the model "unknown" for quantity and
+    # delivery_address if unstated, but said nothing of the kind for
+    # material, so the model silently guessed 18k instead of asking.
+    prompt = llm._build_prompt(
+        "I want to order the Custom Tree Gold Necklace, 20g, deliver to Tamale",
+        pending_order=None, order_draft=None,
+    )
+    assert 'set material to "unknown"' in prompt
+    assert "never assume 18k or any other karat" in prompt
+
+
+def test_prompt_routes_an_order_decision_dispute_away_from_policy_lookup():
+    # Confirmed live, 2026-08-20: "I didn't choose the karat so why did
+    # you choose 18k for me?" was routed to answer_policy_question and
+    # came back with an unrelated warranty answer -- this is a dispute
+    # about an order decision, not store policy, and belongs with
+    # propose_order/get_product_price instead. Uses an unrelated message
+    # here deliberately, so the assertion only passes because the fixed
+    # rule text is present, not because the test's own message happens
+    # to contain it.
+    prompt = llm._build_prompt("hello", pending_order=None, order_draft=None)
+    assert "why did you choose 18k for me" in prompt.lower()
+    assert "not asking about policy" in prompt.lower()
 
 
 def test_prompt_omits_order_draft_section_once_everything_is_known():

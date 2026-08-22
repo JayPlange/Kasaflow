@@ -13,6 +13,8 @@ coordinator) finalises the actual delivery once the order is placed --
 see order_tool.py's confirm_order() for that handoff.
 """
 
+import re
+
 # The only three real delivery arrangements this business offers.
 # `key` is what propose_order()/the LLM deal with internally; `label`
 # is what gets shown to a customer.
@@ -78,6 +80,12 @@ _ACCRA_NEIGHBOURHOODS = {
     "osu", "labadi", "teshie", "nungua", "abelemkpe", "roman ridge",
     "kaneshie", "circle", "lapaz", "haatso", "ashongman", "taifa",
     "sowutuom", "weija", "abeka", "kwashieman", "odorkor",
+    # Kasoa: a real, populous Greater Accra town, previously absent from
+    # every list in this file (including _GHANA_PLACE_NAMES), so it fell
+    # through to the generic three-way delivery question instead of
+    # getting the same neighbourhood-matching treatment Tema/Madina
+    # already get. See the 2026-08-20 architecture audit, failure #7.
+    "kasoa",
 }
 
 _KUMASI_NEIGHBOURHOODS = {
@@ -85,6 +93,25 @@ _KUMASI_NEIGHBOURHOODS = {
     "asafo", "santasi", "kwadaso", "atonsu", "ayigya", "bomso",
     "asawase", "tafo", "oforikrom", "kotei",
 }
+
+# Full-word/phrase membership only -- see _contains_place()'s docstring
+# for why a bare substring check isn't safe for short place names.
+_ACCRA_PLACE_NAMES = {"accra"} | _ACCRA_NEIGHBOURHOODS
+_KUMASI_PLACE_NAMES = {"kumasi"} | _KUMASI_NEIGHBOURHOODS
+
+
+def _contains_place(text_lower: str, places) -> bool:
+    """True if any of `places` appears in `text_lower` as a whole word
+    or phrase, not merely as a substring.
+
+    Matters most for short, common place names -- "Ho" and "Wa" (both
+    real Ghanaian regional capitals in _GHANA_PLACE_NAMES) are also
+    ordinary two-letter sequences that a plain `in` check would
+    false-positive on inside unrelated words ("show", "workshop",
+    "wardrobe", ...). See the 2026-08-20 architecture audit, failure #7.
+    `\\b` word boundaries handle multi-word phrases ("east legon") the
+    same way, since whitespace is itself a boundary."""
+    return any(re.search(rf"\b{re.escape(place)}\b", text_lower) for place in places)
 
 
 def get_delivery_information() -> dict:
@@ -146,10 +173,10 @@ def delivery_option_matches_address(key: str | None, address: str | None) -> boo
         return True
     address_lower = (address or "").lower()
     if key == "accra_rider":
-        return "accra" in address_lower or any(n in address_lower for n in _ACCRA_NEIGHBOURHOODS)
+        return _contains_place(address_lower, _ACCRA_PLACE_NAMES)
     if key == "kumasi_rider":
-        return "kumasi" in address_lower or any(n in address_lower for n in _KUMASI_NEIGHBOURHOODS)
-    return not any(place in address_lower for place in _GHANA_PLACE_NAMES)
+        return _contains_place(address_lower, _KUMASI_PLACE_NAMES)
+    return not _contains_place(address_lower, _GHANA_PLACE_NAMES)
 
 
 def classify_zone_offline(address: str | None) -> str | None:
@@ -180,11 +207,11 @@ def classify_zone_offline(address: str | None) -> str | None:
     address_lower = (address or "").lower().strip()
     if not address_lower:
         return None
-    if "accra" in address_lower or any(n in address_lower for n in _ACCRA_NEIGHBOURHOODS):
+    if _contains_place(address_lower, _ACCRA_PLACE_NAMES):
         return "accra_rider"
-    if "kumasi" in address_lower or any(n in address_lower for n in _KUMASI_NEIGHBOURHOODS):
+    if _contains_place(address_lower, _KUMASI_PLACE_NAMES):
         return "kumasi_rider"
-    if any(place in address_lower for place in _GHANA_PLACE_NAMES):
+    if _contains_place(address_lower, _GHANA_PLACE_NAMES):
         return "ghana_other"
     return None
 

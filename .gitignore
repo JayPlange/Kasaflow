@@ -6,3 +6,12 @@ venv/
 .venv/
 *.egg-info/
 .DS_Store
+
+# Debug/trace artifacts from local troubleshooting -- never real source,
+# and trace files can contain real conversation content (addresses,
+# session ids). See kasaflow_local_logs.txt / trace_full.txt /
+# trace_lines.txt, 2026-08-21.
+kasaflow_local_logs.txt
+trace_full.txt
+trace_lines.txt
+data/products.json.bak-*

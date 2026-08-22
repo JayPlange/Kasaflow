@@ -147,6 +147,61 @@ def test_get_product_price_falls_through_to_semantic_search_when_no_karat_match(
     assert result is None
 
 
+def test_get_product_price_refuses_a_semantic_match_at_the_wrong_karat(monkeypatch, tmp_path):
+    # Confirmed live, 2026-08-20: an explicit "change the karat to 18"
+    # produced a correction_note claiming the karat was updated to 18k,
+    # while the actual proposal underneath silently priced at 12k --
+    # semantic search's top match shared the product but not the karat,
+    # and nothing before this guard ever checked that. This must come
+    # back as no match at all, not a silently wrong price.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_variant_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # The exact/karat-match paths both require an exact product_name, so
+    # this only reaches semantic search when the name itself is slightly
+    # off -- simulate that, and have the fake index return the 12k
+    # variant even though 18k was requested.
+    mismatched = {
+        "product": "Set Multi Stone Golf Ring, 7g",
+        "material": "12 / Women US 8 (18.2 mm)",
+        "price": 8824.2,
+        "score": 0.91,
+    }
+    fake_index = type("FakeIndex", (), {"search": lambda self, *a, **k: [mismatched]})()
+    monkeypatch.setattr(product_tool, "get_product_index", lambda: fake_index)
+
+    # Act
+    result = product_tool.get_product_price("Set Multi Stone Golf Ring 7g", "18k")
+
+    # Assert: refused, not silently returned at the wrong karat
+    assert result is None
+
+
+def test_get_product_price_accepts_a_semantic_match_at_the_right_karat(monkeypatch, tmp_path):
+    # The guard above must not become overzealous -- a semantic match
+    # that DOES share the requested karat is exactly what this fallback
+    # exists for, and must still work.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_variant_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    matching = {
+        "product": "Set Multi Stone Golf Ring, 7g",
+        "material": "18 / Women US 8 (18.2 mm)",
+        "price": 12033.0,
+        "score": 0.91,
+    }
+    fake_index = type("FakeIndex", (), {"search": lambda self, *a, **k: [matching]})()
+    monkeypatch.setattr(product_tool, "get_product_index", lambda: fake_index)
+
+    # Act
+    result = product_tool.get_product_price("Set Multi Stone Golf Ring 7g", "18k")
+
+    # Assert
+    assert result["price"] == 12033.0
+
+
 # ---------------------------------------------------------------------
 # get_product_karat_options -- the full price-by-karat breakdown for
 # one already-identified product (see photo_match_tool.py), not just
@@ -214,3 +269,95 @@ def test_get_product_karat_options_returns_empty_list_when_file_missing(monkeypa
 
     # Act / Assert: fails gracefully, not with an exception
     assert product_tool.get_product_karat_options("Anything") == []
+
+
+# ---------------------------------------------------------------------
+# get_product_price_by_id -- order_tool.propose_order()'s
+# correction-recovery fallback, 2026-08-21 (Webb, real
+# OpenAI-backed /demo run: a correction's restated product_name dropped
+# the ", 14g" weight suffix, and get_product_price()'s exact-match-first
+# design can never recover from that on its own). id is stable across
+# every karat/size variant of one named product in this catalogue
+# (confirmed against the real data), so a session that already knows a
+# product's id can reprice a correction against it directly, without
+# ever depending on the model restating the name correctly again.
+# ---------------------------------------------------------------------
+
+def _ringed_catalogue_with_ids():
+    return [
+        {"id": 5892, "variation_id": 5920, "product": "Big White Crown Stone Gold Ring, 14g",
+         "material": "12 / Women US 9.5 (19.4 mm)", "price": 88242.0},
+        {"id": 5892, "variation_id": 5921, "product": "Big White Crown Stone Gold Ring, 14g",
+         "material": "18 / Women US 9.5 (19.4 mm)", "price": 132000.0},
+        # A different catalogue entry that happens to share a name
+        # prefix with a different weight suffix -- real, confirmed data
+        # shape (data/products.json, 2026-08-21): id=6800, distinct from
+        # the 6520 entry it's a near-duplicate of.
+        {"id": 6800, "variation_id": 7001, "product": "Custom Gye Nyame Gold Necklace with Earrings, 20g",
+         "material": "18k", "price": 200000.0},
+    ]
+
+
+def test_get_product_price_by_id_returns_the_matching_karat(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_ringed_catalogue_with_ids()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_price_by_id(5892, "18k")
+
+    assert result["price"] == 132000.0
+    assert result["material"].startswith("18")
+
+
+def test_get_product_price_by_id_returns_none_for_an_unknown_id(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_ringed_catalogue_with_ids()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    assert product_tool.get_product_price_by_id(999999, "18k") is None
+
+
+def test_get_product_price_by_id_returns_none_when_the_karat_has_no_variant(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_ringed_catalogue_with_ids()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # 5892 only has 12k/18k rows in this fake catalogue -- 22k doesn't
+    # exist, and this must refuse rather than guess.
+    assert product_tool.get_product_price_by_id(5892, "22k") is None
+
+
+def test_get_product_price_by_id_matches_a_bare_exact_material_first(monkeypatch, tmp_path):
+    # Non-sized products store material as a bare "18k", not the sized
+    # "{karat} / {size}" format -- the exact-match tier must still work
+    # for those, same as get_product_price()'s own first tier.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_ringed_catalogue_with_ids()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_price_by_id(6800, "18k")
+
+    assert result["price"] == 200000.0
+
+
+def test_get_product_price_by_id_never_crosses_into_a_different_id(monkeypatch, tmp_path):
+    # The near-duplicate-name collision this whole fallback exists to
+    # stay safe against: id=6800's own material must never be returned
+    # for a query against a completely different id, regardless of any
+    # name similarity -- this function never even looks at `product`
+    # (the name), only `id`.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_ringed_catalogue_with_ids()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_price_by_id(5892, "18k")
+
+    assert result["id"] == 5892
+    assert result["price"] != 200000.0
+
+
+def test_get_product_price_by_id_returns_none_when_file_missing(monkeypatch, tmp_path):
+    missing_file = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(missing_file))
+
+    assert product_tool.get_product_price_by_id(5892, "18k") is None

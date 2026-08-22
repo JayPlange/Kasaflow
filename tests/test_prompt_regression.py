@@ -226,9 +226,46 @@ def test_sequential_quantity_correction_within_one_message_keeps_only_the_final_
 
 @pytest.mark.regression
 def test_bare_confirmation_with_a_pending_order_uses_confirm_order():
+    # awaiting_confirmation=True: proposing this order was the LAST
+    # thing that happened in the session, nothing else asked since --
+    # the case a bare agreement is genuinely meant to confirm.
     pending_order = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0}
 
-    result = understand_customer("yh", pending_order=pending_order)
+    result = understand_customer("yh", pending_order=pending_order, awaiting_confirmation=True)
+
+    assert result["tool"] == "confirm_order"
+
+
+@pytest.mark.regression
+def test_bare_agreement_after_something_else_was_asked_does_not_confirm_a_stale_order():
+    # P0 fix, Webb's check #1, 2026-08-20: KasaFlow: "Your order is
+    # ready. Confirm?" -> Customer: "What other rings do you have?" ->
+    # KasaFlow: [shows rings] -> Customer: "yeah". The correct result is
+    # NOT confirm_order -- the "yeah" answers the more recent offer, not
+    # the stale, unconfirmed order. awaiting_confirmation=False models
+    # exactly that: something else was asked since the order was proposed.
+    pending_order = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0}
+
+    result = understand_customer("yeah", pending_order=pending_order, awaiting_confirmation=False)
+
+    assert result["tool"] != "confirm_order", (
+        f"Expected a bare 'yeah' to NOT confirm a stale pending order once something else "
+        f"was asked since, got {result['tool']!r} -- this would place an order the customer "
+        f"never meant to place."
+    )
+
+
+@pytest.mark.regression
+def test_explicit_confirmation_phrase_still_confirms_even_after_something_else_was_asked():
+    # The other half of the same fix: an UNAMBIGUOUS confirmation phrase
+    # must still work even when awaiting_confirmation is False -- the
+    # deterministic flag narrows what a bare agreement means, it must
+    # not block a customer who explicitly says what they want.
+    pending_order = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2400.0}
+
+    result = understand_customer(
+        "yes please go ahead and place my order", pending_order=pending_order, awaiting_confirmation=False,
+    )
 
     assert result["tool"] == "confirm_order"
 
@@ -263,3 +300,76 @@ def test_ambiguous_product_reference_with_no_context_is_left_unknown_not_guessed
 
     assert result["tool"] in ("get_product_price", "propose_order")
     assert str(result["arguments"].get("product_name", "")).strip().lower() == "unknown"
+
+
+@pytest.mark.regression
+def test_propose_order_leaves_material_unknown_when_no_karat_was_stated():
+    # Confirmed live, 2026-08-20: "I want to order the Custom Tree Gold
+    # Necklace, 20g, deliver to Tamale" -- no karat anywhere in the
+    # message -- resulted in a proposal silently priced at 18k. material
+    # must come back "unknown" so order_tool.py's own guard asks the
+    # customer, rather than the model guessing a default that doesn't
+    # exist (every product here comes in 18k/14k/12k).
+    result = understand_customer(
+        "I want to order the Custom Tree Gold Necklace, 20g, deliver to Tamale"
+    )
+
+    assert result["tool"] == "propose_order"
+    assert str(result["arguments"].get("material", "")).strip().lower() == "unknown", (
+        f"Expected material 'unknown' when no karat was stated, got "
+        f"{result['arguments'].get('material')!r} -- the model guessed a default karat."
+    )
+
+
+@pytest.mark.regression
+def test_order_decision_dispute_does_not_route_to_policy_lookup():
+    # Confirmed live, 2026-08-20: with a pending order proposed at an
+    # (wrongly) assumed 18k, "I didn't choose the karat so why did you
+    # choose 18k for me?" was routed to answer_policy_question and came
+    # back with an unrelated warranty answer. This is a dispute about an
+    # order decision, not store policy.
+    pending_order = {
+        "product": "Custom Tree Gold Necklace, 20g", "material": "18k",
+        "quantity": 6, "total": 180000.0,
+    }
+
+    result = understand_customer(
+        "I didn't choose the karat so why did you choose 18k for me?",
+        pending_order=pending_order,
+    )
+
+    assert result["tool"] != "answer_policy_question", (
+        f"Expected an order/product tool for a dispute about an order decision, "
+        f"got answer_policy_question -- likely to surface an unrelated policy answer."
+    )
+
+
+@pytest.mark.regression
+def test_order_decision_dispute_recovers_the_disputed_field_instead_of_repeating_it():
+    # Webb, 2026-08-20, check #3: not calling answer_policy_question is
+    # necessary but not sufficient -- avoiding the wrong path doesn't
+    # guarantee the right one. If the model re-runs propose_order for a
+    # dispute like this, the disputed field (material) must not just be
+    # silently repeated at the same wrong value the customer is
+    # objecting to; it must come back "unknown" so order_tool.py's own
+    # guard asks the customer directly. Response WORDING quality (an
+    # actual "you're right, I shouldn't have assumed" apology) is a
+    # conversation-quality question the deterministic layer can't
+    # currently guarantee -- this only tests the one thing that's
+    # actually verifiable: the wrong value doesn't survive unchallenged.
+    pending_order = {
+        "product": "Custom Tree Gold Necklace, 20g", "material": "18k",
+        "quantity": 6, "total": 180000.0,
+    }
+
+    result = understand_customer(
+        "I didn't choose the karat so why did you choose 18k for me?",
+        pending_order=pending_order,
+    )
+
+    if result["tool"] == "propose_order":
+        material = str(result["arguments"].get("material", "")).strip().lower()
+        assert material != "18k", (
+            "Expected the disputed karat to be recovered as 'unknown', not silently "
+            "repeated at the same value the customer is disputing."
+        )

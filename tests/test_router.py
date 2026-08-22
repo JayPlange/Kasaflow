@@ -8,6 +8,8 @@ OpenAI client. We're testing the WIRING here, not the individual parts
 -- those already have their own tests.
 """
 
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +17,74 @@ import pytest
 from services import router
 from services.llm import ToolSelectionError
 from services.tool_executor import ToolExecutionError
+
+
+# ---------------------------------------------------------------------
+# Turn concurrency: route_customer() must serialize two near-simultaneous
+# messages for the SAME session, but must NOT serialize messages for
+# different sessions against each other. See memory.SessionStore.
+# session_lock()'s docstring for the corruption this prevents -- a
+# slower request's write landing after a faster, later request's write,
+# silently overwriting the customer's actual last-stated value.
+# ---------------------------------------------------------------------
+
+def test_route_customer_serializes_concurrent_calls_for_the_same_session(monkeypatch):
+    concurrency = {"current": 0, "max": 0}
+    guard = threading.Lock()
+
+    def slow_understand(message, **kwargs):
+        with guard:
+            concurrency["current"] += 1
+            concurrency["max"] = max(concurrency["max"], concurrency["current"])
+        time.sleep(0.05)
+        with guard:
+            concurrency["current"] -= 1
+        return {"tool": "converse", "arguments": {"reply": "ok"}}
+
+    monkeypatch.setattr(router, "understand_customer", slow_understand)
+
+    threads = [
+        threading.Thread(target=router.route_customer, args=(f"message {i}", "session-race"))
+        for i in range(5)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # If the lock only covered individual memory.py calls (the pre-fix
+    # behaviour), all 5 understand_customer calls could overlap during
+    # their sleep -- max would be > 1.
+    assert concurrency["max"] == 1
+
+
+def test_route_customer_does_not_serialize_different_sessions(monkeypatch):
+    active = {"count": 0}
+    overlapped = {"seen": False}
+    guard = threading.Lock()
+
+    def slow_understand(message, **kwargs):
+        with guard:
+            active["count"] += 1
+            if active["count"] > 1:
+                overlapped["seen"] = True
+        time.sleep(0.05)
+        with guard:
+            active["count"] -= 1
+        return {"tool": "converse", "arguments": {"reply": "ok"}}
+
+    monkeypatch.setattr(router, "understand_customer", slow_understand)
+
+    t1 = threading.Thread(target=router.route_customer, args=("hi", "session-a"))
+    t2 = threading.Thread(target=router.route_customer, args=("hi", "session-b"))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Two different customers must not block on each other -- a global
+    # lock would be a correctness fix that also tanks throughput.
+    assert overlapped["seen"] is True
 
 
 def test_route_customer_happy_path(monkeypatch):
@@ -260,14 +330,20 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
 
     # Assert: order_draft is None here -- once a full proposal exists,
     # that's the active state, not the draft that led to it (see
-    # router.py's route_customer())
+    # router.py's route_customer()). awaiting_confirmation defaults to
+    # False for a session that never had propose_order's own success
+    # branch set it True (get_pending_order_summary is mocked here, but
+    # is_awaiting_confirmation() isn't -- it reads the real, untouched
+    # memory store for this brand-new session_id).
     understand.assert_called_once_with(
         "yh",
         pending_order={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0},
+        awaiting_confirmation=False,
         order_draft=None,
         pending_intent=None,
         last_action_outcome=None,
         last_priced_product=None,
+        just_confirmed_order=None,
     )
 
 
@@ -283,11 +359,165 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
     understand.assert_called_once_with(
         "how much is a gold ring?",
         pending_order=None,
+        awaiting_confirmation=False,
+        just_confirmed_order=None,
         order_draft=None,
         pending_intent=None,
         last_action_outcome=None,
         last_priced_product=None,
     )
+
+
+def test_route_customer_marks_awaiting_confirmation_after_a_successful_proposal(monkeypatch):
+    # P0 fix: propose_order succeeding is the ONLY thing that should let
+    # a following bare "yes" be read as confirming this exact order.
+    from services.memory import is_awaiting_confirmation
+
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "Ring", "material": "18k", "quantity": 1,
+                "delivery_address": "Accra", "delivery_option": "accra_rider",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"proposal": {"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0}}),
+    )
+
+    router.route_customer("I want a ring in 18k, deliver to Accra, rider delivery", "session-just-proposed")
+
+    assert is_awaiting_confirmation("session-just-proposed") is True
+
+
+def test_route_customer_clears_awaiting_confirmation_after_any_other_tool(monkeypatch):
+    # P0 fix: the exact scenario the audit flagged -- an order is
+    # proposed and left unconfirmed, then the assistant asks or answers
+    # something completely unrelated. A bare "yes" after THAT must not
+    # be readable as confirming the stale order, so the flag must clear.
+    from services.memory import get_session_store, is_awaiting_confirmation
+
+    get_session_store().set("session-then-browsed", "awaiting_confirmation", True)
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"category": "Rings"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"recommendations": [{"product": "Other Ring", "material": "14k", "price": 900}]}),
+    )
+
+    router.route_customer("what other rings do you have", "session-then-browsed")
+
+    assert is_awaiting_confirmation("session-then-browsed") is False
+
+
+def test_route_customer_clears_awaiting_confirmation_for_a_converse_reply(monkeypatch):
+    # Same as above, specifically for converse -- the exact shape of
+    # Webb's own example ("want to see a few cheaper options?" -> "yeah").
+    from services.memory import get_session_store, is_awaiting_confirmation
+
+    get_session_store().set("session-then-chatted", "awaiting_confirmation", True)
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={
+            "tool": "converse",
+            "arguments": {"reply": "Want me to show you a few cheaper options?"},
+        }),
+    )
+
+    router.route_customer("ei that's expensive oo", "session-then-chatted")
+
+    assert is_awaiting_confirmation("session-then-chatted") is False
+
+
+def test_route_customer_marks_just_confirmed_order_after_a_successful_confirmation(monkeypatch):
+    from services.memory import get_just_confirmed_order
+
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "confirm_order", "arguments": {}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"order_confirmation": {"order_id": 777, "total": 2400.0}}),
+    )
+
+    router.route_customer("yes", "session-confirming")
+
+    assert get_just_confirmed_order("session-confirming") == {"order_id": 777, "total": 2400.0}
+
+
+def test_route_customer_clears_just_confirmed_order_on_the_next_unrelated_turn(monkeypatch):
+    # The signal must not linger past the one turn it's for -- otherwise
+    # a customer's later, unrelated message would keep getting told
+    # about an order that was placed several turns ago.
+    from services.memory import get_just_confirmed_order, get_session_store
+
+    get_session_store().set("session-moved-on", "just_confirmed_order", {"order_id": 777, "total": 2400.0})
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "chain", "material": "gold"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "chain", "material": "gold", "price": 900}),
+    )
+
+    router.route_customer("how much is a gold chain", "session-moved-on")
+
+    assert get_just_confirmed_order("session-moved-on") is None
+
+
+def test_route_customer_reasserts_awaiting_confirmation_after_a_correction_produces_a_new_proposal(monkeypatch):
+    # Webb, 2026-08-20: awaiting_confirmation must track "the exact
+    # current draft that was most recently proposed", not just "some
+    # order exists". A correction that itself produces a full new
+    # proposal must flip the flag back to True for THAT proposal, so a
+    # following "yes" confirms the corrected order, not nothing at all.
+    from services.memory import is_awaiting_confirmation
+
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(side_effect=[
+            {
+                "tool": "propose_order",
+                "arguments": {
+                    "product_name": "Ring", "material": "14k", "quantity": 2,
+                    "delivery_address": "Accra", "delivery_option": "accra_rider",
+                },
+            },
+            {
+                "tool": "propose_order",
+                "arguments": {
+                    "product_name": "unknown", "material": "18k", "quantity": "unknown",
+                    "delivery_address": "unknown", "delivery_option": "unknown",
+                },
+            },
+        ]),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(side_effect=[
+            {"proposal": {"product": "Ring", "material": "14k", "quantity": 2, "total": 2400.0}},
+            {"proposal": {"product": "Ring", "material": "18k", "quantity": 2, "total": 2600.0}},
+        ]),
+    )
+
+    router.route_customer("2 rings in 14k, deliver to Accra, rider delivery", "session-correction-then-confirm")
+    assert is_awaiting_confirmation("session-correction-then-confirm") is True
+
+    router.route_customer("actually make it 18k", "session-correction-then-confirm")
+    assert is_awaiting_confirmation("session-correction-then-confirm") is True
 
 
 def test_route_customer_passes_order_draft_state_when_an_order_is_in_progress(monkeypatch):
@@ -317,6 +547,81 @@ def test_route_customer_passes_order_draft_state_when_an_order_is_in_progress(mo
     from services import router as router_module
     call_kwargs = router_module.understand_customer.call_args.kwargs
     assert call_kwargs["order_draft"]["product_name"] == "Ring"
+
+
+def test_route_customer_still_passes_order_draft_when_a_stale_pending_order_is_for_a_different_product(monkeypatch):
+    # Webb, 2026-08-20, live: a bare "14k" answering propose_order's own
+    # "What karat would you like?" misrouted to recommend_products three
+    # separate times -- every time with an OLD, unconfirmed proposal for
+    # a different product still sitting there. order_draft was previously
+    # suppressed unconditionally whenever ANY pending_order existed, so
+    # the new order's own in-progress draft (product known, karat
+    # missing) never reached the prompt at all, leaving the model with no
+    # order_draft-based disambiguation rule for the bare reply. Fixed via
+    # _order_draft_matches_pending_order(): only suppress order_draft
+    # when it genuinely describes the SAME order as pending_order.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "propose_order", "arguments": {}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"error": "What karat would you like that in?"}))
+    monkeypatch.setattr(
+        router,
+        "get_pending_order_summary",
+        MagicMock(return_value={"product": "Gye Nyame White Necklace with Earrings, 30g", "material": "14k", "quantity": 6, "total": 270000.0}),
+    )
+    monkeypatch.setattr(
+        router,
+        "get_order_draft",
+        MagicMock(return_value={
+            "product_name": "Big White Crown Stone Gold Ring, 14g", "material": None,
+            "quantity": None, "delivery_address": "Accra", "delivery_option": "accra_rider",
+        }),
+    )
+
+    # Act
+    router.route_customer("14k", "session-stale-pending-different-product")
+
+    # Assert: order_draft for the RING must still reach understand_customer,
+    # not be suppressed just because a stale necklace proposal exists.
+    call_kwargs = router.understand_customer.call_args.kwargs
+    assert call_kwargs["order_draft"] is not None
+    assert call_kwargs["order_draft"]["product_name"] == "Big White Crown Stone Gold Ring, 14g"
+
+
+def test_route_customer_suppresses_order_draft_when_it_matches_the_pending_order(monkeypatch):
+    # The guard above must not become overzealous -- when order_draft
+    # genuinely IS the same order as pending_order (the common case,
+    # e.g. right after a full proposal), it must still be suppressed as
+    # before: pending_order's own state line already covers it, and
+    # showing both would be redundant.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "confirm_order", "arguments": {}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"order_confirmation": {}}))
+    monkeypatch.setattr(
+        router,
+        "get_pending_order_summary",
+        MagicMock(return_value={"product": "Ring", "material": "18k", "quantity": 1, "total": 1225.0}),
+    )
+    monkeypatch.setattr(
+        router,
+        "get_order_draft",
+        MagicMock(return_value={
+            "product_name": "Ring", "material": "18k", "quantity": 1,
+            "delivery_address": "Accra", "delivery_option": "accra_rider",
+        }),
+    )
+
+    # Act
+    router.route_customer("yes", "session-matching-draft-and-pending")
+
+    # Assert
+    call_kwargs = router.understand_customer.call_args.kwargs
+    assert call_kwargs["order_draft"] is None
 
 
 def test_route_customer_injects_session_id_for_order_tools(monkeypatch):
@@ -813,6 +1118,42 @@ def test_route_customer_does_not_inject_session_id_for_read_only_tools(monkeypat
 
 
 # ---------------------------------------------------------------------
+# _order_draft_matches_pending_order -- see route_customer()'s
+# order_draft computation. Webb, 2026-08-20, live: a stale pending_order
+# for one product unconditionally suppressed order_draft for a
+# different, in-progress order, leaving a bare karat reply with no
+# disambiguation context at all.
+# ---------------------------------------------------------------------
+
+def test_order_draft_matches_pending_order_returns_false_when_either_side_is_none():
+    assert router._order_draft_matches_pending_order(None, {"product": "Ring"}) is False
+    assert router._order_draft_matches_pending_order({"product_name": "Ring"}, None) is False
+    assert router._order_draft_matches_pending_order(None, None) is False
+
+
+def test_order_draft_matches_pending_order_true_for_the_same_product(monkeypatch):
+    order_draft = {"product_name": "Ring", "material": "18k"}
+    pending_order = {"product": "Ring", "material": "18k"}
+    assert router._order_draft_matches_pending_order(order_draft, pending_order) is True
+
+
+def test_order_draft_matches_pending_order_is_case_and_whitespace_insensitive():
+    order_draft = {"product_name": "  Ring  "}
+    pending_order = {"product": "RING"}
+    assert router._order_draft_matches_pending_order(order_draft, pending_order) is True
+
+
+def test_order_draft_matches_pending_order_false_for_a_different_product():
+    # The exact case that reached the model with zero disambiguation
+    # context: a stale necklace proposal still pending while the ring's
+    # own draft is in progress -- these must NOT be treated as the same
+    # order.
+    order_draft = {"product_name": "Big White Crown Stone Gold Ring, 14g"}
+    pending_order = {"product": "Gye Nyame White Necklace with Earrings, 30g"}
+    assert router._order_draft_matches_pending_order(order_draft, pending_order) is False
+
+
+# ---------------------------------------------------------------------
 # _describe_order_corrections / correction_note wiring -- confirmed
 # live, 2026-08-19 (Webb): "wait i want to order the 14k rather" after
 # material was already "12k" changed the session's remembered material
@@ -871,6 +1212,55 @@ def test_describe_order_corrections_ignores_a_field_answered_for_the_first_time(
     assert router._describe_order_corrections(old_draft, arguments) is None
 
 
+def test_describe_order_corrections_returns_none_for_a_genuinely_different_product():
+    # A different, explicitly-named product means this message is
+    # describing something else entirely, not correcting the order on
+    # file -- diffing the other fields against it would be misleading
+    # (confirmed live, 2026-08-20: exactly this produced a fabricated
+    # correction_note for a product the customer never mentioned).
+    old_draft = {
+        "product_name": "Custom Gye Nyame Gold Necklace with Earrings, 20g", "material": "14k",
+        "quantity": 1, "delivery_address": "Tamale", "delivery_option": "kumasi_rider",
+    }
+    arguments = {
+        "product_name": "Solid Cross Chains White Gold Necklace, 20g", "material": "14k",
+        "quantity": 1, "delivery_address": "Accra", "delivery_option": "accra_rider",
+    }
+
+    assert router._describe_order_corrections(old_draft, arguments) is None
+
+
+def test_describe_order_corrections_still_fires_for_the_same_product_while_pending():
+    # The case the router-level "skip whenever pending_order exists"
+    # guard used to wrongly block too: a genuine correction to the SAME
+    # order, made while it's already fully proposed and awaiting
+    # confirmation, must still be acknowledged.
+    old_draft = {
+        "product_name": "Ring", "material": "14k", "quantity": 2,
+        "delivery_address": "Accra", "delivery_option": "accra_rider",
+    }
+    arguments = {
+        "product_name": "unknown", "material": "18k", "quantity": "unknown",
+        "delivery_address": "unknown", "delivery_option": "unknown",
+    }
+
+    note = router._describe_order_corrections(old_draft, arguments)
+
+    assert note == "Got it, I've updated the karat to 18k."
+
+
+def test_describe_order_corrections_treats_an_unstated_product_as_the_same_one():
+    # product_name "unknown" (not restated) must not itself be read as
+    # "a different product" -- only an EXPLICITLY different name should
+    # suppress the correction note.
+    old_draft = {"product_name": "Ring", "material": "12k", "quantity": 7, "delivery_address": None, "delivery_option": None}
+    arguments = {"product_name": "unknown", "material": "14k", "quantity": 7}
+
+    note = router._describe_order_corrections(old_draft, arguments)
+
+    assert note == "Got it, I've updated the karat to 14k."
+
+
 def test_route_customer_attaches_correction_note_to_the_result(monkeypatch):
     monkeypatch.setattr(
         router,
@@ -897,15 +1287,18 @@ def test_route_customer_attaches_correction_note_to_the_result(monkeypatch):
     assert result["error"] == "What address should this be delivered to?"
 
 
-def test_route_customer_omits_correction_note_when_a_pending_order_already_exists(monkeypatch):
+def test_route_customer_omits_correction_note_for_a_genuinely_different_product(monkeypatch):
     # Confirmed live, 2026-08-20: with an unconfirmed Tamale order still
     # pending, a customer's complete new order (different product,
     # deliver to Accra) got a correction_note referencing the OLD
-    # pending order's product -- built from a draft the LLM itself was
-    # never even shown this turn (route_customer() already withholds
-    # order_draft from the prompt once a pending_order exists -- see its
-    # own "None if pending_order else get_order_draft()" line). This
-    # mirrors that same rule on the correction-note side.
+    # pending order's product -- something this message never even
+    # mentioned correcting. The fix lives in _describe_order_corrections()
+    # itself: a different, explicitly-named product means this is a
+    # fresh order, not a correction, regardless of whether a pending
+    # order happens to exist (an earlier version of this fix gated the
+    # whole computation on "no pending_order", which also silently broke
+    # the much more common case -- correcting a field of an order that's
+    # already fully proposed and pending confirmation).
     monkeypatch.setattr(
         router,
         "understand_customer",
@@ -966,3 +1359,288 @@ def test_route_customer_omits_correction_note_when_nothing_changed(monkeypatch):
     result = router.route_customer("east legon", "session-no-correction")
 
     assert "correction_note" not in result
+
+
+# ---------------------------------------------------------------------
+# Per-turn debug trace: instrumentation Webb asked for (2026-08-21) so a
+# failing live turn can be diagnosed from what the LLM and the app
+# actually did, rather than guessed at ("that's just the model") after
+# the fact. See router._log_turn_trace()'s docstring. These tests only
+# check the trace itself is complete and correct -- not that any
+# particular turn behaves a certain way (already covered elsewhere).
+# ---------------------------------------------------------------------
+
+def test_route_customer_logs_a_complete_turn_trace_on_success(monkeypatch, caplog):
+    import json
+    import logging
+
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"category": "rings"}}),
+    )
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"products": []}))
+
+    with caplog.at_level(logging.INFO, logger="services.router"):
+        result = router.route_customer("show me rings", "trace-session-success")
+
+    traces = [r.message for r in caplog.records if r.message.startswith("KASAFLOW_TURN_TRACE")]
+    assert len(traces) == 1
+    payload = json.loads(traces[0][len("KASAFLOW_TURN_TRACE "):])
+
+    assert payload["session_id"] == "trace-session-success"
+    assert payload["customer_message"] == "show me rings"
+    assert payload["llm_structured_output"] == {"tool": "recommend_products", "arguments": {"category": "rings"}}
+    assert payload["resolved_arguments"] == {"category": "rings"}
+    assert payload["tool_result"] == {"products": []}
+    assert payload["final_result"] == result
+    for key in ("pending_order", "order_draft", "pending_intent", "last_action_outcome",
+                "last_priced_product", "awaiting_confirmation", "just_confirmed_order"):
+        assert key in payload["pre_tool_state"]
+        assert key in payload["post_tool_state"]
+
+
+def test_route_customer_logs_a_turn_trace_when_the_tool_raises(monkeypatch, caplog):
+    import json
+    import logging
+
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"category": "rings"}}),
+    )
+
+    def _raise(tool, **kwargs):
+        raise ToolExecutionError("boom")
+
+    monkeypatch.setattr(router, "execute_tool", _raise)
+
+    with caplog.at_level(logging.INFO, logger="services.router"):
+        result = router.route_customer("show me rings", "trace-session-error")
+
+    assert result == {"error": "Something went wrong while processing your request."}
+    traces = [r.message for r in caplog.records if r.message.startswith("KASAFLOW_TURN_TRACE")]
+    assert len(traces) == 1
+    payload = json.loads(traces[0][len("KASAFLOW_TURN_TRACE "):])
+    assert payload["tool_result"] == {"exception": "boom"}
+    assert payload["final_result"] == {"error": "Something went wrong while processing your request."}
+
+
+def test_route_customer_logs_a_turn_trace_when_tool_selection_fails(monkeypatch, caplog):
+    import json
+    import logging
+
+    def _raise(*args, **kwargs):
+        raise ToolSelectionError("could not decide")
+
+    monkeypatch.setattr(router, "understand_customer", _raise)
+
+    with caplog.at_level(logging.INFO, logger="services.router"):
+        result = router.route_customer("garbled input", "trace-session-tool-selection-error")
+
+    assert result == {"error": "I couldn't understand that request. Could you rephrase it?"}
+    traces = [r.message for r in caplog.records if r.message.startswith("KASAFLOW_TURN_TRACE")]
+    assert len(traces) == 1
+    payload = json.loads(traces[0][len("KASAFLOW_TURN_TRACE "):])
+    assert payload["llm_structured_output"] == {"error": "could not decide"}
+    assert payload["final_result"] == {"error": "I couldn't understand that request. Could you rephrase it?"}
+
+
+# ---------------------------------------------------------------------
+# awaiting_field deterministic short-circuit (Webb, 2026-08-21, P0.4):
+# a direct answer to propose_order's own immediately preceding question
+# resolves without ever calling understand_customer(). See
+# router._try_resolve_awaiting_field()'s docstring for why this exists
+# (a bare "14k" misrouting to recommend_products, live, three times,
+# despite extensive existing prompt guidance covering exactly this
+# case) and memory.set_awaiting_field()'s docstring for its lifetime.
+#
+# Pure-function tests first (no session state, no LLM, no tool
+# execution -- just the pattern match itself), then integration tests
+# proving understand_customer is never actually called when it fires.
+# ---------------------------------------------------------------------
+
+def test_try_resolve_awaiting_field_returns_none_when_nothing_is_awaited():
+    assert router._try_resolve_awaiting_field(None, "14k") is None
+
+
+@pytest.mark.parametrize("reply, expected_karat", [("12", "12"), ("12k", "12"), ("18K", "18"), (" 14k ", "14")])
+def test_try_resolve_awaiting_field_resolves_a_bare_karat(reply, expected_karat):
+    result = router._try_resolve_awaiting_field("material", reply)
+    assert result["tool"] == "propose_order"
+    assert result["arguments"]["material"] == f"{expected_karat}k"
+    assert result["arguments"]["product_name"] == "unknown"
+    assert result["arguments"]["quantity"] == "unknown"
+
+
+def test_try_resolve_awaiting_field_does_not_resolve_a_compound_material_message():
+    # "12k, 2 of them" needs the LLM's own compound-correction handling
+    # (see llm.py's _order_draft_state_line()) -- the whole message must
+    # match, not just a leading substring.
+    assert router._try_resolve_awaiting_field("material", "12k, 2 of them") is None
+
+
+@pytest.mark.parametrize("reply, expected_qty", [("2", 2), ("2 pieces", 2), ("3 of them", 3), ("5 please", 5)])
+def test_try_resolve_awaiting_field_resolves_a_bare_quantity(reply, expected_qty):
+    result = router._try_resolve_awaiting_field("quantity", reply)
+    assert result["tool"] == "propose_order"
+    assert result["arguments"]["quantity"] == expected_qty
+    assert result["arguments"]["material"] == "unknown"
+
+
+@pytest.mark.parametrize("reply", ["14k", "18k", "12k please"])
+def test_try_resolve_awaiting_field_does_not_resolve_a_karat_reply_as_quantity(reply):
+    # Webb, 2026-08-21: "assistant asked for quantity -> '14k' must not
+    # become quantity" -- a trailing "k" must not be silently parsed as
+    # a digit count. _BARE_QUANTITY_RE's optional trailing-word group
+    # only ever matches "pieces"/"pcs"/"of them"/"please", never a bare
+    # "k", so this simply doesn't match and falls through to the LLM
+    # (which has the order_draft context to tell these apart -- see
+    # llm.py's own bare-number disambiguation rule) rather than being
+    # guessed at here. Note a bare digit WITHOUT "k" ("18" alone, no
+    # material context at all) correctly DOES resolve as quantity when
+    # quantity is what's actually awaited -- awaiting_field itself is
+    # what disambiguates a bare number here, unlike the LLM's harder
+    # context-free version of the same problem.
+    assert router._try_resolve_awaiting_field("quantity", reply) is None
+
+
+@pytest.mark.parametrize("reply", ["four", "six pieces", "a couple"])
+def test_try_resolve_awaiting_field_does_not_resolve_a_word_number_as_quantity(reply):
+    # Deliberate scope boundary, not a gap: this resolver only ever
+    # matches digit patterns. Word-form numbers fall through to the LLM
+    # path exactly as before this existed -- safe (never wrong), just
+    # not sped up for this case. Keeping the deterministic path narrow
+    # is the point (Webb, 2026-08-21: "it must remain narrow").
+    assert router._try_resolve_awaiting_field("quantity", reply) is None
+
+
+@pytest.mark.parametrize("reply", [
+    "yes", "Yeah", "yh", "ok", "confirm", "go ahead", "place it", "sure.", "yes, confirm", "Yes, confirm!",
+])
+def test_try_resolve_awaiting_field_resolves_a_bare_confirmation(reply):
+    result = router._try_resolve_awaiting_field("confirmation", reply)
+    assert result == {"tool": "confirm_order", "arguments": {}, "_source": "awaiting_field:confirmation"}
+
+
+def test_try_resolve_awaiting_field_does_not_resolve_an_ambiguous_confirmation_reply():
+    # Not in the canonical set -- a hedge or a longer sentence must go
+    # through the LLM's own, already-tested confirmation guidance, not
+    # be guessed at here.
+    assert router._try_resolve_awaiting_field("confirmation", "maybe, how much would it be") is None
+
+
+@pytest.mark.parametrize("reply", ["East Legon", "12 Cantonments Road, Accra", "Kasoa"])
+def test_try_resolve_awaiting_field_resolves_a_bare_address(reply):
+    result = router._try_resolve_awaiting_field("delivery_address", reply)
+    assert result["tool"] == "propose_order"
+    assert result["arguments"]["delivery_address"] == reply
+    assert result["arguments"]["material"] == "unknown"
+
+
+@pytest.mark.parametrize("reply", ["confirm", "Confirm!", "yes", "ok", "go ahead", "place it"])
+def test_try_resolve_awaiting_field_does_not_treat_a_bare_agreement_word_as_an_address(reply):
+    # Caught live, 2026-08-21 (Webb's own first trace run): a stray
+    # "confirm" sent while delivery_address was still awaited (the
+    # previous turn's address extraction had already failed, so the
+    # question was still open) was stored as the literal delivery
+    # address "confirm" -- satisfying propose_order's own "is an address
+    # present" check, so it moved straight on to asking about
+    # delivery_option instead of recognising the customer was trying to
+    # confirm. None of the other exclusions in this branch (question
+    # marks, correction words, karat/quantity shapes) catch a bare
+    # agreement word, because there's nothing address-SPECIFIC about it
+    # -- it just isn't descriptive content for ANY field. A regression
+    # in this feature's own first version, found from Webb's live
+    # transcript, not a pre-existing bug.
+    assert router._try_resolve_awaiting_field("delivery_address", reply) is None
+
+
+def test_try_resolve_awaiting_field_does_not_resolve_a_karat_correction_as_an_address():
+    # Webb, 2026-08-21: "assistant asked for address -> '14k, make it 6'
+    # must go through the normal correction path, not become an
+    # address." Already covered by the disqualifying-words/embedded-
+    # karat parametrized test above (test_try_resolve_awaiting_field_
+    # does_not_guess_at_a_non_address_reply) -- named separately here so
+    # this specific scenario, called out explicitly, has its own visible
+    # regression test rather than only living inside a parametrize list.
+    assert router._try_resolve_awaiting_field("delivery_address", "14k, make it 6") is None
+
+
+@pytest.mark.parametrize("reply", [
+    "why do you need that?",
+    "actually 14k, make it 6 instead",
+    "wait, can I change the karat first",
+    "12k",
+    "2 of them",
+    "no, I gave you the address already",
+])
+def test_try_resolve_awaiting_field_does_not_guess_at_a_non_address_reply(reply):
+    # Every one of these is a real, live-plausible reply that is NOT an
+    # address -- a question, a correction naming a different field, a
+    # bare karat/quantity that belongs to a different awaited field, or
+    # pushback. All must fall through to the LLM's own order_draft-aware
+    # handling rather than being stored as a literal delivery address.
+    assert router._try_resolve_awaiting_field("delivery_address", reply) is None
+
+
+def test_route_customer_never_calls_understand_customer_when_the_bypass_fires(monkeypatch):
+    understand_customer_mock = MagicMock()
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(router, "get_awaiting_field", MagicMock(return_value="material"))
+    monkeypatch.setattr(router, "execute_tool", MagicMock(return_value={"error": "How many would you like?", "awaiting_field": "quantity"}))
+
+    result = router.route_customer("14k", "bypass-session")
+
+    understand_customer_mock.assert_not_called()
+    assert result["error"] == "How many would you like?"
+    # The internal routing key must never leak into the customer-facing
+    # result -- see _execute_single()'s awaiting_field stripping.
+    assert "awaiting_field" not in result
+
+
+def test_route_customer_falls_through_to_the_llm_when_the_bypass_does_not_match(monkeypatch):
+    understand_customer_mock = MagicMock(return_value={"tool": "converse", "arguments": {"reply": "Sure!"}})
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(router, "get_awaiting_field", MagicMock(return_value="material"))
+
+    router.route_customer("what karats do you have available?", "no-bypass-session")
+
+    understand_customer_mock.assert_called_once()
+
+
+def test_awaiting_field_does_not_survive_an_unrelated_turn_in_between(monkeypatch):
+    # "Immediately preceding question" (Webb's own phrasing) -- a
+    # converse reply in between means the next bare "12k" is no longer
+    # answering propose_order's karat question, so it must go back
+    # through the LLM rather than being deterministically resolved
+    # against a field that's no longer the live topic.
+    understand_customer_mock = MagicMock(side_effect=[
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Ring", "material": "unknown", "quantity": 1,
+            "delivery_address": "Accra", "delivery_option": "accra_rider"}},
+        {"tool": "converse", "arguments": {"reply": "Sure, happy to help!"}},
+        {"tool": "recommend_products", "arguments": {"category": "Rings", "material": "unknown"}},
+    ])
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(router, "execute_tool", MagicMock(side_effect=[
+        {"error": "What karat would you like that in?", "awaiting_field": "material"},
+        {"conversation_reply": "Sure, happy to help!"},
+        {"recommendations": []},
+    ]))
+    session_id = "awaiting-field-does-not-linger"
+
+    router.route_customer("I'd like to order a Ring, 1, deliver to Accra, rider delivery", session_id)
+    assert router.get_awaiting_field(session_id) == "material"
+    assert understand_customer_mock.call_count == 1
+
+    router.route_customer("thanks for your help", session_id)
+    assert router.get_awaiting_field(session_id) is None
+    assert understand_customer_mock.call_count == 2
+
+    # A bare "12k" now must go through the LLM (recommend_products, per
+    # the canned mock) rather than being silently resolved as the
+    # karat -- proving the deterministic path did NOT fire now that
+    # awaiting_field has reset.
+    router.route_customer("12k", session_id)
+    assert understand_customer_mock.call_count == 3

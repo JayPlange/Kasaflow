@@ -27,6 +27,21 @@ class SessionStore:
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
         self._sessions: dict[str, dict] = {}  # session_id -> {"data": {...}, "expires_at": float}
+        # Per-session locks for session_lock() below -- deliberately
+        # separate from self._lock, which only ever protects a single
+        # get()/set() dict operation. self._lock never spanned the real
+        # risk window: read state -> call the LLM -> execute a tool ->
+        # write state back, all as one logical turn. Two WhatsApp
+        # messages from the same customer arriving close together (the
+        # second sent before the first's slow LLM call has returned) can
+        # otherwise interleave across that whole sequence on separate
+        # threads and silently corrupt state -- e.g. a later write
+        # landing after an earlier one meant to come first, clobbering
+        # the customer's actual last-stated value. See router.py's
+        # route_customer(), which holds session_lock() for the entire
+        # turn, not just individual memory calls.
+        self._session_locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
 
     def _is_expired(self, entry: dict, now: float) -> bool:
         return entry["expires_at"] < now
@@ -58,6 +73,28 @@ class SessionStore:
         with self._lock:
             return sum(1 for entry in self._sessions.values() if not self._is_expired(entry, now))
 
+    def session_lock(self, session_id: str) -> threading.Lock:
+        """A lock dedicated to this session_id, created on first use.
+
+        Callers must hold this for the FULL duration of a turn (read
+        state -> call the LLM -> execute a tool -> write state), not
+        just around individual get()/set() calls -- those already have
+        their own, separate protection (self._lock above), which is
+        correct for what it does but was never meant to, and doesn't,
+        cover a whole turn. See the docstring on self._session_locks_guard
+        in __init__ for the concrete failure this closes.
+
+        Locks are never removed once created -- a small, bounded amount
+        of long-lived memory per distinct session_id (a WhatsApp phone
+        number, in production), not worth TTL-based cleanup machinery
+        for a single small business's real customer volume."""
+        with self._session_locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[session_id] = lock
+            return lock
+
 
 # Module-level store shared by the app process. Safe now because every
 # access is keyed by session_id and guarded by a lock, unlike the old
@@ -86,9 +123,101 @@ _REMEMBERED_KEYS = ("product_name", "material", "category", "delivery_option", "
 # llm.py's _order_draft_state_line()).
 _ORDER_DRAFT_KEYS = ("product_name", "material", "quantity", "delivery_address", "delivery_option")
 
+# Fields that describe a specific ITEM and shouldn't be assumed to
+# still apply once the customer names a different product -- see
+# fill_missing_context()'s and remember_context()'s product-switch
+# guards below. A ring's karat and a necklace's karat are genuinely
+# different facts, so these are always required to be restated (or
+# explicitly re-given in the same message) once the product changes.
+_PRODUCT_SPECIFIC_KEYS = ("material", "quantity")
+
+# Fields that describe the CUSTOMER's order as a whole, not the
+# specific item -- "deliver to Accra, rider delivery" doesn't stop
+# being true because the customer swapped which ring they want. These
+# are deliberately NOT cleared or blocked from backfilling on a product
+# switch, unlike _PRODUCT_SPECIFIC_KEYS above.
+#
+# Webb, 2026-08-20 (check #6 follow-up): the first pass of this fix put
+# delivery_address/delivery_option in _PRODUCT_SPECIFIC_KEYS too, on the
+# conservative "ask rather than guess" reasoning used elsewhere in this
+# codebase. On review, Webb concluded that reasoning doesn't actually
+# apply here -- unlike karat or quantity, an address isn't a fact that
+# could plausibly differ per product in the same conversation, so
+# treating it as product-specific meant re-asking a question the
+# customer had already answered, for no real safety benefit. Corrected
+# the classification rather than carrying the original choice forward
+# by default.
+_ORDER_LEVEL_KEYS = ("delivery_address", "delivery_option")
+
 
 def _is_unknown(value) -> bool:
     return isinstance(value, str) and value.strip().lower() == "unknown"
+
+
+def _names_a_different_product(session_id: str, arguments: dict) -> bool:
+    """True when `arguments` explicitly names a product other than the
+    one currently remembered for this session. Shared by
+    fill_missing_context() (don't backfill the old product's details
+    onto the new one) and remember_context() (don't leave the old
+    product's details sitting there once the new one's own turn writes
+    its product_name) -- see both docstrings."""
+    new_product = arguments.get("product_name")
+    remembered_product = _store.get(session_id, "product_name")
+    return (
+        remembered_product is not None
+        and new_product is not None
+        and not _is_unknown(new_product)
+        and str(new_product).strip().lower() != str(remembered_product).strip().lower()
+    )
+
+
+def _names_a_different_address(session_id: str, arguments: dict) -> bool:
+    """True when `arguments` explicitly states a delivery_address other
+    than the one currently remembered for this session.
+
+    delivery_option is DERIVED from delivery_address (see
+    geocoding_tool.infer_delivery_option()), not an independent fact --
+    "rider delivery within Kumasi" only means anything in relation to
+    some specific address. Confirmed live, 2026-08-20: once
+    delivery_option started carrying forward across turns (see
+    _ORDER_LEVEL_KEYS above), a customer who gave a NEW address later in
+    the same conversation (Accra, then Kasoa) kept getting the OLD
+    address's stale delivery_option ("kumasi_rider") silently reused --
+    order_tool.propose_order() only re-infers delivery_option from the
+    address when the current value isn't already a valid key, so a
+    stale-but-still-valid one is never revisited. Every reply came back
+    "this address doesn't match our usual rider delivery within Kumasi
+    zone", for an address nowhere near Kumasi. Used by
+    fill_missing_context() and remember_context() below to stop
+    delivery_option being backfilled/kept once the address itself has
+    genuinely moved on, forcing propose_order() to re-derive it fresh
+    for wherever the customer actually just said.
+
+    Also True when NO address has ever actually been remembered yet, but
+    a delivery_option somehow already has been. Webb's own first live
+    trace run against the awaiting_field instrumentation, 2026-08-21,
+    surfaced exactly this: a compound order message ("1 ... in 12k,
+    deliver to Kumasi, rider delivery within Kumasi") had delivery_option
+    ("kumasi_rider") extracted correctly but delivery_address silently
+    failed to extract at all that turn (still "unknown"), so nothing was
+    ever remembered for it. Several turns later, an address FINALLY
+    arrived ("deliver to Kasoa") -- but because remembered_address was
+    None rather than some earlier, genuinely different value, the
+    original "same address, nothing to re-derive" case below never
+    fired, and the stale "kumasi_rider" (which was never actually
+    derived from any address at all) carried straight through to a real
+    Kasoa order, producing the same "doesn't match our usual ... Kumasi
+    zone" message this function exists to prevent. A delivery_option
+    that was never grounded in ANY address is exactly as stale as one
+    grounded in a now-superseded address -- both need to be re-derived
+    the moment a real address actually lands."""
+    new_address = arguments.get("delivery_address")
+    if new_address is None or _is_unknown(new_address):
+        return False
+    remembered_address = _store.get(session_id, "delivery_address")
+    if remembered_address is None:
+        return _store.get(session_id, "delivery_option") is not None
+    return str(new_address).strip().lower() != str(remembered_address).strip().lower()
 
 
 def fill_missing_context(session_id: str, arguments: dict) -> dict:
@@ -99,6 +228,35 @@ def fill_missing_context(session_id: str, arguments: dict) -> dict:
     from the message alone -- this is what turns that sentinel into an
     actual resolved value from earlier in the same conversation.
 
+    Guards against a real, reachable contamination path: if THIS call
+    explicitly names a DIFFERENT product than the one remembered, its
+    other "unknown" ITEM-specific fields (material, quantity -- see
+    _PRODUCT_SPECIFIC_KEYS) are NOT backfilled from the old product's
+    memory. Traced while designing a live check for the router-level
+    product-identity correction guard, 2026-08-20: "order Product A in
+    14k, 6 of them... actually I'll take Product B" -- without this
+    guard, Product B would be silently, fully priced using Product A's
+    exact karat/quantity, neither of which the customer ever stated for
+    B, because fill_missing_context() had no concept of "these fields
+    belonged to a different item". product_name and category are
+    unaffected -- those describe what's being asked about, not a detail
+    of a specific item, so they still resolve normally. Nor are
+    delivery_address/delivery_option (see _ORDER_LEVEL_KEYS): those
+    describe the customer's order as a whole, not the item, so they
+    keep resolving from memory even across a product switch.
+
+    Separately, and for the same "don't backfill a fact that's actually
+    tied to something that just changed" reason: if THIS call states a
+    genuinely different delivery_address than the one remembered, and
+    doesn't ALSO explicitly restate delivery_option, delivery_option is
+    NOT backfilled from the old address's memory either -- see
+    _names_a_different_address()'s docstring for the live bug this
+    closes. It's deliberately left unresolved ("unknown") rather than
+    silently carrying the old address's arrangement, so
+    order_tool.propose_order()'s own infer_delivery_option() call runs
+    fresh against the new address instead of being skipped because a
+    stale-but-still-valid key was already sitting there.
+
     Returns a new dict rather than mutating the one passed in. The
     caller's arguments dict may be referenced elsewhere (tests and
     callers that snapshot the LLM's raw output are the obvious cases),
@@ -106,11 +264,19 @@ def fill_missing_context(session_id: str, arguments: dict) -> dict:
     leaking into code that still expects the original "unknown".
     """
     resolved = dict(arguments)
+    product_changed = _names_a_different_product(session_id, resolved)
+    address_changed = _names_a_different_address(session_id, resolved)
+
     for key in _REMEMBERED_KEYS:
-        if key in resolved and _is_unknown(resolved[key]):
-            remembered = _store.get(session_id, key)
-            if remembered is not None:
-                resolved[key] = remembered
+        if key not in resolved or not _is_unknown(resolved[key]):
+            continue
+        if product_changed and key in _PRODUCT_SPECIFIC_KEYS:
+            continue
+        if address_changed and key == "delivery_option":
+            continue
+        remembered = _store.get(session_id, key)
+        if remembered is not None:
+            resolved[key] = remembered
     return resolved
 
 
@@ -125,7 +291,43 @@ def remember_context(session_id: str, arguments: dict) -> None:
     arguments (a different tool that doesn't take it) or explicitly
     "unknown" -- never overwrites a real remembered value with a
     stale/missing one.
+
+    Write-side counterpart to fill_missing_context()'s read-side guard
+    above: when THIS call explicitly names a different product than the
+    one remembered, the OLD product's _PRODUCT_SPECIFIC_KEYS (material,
+    quantity) are cleared before writing this call's own values. Without
+    this, get_order_draft() (used by _describe_order_corrections() for
+    the correction-note diff) would still see the old product's stale
+    material/quantity once the new product_name lands, and misreport
+    fields the customer is stating for the first time on the new item as
+    "corrections". Traced while building the live check for the
+    router-level product-identity correction guard, 2026-08-20 --
+    product_changed must be computed BEFORE product_name itself is
+    overwritten below, since _names_a_different_product() compares
+    against whatever is currently remembered.
+
+    _ORDER_LEVEL_KEYS (delivery_address, delivery_option) are NOT cleared
+    on a product switch alone -- a product switch doesn't change where
+    the customer lives or how they want it delivered, so those keep
+    carrying forward exactly as they did before that fix.
+
+    delivery_option specifically IS cleared here when delivery_address
+    itself changes to something genuinely different (see
+    _names_a_different_address()'s docstring for the live bug this
+    closes: a stale "kumasi_rider" surviving long after the conversation
+    moved to Accra/Kasoa addresses, because nothing ever re-derived it).
+    delivery_option is a property OF an address, not an independent fact
+    -- once the address moves on, the old arrangement shouldn't just sit
+    there as if it still applies.
     """
+    product_changed = _names_a_different_product(session_id, arguments)
+    address_changed = _names_a_different_address(session_id, arguments)
+    if product_changed:
+        for key in _PRODUCT_SPECIFIC_KEYS:
+            _store.set(session_id, key, None)
+    if address_changed:
+        _store.set(session_id, "delivery_option", None)
+
     for key in _REMEMBERED_KEYS:
         if key not in arguments:
             continue
@@ -239,6 +441,133 @@ def set_last_priced_product(session_id: str, product_name: str | None) -> None:
 
 def get_last_priced_product(session_id: str) -> str | None:
     return _store.get(session_id, _LAST_PRICED_PRODUCT_KEY)
+
+
+def clear_order_state(session_id: str) -> None:
+    """Clears the remembered order-relevant slots and last_priced_product.
+
+    Call this the moment an order is CONFIRMED, not just when a proposal
+    is superseded. Previously nothing did: _finalize_confirmation() in
+    order_tool.py only ever cleared its own pending-order key, so
+    product_name, material, quantity, delivery_address, delivery_option,
+    and last_priced_product all sat untouched in session memory after a
+    real, paid-for order -- ready to silently bleed their stale values
+    into whatever the customer asks for next (2026-08-20 architecture
+    audit, failure #3: a second, unrelated order placed shortly after
+    could inherit the just-confirmed order's product/address, or receive
+    a fabricated "I've updated..." correction note for a field the new
+    order never even mentioned).
+
+    Deliberately does NOT clear "category" or pending_intent -- a
+    customer browsing "what other rings do you have" right after
+    confirming an order is a normal continuation, not contamination."""
+    for key in _ORDER_DRAFT_KEYS:
+        _store.set(session_id, key, None)
+    _store.set(session_id, _LAST_PRICED_PRODUCT_KEY, None)
+
+
+_JUST_CONFIRMED_ORDER_KEY = "just_confirmed_order"
+
+
+def set_just_confirmed_order(session_id: str, confirmation: dict | None) -> None:
+    """Marks (or clears, with None) that an order was confirmed as the
+    LAST thing that happened in this session, nothing since.
+
+    Deliberately ephemeral, unlike order_tool.py's own long-lived
+    "most recently confirmed order" record (used there to resolve a
+    bare "cancel my order" days later) -- this one exists only to tell
+    the model, for exactly one turn, that a confirmation just happened,
+    so a genuinely unrelated next message doesn't get its details read
+    against a stale, already-completed order, and so the model can give
+    a naturally different reply to "what's my order number?" than to a
+    fresh "what would you like to order?". router.py clears this back to
+    None at the start of handling every turn, same pattern as
+    set_awaiting_confirmation() above, and only sets it non-None again
+    when THIS turn's action was confirm_order succeeding."""
+    _store.set(session_id, _JUST_CONFIRMED_ORDER_KEY, confirmation)
+
+
+def get_just_confirmed_order(session_id: str) -> dict | None:
+    return _store.get(session_id, _JUST_CONFIRMED_ORDER_KEY)
+
+
+_AWAITING_CONFIRMATION_KEY = "awaiting_confirmation"
+
+
+def set_awaiting_confirmation(session_id: str, value: bool) -> None:
+    """Marks whether a bare agreement ("yes", "yeah", "ok") right now
+    should be read as confirming the session's pending order.
+
+    Exists because a pending order can sit unconfirmed for the rest of
+    the session's 30-minute TTL, and in that time the assistant can go
+    on to offer or ask the customer something completely unrelated
+    ("want to see a few cheaper options?"). Without this flag, a bare
+    "yeah" answering THAT question reads exactly like a bare "yeah"
+    confirming the stale order -- llm.py's pending_order guidance
+    previously had no way to tell the two apart, which is a real
+    commerce-integrity risk (an order gets placed the customer never
+    meant to place), not just a UX rough edge.
+
+    router.py sets this to True only immediately after a propose_order
+    call that actually produced a full proposal, and back to False at
+    the start of handling every other turn -- so it's True only when
+    the LAST thing that happened in this session was proposing this
+    exact order, nothing since. See llm.py's _pending_order_state_line()
+    for how this changes the confirm_order guidance."""
+    _store.set(session_id, _AWAITING_CONFIRMATION_KEY, value)
+
+
+def is_awaiting_confirmation(session_id: str) -> bool:
+    return bool(_store.get(session_id, _AWAITING_CONFIRMATION_KEY, False))
+
+
+_AWAITING_FIELD_KEY = "awaiting_field"
+
+# The only values this ever holds -- one specific thing this assistant
+# itself just asked the customer for, deterministically, as its very
+# last action. Deliberately a small, closed set: only the fields
+# propose_order's own missing-detail questions ask for one at a time,
+# plus "confirmation" for the question a full proposal itself poses
+# ("would you like to go ahead?"). Not every gap in an order needs an
+# entry here -- e.g. "which product" has no single deterministic
+# pattern a reply could be checked against the way a bare karat or a
+# bare number does, so it's left to the existing LLM-driven path
+# entirely, same as before this existed.
+AWAITING_FIELDS = ("material", "quantity", "delivery_address", "confirmation")
+
+
+def set_awaiting_field(session_id: str, field: str | None) -> None:
+    """Marks (or clears, with None) the one specific thing this
+    assistant's own last message asked the customer for, so their very
+    next reply can be checked against a deterministic pattern for that
+    field BEFORE the general LLM tool-selection call ever runs -- see
+    router.py's _try_resolve_awaiting_field().
+
+    Requested by Webb, 2026-08-21 (P0.4), specifically to close the
+    repeated live failure where a bare "14k" answering propose_order's
+    own "What karat would you like that in?" misrouted to
+    recommend_products three separate times, despite order_draft's
+    prompt guidance already covering this exact case in detail (see
+    llm.py's _order_draft_state_line()) -- more prompt text was not
+    enough; deciding correctly needs to not depend on the model at all
+    for this specific, narrow, pattern-matchable class of reply.
+
+    Same "last thing that happened, nothing since" lifetime as
+    set_awaiting_confirmation() above: router.py resets this to None at
+    the very start of handling every turn, and only sets it again based
+    on what THIS turn's own propose_order/confirm_order call actually
+    produced. It does not persist across an unrelated turn in between
+    (a converse reply, a browse) -- Webb's own phrasing was "direct
+    answers to the assistant's IMMEDIATELY PRECEDING question", not
+    "at any point later in the conversation"; get_order_draft() already
+    covers the longer-lived version of this for the LLM's own prompt."""
+    if field is not None and field not in AWAITING_FIELDS:
+        raise ValueError(f"Unknown awaiting_field: {field!r} (must be one of {AWAITING_FIELDS} or None)")
+    _store.set(session_id, _AWAITING_FIELD_KEY, field)
+
+
+def get_awaiting_field(session_id: str) -> str | None:
+    return _store.get(session_id, _AWAITING_FIELD_KEY)
 
 
 def get_session_store() -> SessionStore:

@@ -14,7 +14,9 @@ from services.memory import (
     get_last_priced_product,
     get_order_draft,
     get_pending_intent,
+    is_awaiting_confirmation,
     remember_context,
+    set_awaiting_confirmation,
     set_last_action_outcome,
     set_last_priced_product,
     set_pending_intent,
@@ -111,6 +113,152 @@ def test_fill_missing_context_leaves_unknown_when_session_has_nothing(monkeypatc
     assert result["material"] == "unknown"
 
 
+def test_fill_missing_context_does_not_carry_product_specific_fields_to_a_different_product(monkeypatch):
+    # Webb, 2026-08-20, check #6: "order Product A in 14k, 6 of them...
+    # actually I'll take Product B". Product B's own missing fields must
+    # NOT get silently completed from Product A's memory -- material and
+    # quantity describe Product A's order specifically, not a fact still
+    # true for a different item.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+    remember_context("session-1", {
+        "product_name": "Product A", "material": "14k", "quantity": 6,
+        "delivery_address": "Accra", "delivery_option": "accra_rider",
+    })
+
+    result = fill_missing_context("session-1", {
+        "product_name": "Product B", "material": "unknown", "quantity": "unknown",
+        "delivery_address": "unknown", "delivery_option": "unknown",
+    })
+
+    assert result["product_name"] == "Product B"
+    assert result["material"] == "unknown"
+    assert result["quantity"] == "unknown"
+
+
+def test_fill_missing_context_still_carries_order_level_delivery_fields_across_a_product_switch(monkeypatch):
+    # Webb, 2026-08-20, check #6 follow-up: unlike karat/quantity,
+    # delivery_address and delivery_option are facts about the customer's
+    # order as a whole, not the specific item -- "deliver to Accra, rider
+    # delivery" doesn't stop being true just because the customer swapped
+    # which ring they want. These must keep resolving from memory even
+    # when the product itself has changed, so the customer isn't asked to
+    # restate an address they already gave earlier in the same
+    # conversation.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+    remember_context("session-1", {
+        "product_name": "Product A", "material": "14k", "quantity": 6,
+        "delivery_address": "Accra", "delivery_option": "accra_rider",
+    })
+
+    result = fill_missing_context("session-1", {
+        "product_name": "Product B", "material": "unknown", "quantity": "unknown",
+        "delivery_address": "unknown", "delivery_option": "unknown",
+    })
+
+    assert result["delivery_address"] == "Accra"
+    assert result["delivery_option"] == "accra_rider"
+
+
+def test_fill_missing_context_does_not_backfill_delivery_option_when_the_address_changes(monkeypatch):
+    # Webb, 2026-08-20, live: a customer moved from an Accra order to a
+    # Kumasi one and later gave a brand-new Accra-area address (Kasoa) --
+    # every reply kept saying "doesn't match our usual rider delivery
+    # within Kumasi zone", because delivery_option ("kumasi_rider") was
+    # being silently carried over from the OLD address instead of
+    # re-derived for the new one. delivery_option is a property of the
+    # address, not an independent fact -- once delivery_address genuinely
+    # changes, delivery_option must come back "unknown" so
+    # order_tool.propose_order()'s own infer_delivery_option() call runs
+    # fresh, rather than being skipped because a stale-but-valid key was
+    # already sitting there.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+    remember_context("session-1", {
+        "product_name": "Ring", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider",
+    })
+
+    result = fill_missing_context("session-1", {
+        "product_name": "Ring", "delivery_address": "Kasoa", "delivery_option": "unknown",
+    })
+
+    assert result["delivery_address"] == "Kasoa"
+    assert result["delivery_option"] == "unknown"
+
+
+def test_fill_missing_context_keeps_an_explicitly_restated_delivery_option_on_an_address_change(monkeypatch):
+    # The guard above must not overreach -- if the customer explicitly
+    # states BOTH a new address and a delivery option in the same
+    # message, that stated option is this call's own answer, not a
+    # leftover, and must be used as-is.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+    remember_context("session-1", {
+        "product_name": "Ring", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider",
+    })
+
+    result = fill_missing_context("session-1", {
+        "product_name": "Ring", "delivery_address": "East Legon", "delivery_option": "accra_rider",
+    })
+
+    assert result["delivery_address"] == "East Legon"
+    assert result["delivery_option"] == "accra_rider"
+
+
+def test_remember_context_clears_delivery_option_when_the_address_changes(monkeypatch):
+    # Write-side counterpart: once the OLD delivery_option is cleared
+    # from the store on a genuine address change, it must not just get
+    # backfilled right back in on the very next turn either.
+    from services import memory
+    store = SessionStore()
+    monkeypatch.setattr(memory, "_store", store)
+    remember_context("session-1", {
+        "product_name": "Ring", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider",
+    })
+
+    remember_context("session-1", {
+        "product_name": "Ring", "delivery_address": "Kasoa", "delivery_option": "unknown",
+    })
+
+    assert store.get("session-1", "delivery_address") == "Kasoa"
+    assert store.get("session-1", "delivery_option") is None
+
+
+def test_fill_missing_context_still_fills_for_the_same_product(monkeypatch):
+    # The guard must not become overzealous -- continuing the SAME
+    # product's order (the overwhelmingly common case) must still work
+    # exactly as before.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+    remember_context("session-1", {
+        "product_name": "Ring", "material": "14k", "quantity": 2, "delivery_address": "Accra",
+    })
+    result = fill_missing_context("session-1", {
+        "product_name": "Ring", "material": "unknown", "quantity": "unknown", "delivery_address": "unknown",
+    })
+
+    assert result["material"] == "14k"
+    assert result["quantity"] == 2
+    assert result["delivery_address"] == "Accra"
+
+
+def test_fill_missing_context_still_fills_when_no_product_is_named_at_all(monkeypatch):
+    # A bare reply ("14k") never restates product_name at all -- the
+    # arguments dict for a call like this has no "product_name" key at
+    # all, so the guard must not mistake that absence for "a different
+    # product" and must still resolve normally, exactly like continuing
+    # the same product.
+    from services import memory
+    store = SessionStore()
+    monkeypatch.setattr(memory, "_store", store)
+    remember_context("session-1", {"product_name": "Ring", "material": "12k", "quantity": 2})
+
+    result = fill_missing_context("session-1", {"material": "unknown"})
+
+    assert result["material"] == "12k"
+
+
 def test_remember_context_only_stores_resolved_values(monkeypatch):
     from services import memory
     store = SessionStore()
@@ -161,6 +309,56 @@ def test_remember_context_does_not_clear_a_remembered_value_when_key_is_absent(m
     remember_context("session-1", {"product_name": "ring", "material": "gold"})
 
     assert store.get("session-1", "delivery_address") == "12 Cantonments Road, Accra"
+
+
+def test_remember_context_clears_old_product_specific_fields_on_a_product_switch(monkeypatch):
+    # Write-side counterpart to the fill_missing_context tests above: once
+    # a call names a genuinely different product, the OLD product's
+    # material/quantity must not keep sitting in the store, or
+    # get_order_draft() (via _describe_order_corrections()) would still
+    # attribute Product A's karat/quantity to Product B once Product B's
+    # own product_name lands. delivery_address/delivery_option are
+    # order-level, not item-level, so they must survive untouched.
+    from services import memory
+    store = SessionStore()
+    monkeypatch.setattr(memory, "_store", store)
+    remember_context("session-1", {
+        "product_name": "Product A", "material": "14k", "quantity": 6,
+        "delivery_address": "Accra", "delivery_option": "accra_rider",
+    })
+
+    remember_context("session-1", {
+        "product_name": "Product B", "material": "unknown", "quantity": "unknown",
+        "delivery_address": "unknown", "delivery_option": "unknown",
+    })
+
+    assert store.get("session-1", "product_name") == "Product B"
+    assert store.get("session-1", "material") is None
+    assert store.get("session-1", "quantity") is None
+    assert store.get("session-1", "delivery_address") == "Accra"
+    assert store.get("session-1", "delivery_option") == "accra_rider"
+
+
+def test_remember_context_keeps_explicitly_restated_fields_on_a_product_switch(monkeypatch):
+    # The clearing above must not become overzealous: "actually I'll take
+    # Product B, still 14k and 6 pieces" explicitly restates material and
+    # quantity in the SAME call that names the new product -- those
+    # values are this call's own arguments, not leftovers from Product A,
+    # and must be stored normally rather than cleared.
+    from services import memory
+    store = SessionStore()
+    monkeypatch.setattr(memory, "_store", store)
+    remember_context("session-1", {
+        "product_name": "Product A", "material": "14k", "quantity": 6,
+    })
+
+    remember_context("session-1", {
+        "product_name": "Product B", "material": "14k", "quantity": 6,
+    })
+
+    assert store.get("session-1", "product_name") == "Product B"
+    assert store.get("session-1", "material") == "14k"
+    assert store.get("session-1", "quantity") == 6
 
 
 def test_delivery_address_round_trips_across_turns(monkeypatch):
@@ -225,6 +423,49 @@ def test_pending_intent_can_be_cleared(monkeypatch):
     set_pending_intent("session-1", None)
 
     assert get_pending_intent("session-1") is None
+
+
+# ---------------------------------------------------------------------
+# session_lock -- per-session turn lock (see router.route_customer())
+# ---------------------------------------------------------------------
+
+def test_session_lock_returns_the_same_lock_object_for_the_same_session():
+    store = SessionStore()
+    assert store.session_lock("session-1") is store.session_lock("session-1")
+
+
+def test_session_lock_returns_different_lock_objects_for_different_sessions():
+    store = SessionStore()
+    assert store.session_lock("session-1") is not store.session_lock("session-2")
+
+
+# ---------------------------------------------------------------------
+# awaiting_confirmation -- P0 fix: a bare "yes" must only confirm the
+# session's pending order when proposing it was the last thing that
+# happened, not whenever a pending order merely exists somewhere.
+# ---------------------------------------------------------------------
+
+def test_is_awaiting_confirmation_defaults_to_false_when_nothing_set():
+    assert is_awaiting_confirmation("session-never-seen") is False
+
+
+def test_awaiting_confirmation_round_trips(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_awaiting_confirmation("session-1", True)
+
+    assert is_awaiting_confirmation("session-1") is True
+
+
+def test_awaiting_confirmation_can_be_cleared(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_awaiting_confirmation("session-1", True)
+    set_awaiting_confirmation("session-1", False)
+
+    assert is_awaiting_confirmation("session-1") is False
 
 
 # ---------------------------------------------------------------------

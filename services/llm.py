@@ -102,7 +102,7 @@ Arguments:
 - quantity
 - delivery_address
 - delivery_option
-Use this when the customer clearly wants to PLACE an order, not just ask a price or a quote, and has given enough detail to price it. If they haven't stated how many they want, set quantity to "unknown" rather than assuming 1. If they haven't given a delivery address yet, set delivery_address to "unknown" -- never invent either one.
+Use this when the customer clearly wants to PLACE an order, not just ask a price or a quote, and has given enough detail to price it. If they haven't stated a karat, set material to "unknown" -- every item this store sells comes in 18k, 14k, and 12k, so there is no default to fall back on; never assume 18k or any other karat just because they didn't say one. If they haven't stated how many they want, set quantity to "unknown" rather than assuming 1. If they haven't given a delivery address yet, set delivery_address to "unknown" -- never invent any of the three.
 `delivery_option` must be one of this store's three real delivery arrangements: "accra_rider" (rider delivery within Accra), "kumasi_rider" (rider delivery within Kumasi), or "international" (shipping outside Ghana) -- but only set it when the customer explicitly states which arrangement they want ("rider delivery", "ship it", "I'm not in Ghana", or similar). Do NOT try to work out the zone from the address yourself -- Ghanaian neighbourhood names (East Legon, Suame, Osu, ...) are exactly the kind of thing you're unreliable at mapping to a city, and guessing wrong here is worse than not guessing. Set delivery_option to "unknown" whenever the customer hasn't explicitly named an arrangement, even if you can see the address -- the system resolves the correct zone from the address on its own, more reliably than you can, and will only fall back to asking the customer directly if it genuinely can't tell either. This store doesn't price delivery automatically -- a human arranges the actual rider/shipping after the order is placed -- so this only needs to capture what the customer explicitly said, not a cost or time. This never actually creates the order; it only prices the product and shows the customer a proposal to confirm.
 
 7. confirm_order
@@ -185,7 +185,7 @@ Rules:
 - If the customer mentions "this", "that one", or similar references, infer the product, material, or category from earlier in THIS message if possible.
 - If a tool needs product_name, material, or category and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
 - If the customer refers to a photo/image they already sent earlier in THIS conversation ("the image I sent", "that photo", "order the one I sent a picture of") to identify which product they mean, do not say you can't view images -- a photo sent earlier in this conversation may already have been matched to a specific catalogue item and remembered. Treat it exactly like naming that product: use whichever tool their request actually needs (get_product_price, propose_order, generate_quote, ...) with product_name "unknown", and let the system's own memory resolve it. Only fall back to converse and explain you can't view images if the customer is sending or describing an image right now, in this message, with no earlier photo anywhere in the conversation to refer back to.
-- If the customer is disagreeing or pushing back on something ("that's wrong", "no, that's not right", "Cape Coast is in Ghana", "that's not what I said") rather than stating a new preference of their own, do not just repeat the same claim or brush past it -- but also do not simply agree with them either, you have no way to see what you said a moment ago or to verify their claim yourself. Re-run the same kind of business tool their pushback relates to (answer_policy_question for a policy dispute, propose_order/get_product_price for a product or delivery dispute, ...) using their current message as the input, and let that tool's real, grounded answer -- not your own agreement or apology -- decide what's actually true. If a customer states a specific replacement value while disputing something ("no, I said 14k"), that's an ordinary correction (see the order-draft correction rule above), not a dispute needing this rule at all.
+- If the customer is disagreeing or pushing back on something ("that's wrong", "no, that's not right", "Cape Coast is in Ghana", "that's not what I said") rather than stating a new preference of their own, do not just repeat the same claim or brush past it -- but also do not simply agree with them either, you have no way to see what you said a moment ago or to verify their claim yourself. Work out what the pushback is actually ABOUT before picking a tool: a dispute about store policy (returns, warranty, sizing, engraving, payment terms) is the only case that means answer_policy_question -- do not send it there just because the message contains a "why" or sounds like a complaint. A dispute about THIS order or THIS product -- a price, a karat, a quantity, an address, a delivery arrangement, or a decision the system itself made while building the order ("I didn't choose the karat so why did you choose 18k for me?", "that's not the address I gave you", "I never said 5") -- means propose_order/get_product_price/generate_quote, whichever this conversation's order or product question actually needs, using their current message as the input. Confirmed live, 2026-08-20: "I didn't choose the karat so why did you choose 18k for me?" was sent to answer_policy_question and came back with an unrelated warranty answer -- that message was disputing an order decision, not asking about policy, and belonged with propose_order instead. Let the matching tool's real, grounded answer -- not your own agreement, apology, or a policy lookup that has nothing to do with what they actually said -- decide what's true. If a customer states a specific replacement value while disputing something ("no, I said 14k"), that's an ordinary correction (see the order-draft correction rule above), not a dispute needing this rule at all.
 
 Multiple requests in one message:
 
@@ -267,12 +267,14 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {last_priced_product_state}
 
+{just_confirmed_order_state}
+
 Customer:
 {message}
 """
 
 
-def _pending_order_state_line(pending_order: dict | None) -> str:
+def _pending_order_state_line(pending_order: dict | None, awaiting_confirmation: bool = False) -> str:
     """Describes whether this session currently has an order awaiting
     confirmation, for the confirm_order guidance above.
 
@@ -286,10 +288,23 @@ def _pending_order_state_line(pending_order: dict | None) -> str:
     those apart and would sometimes guess confirm_order regardless of
     whether anything was actually pending (confirmed live -- see
     services/order_tool.py's confirm_order() decline message, which
-    exists specifically to handle that guess coming back wrong)."""
-    if pending_order:
+    exists specifically to handle that guess coming back wrong).
+
+    awaiting_confirmation narrows this further: a pending order can sit
+    unconfirmed for the rest of the session's 30-minute TTL, and in that
+    time the assistant can go on to offer or ask something completely
+    unrelated ("want to see a few cheaper options?"). A bare "yeah"
+    answering THAT reads exactly like a bare "yeah" confirming the stale
+    order -- this is a commerce-integrity risk (an order gets placed the
+    customer never meant to place), not just a UX rough edge, so it is
+    not left to the model's judgement alone: router.py computes this
+    deterministically (True only when proposing this exact order was the
+    last thing that happened in the session) and hands it over as a
+    fact, not an inference."""
+    if pending_order and awaiting_confirmation:
         return (
-            f"This customer currently has a pending order awaiting confirmation: "
+            f"This customer currently has a pending order awaiting confirmation, proposed just "
+            f"now with nothing else asked or offered since: "
             f"{pending_order['quantity']} x {pending_order['material']} {pending_order['product']}, "
             f"total GH₵{pending_order['total']:,.2f}. If their message clearly confirms this "
             f"(\"yes\", \"confirm\", \"go ahead\", \"yh\", \"ok place it\"), use confirm_order. "
@@ -305,6 +320,19 @@ def _pending_order_state_line(pending_order: dict | None) -> str:
             f"deliver to Accra, rider delivery within Accra) -- the resulting proposal wrongly kept "
             f"the old product and the old Tamale address, because part of the new message's own "
             f"detail was treated as unknown instead of being read from the message actually sent."
+        )
+    if pending_order and not awaiting_confirmation:
+        return (
+            f"This customer has an EARLIER order still sitting unconfirmed: "
+            f"{pending_order['quantity']} x {pending_order['material']} {pending_order['product']}, "
+            f"total GH₵{pending_order['total']:,.2f}. Since it was proposed, you have asked or offered "
+            f"them something else in this conversation, so a bare agreement right now (\"yes\", "
+            f"\"yeah\", \"ok\", \"sure\") most likely answers THAT more recent thing, not this order -- "
+            f"do NOT use confirm_order for a bare agreement alone. Only use confirm_order if the "
+            f"message unambiguously names the order itself (\"yes place the order\", \"confirm my "
+            f"order\", \"go ahead and order it\", \"place it\"). This is a deliberate safeguard: a "
+            f"stale pending order must never get confirmed by a customer agreeing to something "
+            f"unrelated, because that places a real order they never meant to place."
         )
     return (
         "This customer does NOT currently have any pending order awaiting confirmation. "
@@ -356,11 +384,14 @@ def _order_draft_state_line(order_draft: dict | None) -> str:
         f"sense as answering one of the missing pieces, treat it as continuing this order: "
         f"use propose_order, fill in the new piece from their message, and keep every OTHER "
         f"already-known value exactly as given above. "
-        f"A bare number on its own (\"12\", \"18\") almost always means the karat if "
-        f"material is still missing -- e.g. \"12\" -> material \"12k\" -- NOT the quantity, "
-        f"even though quantity is also often given as a bare number; only read a bare number "
-        f"as quantity if material is already known, or if the message clearly states a "
-        f"separate count (\"2 please\", \"I want 3\", \"12k, 2 of them\"). Never use the "
+        f"A bare number on its own, WITH or WITHOUT a trailing \"k\" (\"12\", \"18\", \"12k\", "
+        f"\"18k\") almost always means the karat if material is still missing -- e.g. \"12\" or "
+        f"\"12k\" -> material \"12k\" -- NOT the quantity, and NOT a request to browse other "
+        f"products (do not use recommend_products here just because the reply only contains a "
+        f"karat -- this customer is answering a specific question this conversation already "
+        f"asked, not browsing). Only read a bare number as quantity if material is already known, "
+        f"or if the message clearly states a separate count (\"2 please\", \"I want 3\", "
+        f"\"12k, 2 of them\"). Never use the "
         f"same number from the message to fill two different fields -- if a digit already "
         f"answered the karat, do not also copy that same digit into quantity unless the "
         f"customer separately gave a count; leave quantity as \"unknown\" (never assume 1) "
@@ -477,6 +508,39 @@ def _last_priced_product_state_line(last_priced_product: str | None) -> str:
     )
 
 
+def _just_confirmed_order_state_line(just_confirmed_order: dict | None) -> str:
+    """Describes an order that was confirmed as the LAST thing that
+    happened in this session, nothing since.
+
+    Exists because confirm_order clears the pending-order state and
+    clears the remembered product/material/quantity/address/delivery
+    fields the moment an order is placed (see memory.clear_order_state()
+    -- 2026-08-20 architecture audit, failure #3), but the model still
+    has no way to know an order was JUST successfully placed rather than
+    never having existed at all. Without this, a genuinely unrelated
+    next message risks being read against nothing, or a customer asking
+    "what's my order number?" right after confirming gets treated like a
+    fresh, contextless question instead of an obvious follow-up. Only
+    ever non-empty for the one turn immediately after confirm_order
+    succeeded -- see memory.set_just_confirmed_order()'s docstring for
+    why this doesn't linger."""
+    if not just_confirmed_order:
+        return ""
+    order_id = just_confirmed_order.get("order_id")
+    total = just_confirmed_order.get("total")
+    total_text = f", total GH₵{total:,.2f}" if isinstance(total, (int, float)) else ""
+    return (
+        f"This customer's order (#{order_id}{total_text}) was JUST confirmed and placed -- "
+        f"this is now a completed action, not something still in progress. If their current "
+        f"message asks about this order (its number, status, delivery), answer using this "
+        f"information directly via converse. If their current message describes something new "
+        f"and unrelated -- a different product, a fresh question -- treat it as exactly that: "
+        f"a completely new, independent request. It genuinely has no product/karat/quantity/"
+        f"address to inherit from the order that was just placed, so use \"unknown\" for "
+        f"whatever this new message doesn't itself state, same as any other fresh request."
+    )
+
+
 def _build_prompt(
     message: str,
     pending_order: dict | None,
@@ -484,14 +548,17 @@ def _build_prompt(
     pending_intent: str | None = None,
     last_action_outcome: dict | None = None,
     last_priced_product: str | None = None,
+    awaiting_confirmation: bool = False,
+    just_confirmed_order: dict | None = None,
 ) -> str:
     return _PROMPT_TEMPLATE.format(
         message=message,
-        pending_order_state=_pending_order_state_line(pending_order),
+        pending_order_state=_pending_order_state_line(pending_order, awaiting_confirmation),
         order_draft_state=_order_draft_state_line(order_draft),
         pending_intent_state=_pending_intent_state_line(pending_intent),
         last_action_outcome_state=_last_action_outcome_state_line(last_action_outcome),
         last_priced_product_state=_last_priced_product_state_line(last_priced_product),
+        just_confirmed_order_state=_just_confirmed_order_state_line(just_confirmed_order),
     )
 
 
@@ -502,6 +569,8 @@ def _call_llm(
     pending_intent: str | None = None,
     last_action_outcome: dict | None = None,
     last_priced_product: str | None = None,
+    awaiting_confirmation: bool = False,
+    just_confirmed_order: dict | None = None,
 ) -> str:
     """Call the model with retries on transient failures only.
 
@@ -516,7 +585,8 @@ def _call_llm(
             response = client.responses.create(
                 model=settings.openai_model,
                 input=_build_prompt(
-                    message, pending_order, order_draft, pending_intent, last_action_outcome, last_priced_product
+                    message, pending_order, order_draft, pending_intent, last_action_outcome,
+                    last_priced_product, awaiting_confirmation, just_confirmed_order,
                 ),
                 timeout=settings.llm_timeout_seconds,
             )
@@ -588,15 +658,23 @@ def _validate_multi_request(data: dict) -> dict:
 def understand_customer(
     message: str,
     pending_order: dict | None = None,
+    awaiting_confirmation: bool = False,
     order_draft: dict | None = None,
     pending_intent: str | None = None,
     last_action_outcome: dict | None = None,
     last_priced_product: str | None = None,
+    just_confirmed_order: dict | None = None,
 ) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
     -- see _pending_order_state_line()'s docstring for why this needs to
     be passed in explicitly rather than left for the model to infer.
+
+    awaiting_confirmation is only meaningful when pending_order is set --
+    True only when proposing that exact order was the last thing that
+    happened in this session, False once anything else has been asked or
+    offered since (see memory.set_awaiting_confirmation()). Governs
+    whether a bare "yes"/"yeah" is safe to read as confirming it.
 
     order_draft is the equivalent one step earlier -- an order that's
     been started but not yet fully priced (see memory.get_order_draft()
@@ -615,12 +693,18 @@ def understand_customer(
     get_product_price/generate_quote call resolved to, so a bare
     karat-only follow-up re-quotes that same product instead of falling
     through to a category browse (see memory.get_last_priced_product()
-    and _last_priced_product_state_line())."""
+    and _last_priced_product_state_line()).
+
+    just_confirmed_order is non-None for exactly one turn: the one right
+    after confirm_order succeeded, nothing since (see
+    memory.get_just_confirmed_order() and
+    _just_confirmed_order_state_line())."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
     raw_text = _call_llm(
-        message, pending_order, order_draft, pending_intent, last_action_outcome, last_priced_product
+        message, pending_order, order_draft, pending_intent, last_action_outcome,
+        last_priced_product, awaiting_confirmation, just_confirmed_order,
     )
     logger.info("Raw LLM output: %s", raw_text)
 

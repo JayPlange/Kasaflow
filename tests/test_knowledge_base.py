@@ -13,7 +13,7 @@ regression tests (opt-in, real API) are for.
 import json
 
 from services import knowledge_base as kb_module
-from services.knowledge_base import KnowledgeBase
+from services.knowledge_base import KnowledgeBase, _topic_matches
 
 
 def _fake_embed_texts(calls):
@@ -153,6 +153,61 @@ def test_reload_forces_documents_to_be_re_read_and_re_embedded(monkeypatch, tmp_
     # Assert: the document batch was embedded again after reload()
     document_embed_calls = [c for c in calls if c == ["Our return policy is 30 days."]]
     assert len(document_embed_calls) == 2
+
+
+# ---------------------------------------------------------------------
+# Topic-keyword guard -- 2026-08-20 architecture audit, failure #6.
+# A similarity score above min_score is necessary but not sufficient;
+# the query must also plausibly be about that document's real topic.
+# ---------------------------------------------------------------------
+
+def test_retrieve_blocks_a_high_scoring_but_topically_unrelated_document(monkeypatch, tmp_path):
+    # Reproduces the live mechanism, not just the one specific query:
+    # a query can score above min_score against the wrong document by
+    # embedding coincidence alone. Forcing every text (document AND
+    # query) to the same vector simulates that worst case directly --
+    # similarity is always 1.0, so only the topic-keyword guard can
+    # possibly reject this.
+    documents = [{"id": "warranty_policy", "title": "Warranty", "text": "Our warranty covers defects."}]
+    path = _write_documents(tmp_path, documents)
+    monkeypatch.setattr(kb_module, "embed_texts", lambda texts: [[1.0, 0.0] for _ in texts])
+    kb = KnowledgeBase(path)
+
+    # The actual live query, 2026-08-20: a dispute about an order
+    # decision, not a warranty question, that previously got a warranty
+    # answer back.
+    results = kb.retrieve("I didn't choose the karat so why did you choose 18k for me?")
+
+    assert results == []
+
+
+def test_retrieve_allows_a_high_scoring_topically_relevant_document(monkeypatch, tmp_path):
+    # Same forced-similarity setup as above, but with a query that
+    # genuinely is about warranty -- the guard must not block real
+    # matches, only coincidental ones.
+    documents = [{"id": "warranty_policy", "title": "Warranty", "text": "Our warranty covers defects."}]
+    path = _write_documents(tmp_path, documents)
+    monkeypatch.setattr(kb_module, "embed_texts", lambda texts: [[1.0, 0.0] for _ in texts])
+    kb = KnowledgeBase(path)
+
+    results = kb.retrieve("is this covered under warranty?")
+
+    assert len(results) == 1
+    assert results[0]["id"] == "warranty_policy"
+
+
+def test_topic_matches_true_for_a_keyword_present_in_the_query():
+    assert _topic_matches("warranty_policy", "does this have a warranty?") is True
+
+
+def test_topic_matches_false_for_no_keyword_present():
+    assert _topic_matches("warranty_policy", "why did you choose 18k for me?") is False
+
+
+def test_topic_matches_fails_open_for_a_document_with_no_keyword_entry():
+    # A future policy document added without a matching _TOPIC_KEYWORDS
+    # entry must not become silently unreachable -- fail open, not closed.
+    assert _topic_matches("some_brand_new_policy_doc", "anything at all") is True
 
 
 def test_get_knowledge_base_returns_the_same_module_level_instance():
