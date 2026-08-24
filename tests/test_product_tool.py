@@ -129,6 +129,65 @@ def test_get_product_price_karat_match_is_size_indifferent_since_price_is_unifor
     assert result["material"].startswith("12")
 
 
+def test_get_product_price_returns_karat_breakdown_when_name_matches_and_no_karat_stated(monkeypatch, tmp_path):
+    # Confirmed live, 2026-08-24 (Webb/GPT 50-turn test): "how much is
+    # the Big White Crown Stone Gold Ring, 14g" (no karat stated)
+    # returned "couldn't find that one" even though the product exists
+    # verbatim -- the deterministic karat-match path above only ever
+    # activates once a karat is present. This must find the exact
+    # product and, since more than one real karat exists, name them
+    # rather than silently guessing one or claiming no match at all.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_variant_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # Act
+    result = product_tool.get_product_price("Set Multi Stone Golf Ring, 7g", "unknown")
+
+    # Assert: the same {"product", "karat_options"} shape
+    # list_karat_options() returns, deduped and sorted highest-first --
+    # response_formatter.py already knows how to render this.
+    assert result["product"] == "Set Multi Stone Golf Ring, 7g"
+    assert [o["material"][:2] for o in result["karat_options"]] == ["18", "12"]
+
+
+def test_get_product_price_answers_directly_when_name_matches_and_only_one_karat_exists(monkeypatch, tmp_path):
+    # A product with only one real karat has nothing to ask about --
+    # same "no-variant product" precedent as scenario 3 in this
+    # engagement's own test history, just reached via a karat-less
+    # query instead of an already-resolved one.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # Act: "Other Necklace" only has one row/karat in _necklace_catalogue()
+    result = product_tool.get_product_price("Other Necklace", "unknown")
+
+    # Assert: a normal, single priced product, not a karat_options shape
+    assert result == {"product": "Other Necklace", "material": "18k", "price": 20000.0, "image_url": "https://x/b.jpg"}
+
+
+def test_get_product_price_still_falls_back_to_semantic_search_when_name_matches_nothing_at_all(monkeypatch, tmp_path):
+    # The new karat-less exact-name path above must not swallow the
+    # existing semantic-search fallback for a genuinely mangled/off
+    # product_name -- get_product_karat_options() correctly returns []
+    # for that, and this must fall through unchanged.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    matching = {"product": "Gye Nyame White Necklace", "material": "18k", "price": 51000.0, "score": 0.91}
+    fake_index = type("FakeIndex", (), {"search": lambda self, *a, **k: [matching]})()
+    monkeypatch.setattr(product_tool, "get_product_index", lambda: fake_index)
+
+    # Act
+    result = product_tool.get_product_price("Gye Nyame Necklace", "unknown")
+
+    # Assert: reached semantic search and returned its match, exactly as
+    # before this fix
+    assert result["price"] == 51000.0
+
+
 def test_get_product_price_falls_through_to_semantic_search_when_no_karat_match(monkeypatch, tmp_path):
     # Arrange: a karat is stated, but no product in the file has that
     # exact product name at all -- must not error, must still reach the
@@ -269,6 +328,33 @@ def test_get_product_karat_options_returns_empty_list_when_file_missing(monkeypa
 
     # Act / Assert: fails gracefully, not with an exception
     assert product_tool.get_product_karat_options("Anything") == []
+
+
+# ---------------------------------------------------------------------
+# list_karat_options -- the tool-registry entry point wrapping
+# get_product_karat_options() above into the dict shape execute_tool()/
+# response_formatter.py expect (see that function's docstring).
+# ---------------------------------------------------------------------
+
+def test_list_karat_options_wraps_the_bare_list_in_a_dict_shape(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.list_karat_options("Gye Nyame White Necklace")
+
+    assert result["product"] == "Gye Nyame White Necklace"
+    assert [r["material"] for r in result["karat_options"]] == ["18k", "14k", "12k"]
+
+
+def test_list_karat_options_returns_empty_karat_options_for_no_match(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.list_karat_options("Completely Unknown Product")
+
+    assert result == {"product": "Completely Unknown Product", "karat_options": []}
 
 
 # ---------------------------------------------------------------------

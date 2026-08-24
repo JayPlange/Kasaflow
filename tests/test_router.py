@@ -1053,6 +1053,55 @@ def test_route_customer_does_not_set_last_priced_product_when_lookup_found_nothi
     set_last_priced_product.assert_not_called()
 
 
+def test_route_customer_sets_last_priced_product_on_successful_karat_options_lookup(monkeypatch):
+    # Arrange: get_product_karat_options is the third tool that resolves
+    # a specific product -- a bare karat follow-up right after seeing
+    # the options list ("okay what about 12") needs the same
+    # continuation handling as one right after a price quote.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_karat_options", "arguments": {"product_name": "Ring"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Custom Leaf White Gold Necklace, 20g", "karat_options": [{"material": "18k", "price": 34000.0}]}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("what karat does that come in", "session-karat-options-set")
+
+    # Assert
+    set_last_priced_product.assert_called_once_with("session-karat-options-set", "Custom Leaf White Gold Necklace, 20g")
+
+
+def test_route_customer_does_not_set_last_priced_product_when_karat_options_found_nothing(monkeypatch):
+    # Arrange: an empty karat_options list is the "found nothing" case,
+    # same as an empty recommendations list -- must not overwrite
+    # whatever was priced before.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_karat_options", "arguments": {"product_name": "unicorn pendant"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "unicorn pendant", "karat_options": []}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("what karat does the unicorn pendant come in", "session-karat-options-miss")
+
+    # Assert
+    set_last_priced_product.assert_not_called()
+
+
 def test_route_customer_clears_last_priced_product_on_a_successful_category_browse(monkeypatch):
     # Arrange: recommend_products succeeding means the topic has genuinely
     # moved on from a single priced item to browsing a category

@@ -75,6 +75,38 @@ def get_product_price(product_name: str, material: str):
         ]
         if karat_matches:
             return karat_matches[0]
+    else:
+        # No karat stated or extractable at all (material is "unknown",
+        # or something that isn't a karat, e.g. a stray "white gold" --
+        # see router.py's material-context-override fix, 2026-08-24, for
+        # a live case of the latter). The two deterministic paths above
+        # only ever activate once a karat is present, so a plain,
+        # karat-less "how much is X" for a real catalogue product used to
+        # fall straight through to semantic search below -- seeded with
+        # the literal string "unknown {product_name}" -- instead of ever
+        # checking the exact name on its own. Confirmed live, 2026-08-24
+        # (Webb/GPT 50-turn test): "how much is the Big White Crown Stone
+        # Gold Ring, 14g" (no karat stated) returned "couldn't find that
+        # one", while the exact same product with a karat stated ("...in
+        # 12k") priced correctly in the same session -- the product was
+        # never actually missing from the catalogue, only unreachable by
+        # this specific phrasing.
+        #
+        # Reuses get_product_karat_options() rather than duplicating its
+        # exact-name-match/dedupe logic here. A single real option means
+        # there's nothing to ask -- answer directly, same as any other
+        # exact match. More than one real option means a karat genuinely
+        # has to be chosen: this store's own rule (see llm.py's
+        # propose_order guidance) is never to assume 18k or any other
+        # karat, so this returns the same {"product", "karat_options"}
+        # shape list_karat_options() does -- response_formatter.py
+        # already renders that as "comes in: ..." rather than silently
+        # picking one or claiming the product doesn't exist.
+        options = get_product_karat_options(product_name)
+        if len(options) == 1:
+            return options[0]
+        if options:
+            return {"product": product_name, "karat_options": options}
 
     logger.info(
         "No exact match for product_name=%s material=%s -- falling back to semantic search",
@@ -244,3 +276,21 @@ def get_product_karat_options(product_name: str) -> list[dict]:
 
     deduped.sort(key=_sort_key)
     return deduped
+
+
+def list_karat_options(product_name: str) -> dict:
+    """Tool-registry entry point wrapping get_product_karat_options() above
+    into the {"product": ..., "karat_options": [...]} dict shape every
+    other registered tool returns.
+
+    get_product_karat_options() itself returns a bare list -- correct for
+    its original caller (demo_routes.py's photo-match flow, which builds
+    its own result dict around it), but execute_tool()/response_formatter.
+    py are both written for dict results (see tool_executor.py's own type
+    hint and response_formatter.py's duck-typed "key in result" dispatch,
+    which silently mis-evaluates against a bare list). Wired in here,
+    2026-08-24, as this text-conversation tool's own registered entry
+    point specifically so get_product_price() keeps returning a raw
+    catalogue row unchanged -- nothing about that existing shape moves.
+    """
+    return {"product": product_name, "karat_options": get_product_karat_options(product_name)}

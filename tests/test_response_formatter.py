@@ -321,6 +321,30 @@ def test_formats_recommendations_keeps_karat_wording_when_karat_varies():
     assert "karat" in formatted.lower()
 
 
+def test_formats_karat_options_lists_every_variant_price():
+    # product_tool.list_karat_options()'s shape -- "what karat does that
+    # come in" (llm.py's tool 10), distinct from a single price quote.
+    result = {
+        "product": "Custom Leaf White Gold Necklace, 20g",
+        "karat_options": [
+            {"product": "Custom Leaf White Gold Necklace, 20g", "material": "18k", "price": 34000.0},
+            {"product": "Custom Leaf White Gold Necklace, 20g", "material": "14k", "price": 30000.0},
+            {"product": "Custom Leaf White Gold Necklace, 20g", "material": "12k", "price": 26000.0},
+        ],
+    }
+    formatted = format_for_customer(result)
+    assert "Custom Leaf White Gold Necklace, 20g" in formatted
+    assert "18k: *GH₵34,000.00*" in formatted
+    assert "14k: *GH₵30,000.00*" in formatted
+    assert "12k: *GH₵26,000.00*" in formatted
+    assert "Which karat would you like?" in formatted
+
+
+def test_formats_karat_options_with_no_matches_gives_the_same_no_match_message_as_price():
+    result = {"product": "Nonexistent Ring", "karat_options": []}
+    assert "couldn't find that one" in format_for_customer(result).lower()
+
+
 def test_formats_identified_product_shows_every_karat_price():
     # photo_match_tool.py's confident-match shape -- unlike the
     # recommendations list (which collapses to a price range above 3

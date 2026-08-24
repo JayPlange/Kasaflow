@@ -192,6 +192,24 @@ def test_matches_accra_rider_for_kasoa():
     assert delivery_option_matches_address("accra_rider", "Kasoa")
 
 
+def test_matches_accra_rider_for_ashaiman():
+    # Same gap class as Kasoa above -- a real, populous Greater Accra
+    # town. Webb/GPT 50-turn live test, 2026-08-24.
+    assert delivery_option_matches_address("accra_rider", "Ashaiman")
+
+
+def test_matches_kumasi_rider_for_kejetia():
+    # Kejetia: Kumasi's central market/lorry station, named by a real
+    # live-test customer already on a Kumasi delivery ("no, Kejetia") --
+    # previously fell through to the generic three-way question instead
+    # of confirming Kumasi coverage. Webb/GPT 50-turn live test, 2026-08-24.
+    assert delivery_option_matches_address("kumasi_rider", "Kejetia")
+
+
+def test_matches_kumasi_rider_for_manhyia():
+    assert delivery_option_matches_address("kumasi_rider", "Manhyia")
+
+
 def test_mismatches_kumasi_rider_for_an_accra_neighbourhood():
     # A curated Accra neighbourhood must not also satisfy kumasi_rider
     assert not delivery_option_matches_address("kumasi_rider", "East Legon")
@@ -278,6 +296,24 @@ def test_classify_zone_offline_resolves_kasoa_to_accra():
     # getting the same treatment Tema/Madina already get.
     assert classify_zone_offline("Kasoa") == "accra_rider"
     assert classify_zone_offline("Millennium City, Kasoa") == "accra_rider"
+
+
+def test_classify_zone_offline_resolves_ashaiman_to_accra():
+    # Same gap class as Kasoa above. Webb/GPT 50-turn live test, 2026-08-24.
+    assert classify_zone_offline("Ashaiman") == "accra_rider"
+
+
+def test_classify_zone_offline_resolves_kejetia_to_kumasi():
+    # Confirmed live, 2026-08-24 (Webb/GPT 50-turn test): "no, Kejetia",
+    # sent right after the customer was already on a Kumasi delivery,
+    # previously returned None here and reset to the generic three-way
+    # question instead of confirming Kumasi coverage.
+    assert classify_zone_offline("Kejetia") == "kumasi_rider"
+    assert classify_zone_offline("near Kejetia market") == "kumasi_rider"
+
+
+def test_classify_zone_offline_resolves_manhyia_to_kumasi():
+    assert classify_zone_offline("Manhyia") == "kumasi_rider"
 
 
 def test_classify_zone_offline_resolves_realistic_kasoa_variants():

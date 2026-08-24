@@ -337,6 +337,20 @@ def format_for_customer(result: dict | None) -> str:
             f"I'll help you find the correct piece -- otherwise, want me to get an order started?"
         )
 
+    if "karat_options" in result:
+        # product_tool.list_karat_options()'s shape -- the customer asked
+        # which karats a specific, already-identified product comes in,
+        # not to price one specific karat (see llm.py's tool 10). Empty
+        # list means the product_name didn't match anything real; same
+        # wording as get_product_price's own no-match message, since
+        # that's exactly the same underlying failure from the customer's
+        # point of view.
+        variants = result["karat_options"]
+        if not variants:
+            return "Hmm, I couldn't find that one -- could you tell me a bit more about what you're after?"
+        sub_lines = "\n".join(f"- {v['material']}: *GH₵{v['price']:,.2f}*" for v in variants)
+        return f"The *{result['product']}* comes in:\n{sub_lines}\n\nWhich karat would you like?"
+
     if "recommendations" in result:
         items = result["recommendations"]
         if not items:

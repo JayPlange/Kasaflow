@@ -86,12 +86,27 @@ _ACCRA_NEIGHBOURHOODS = {
     # getting the same neighbourhood-matching treatment Tema/Madina
     # already get. See the 2026-08-20 architecture audit, failure #7.
     "kasoa",
+    # Ashaiman: same gap as Kasoa above, same fix -- a real, populous
+    # Greater Accra industrial town, not a Kasoa-style edge case.
+    # Webb/GPT 50-turn live test, 2026-08-24.
+    "ashaiman",
 }
 
 _KUMASI_NEIGHBOURHOODS = {
     "suame", "adum", "asokwa", "bantama", "ahodwo", "nhyiaeso",
     "asafo", "santasi", "kwadaso", "atonsu", "ayigya", "bomso",
     "asawase", "tafo", "oforikrom", "kotei",
+    # Kejetia: Kumasi's central market and lorry station -- arguably the
+    # single most-referenced landmark in the city, and a real live-test
+    # customer named it right after already being on a Kumasi delivery
+    # ("no, Kejetia"), which reset to the generic three-way question
+    # instead of confirming Kumasi coverage. Same gap as Kasoa/Ashaiman
+    # above. Confirmed live, 2026-08-24 (Webb/GPT 50-turn test).
+    "kejetia",
+    # Manhyia: the Asantehene's palace, similarly landmark-level known
+    # in Kumasi and similarly absent -- added alongside Kejetia rather
+    # than waiting for it to surface as its own separate live miss.
+    "manhyia",
 }
 
 # Full-word/phrase membership only -- see _contains_place()'s docstring

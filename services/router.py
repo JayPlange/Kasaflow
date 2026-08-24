@@ -71,7 +71,12 @@ _PENDING_INTENT_TOOLS = {"get_product_price", "generate_quote"}
 # DID resolve. See memory.set_last_priced_product() and llm.py's
 # _last_priced_product_state_line() for why a bare karat-only follow-up
 # needs this remembered.
-_PRICING_TOOLS = {"get_product_price", "generate_quote"}
+# get_product_karat_options joins this set too: it also resolves to one
+# specific product (see product_tool.list_karat_options()'s "product" key,
+# same shape as the other two), and a bare karat-only follow-up right
+# after seeing the options list ("okay what about 12") needs the same
+# continuation handling as a follow-up right after a price quote.
+_PRICING_TOOLS = {"get_product_price", "generate_quote", "get_product_karat_options"}
 
 # A genuine category browse means the topic has moved on from one
 # specific priced item -- see memory.set_last_priced_product()'s
@@ -113,6 +118,12 @@ def _found_nothing(result: dict | None) -> bool:
     if result is None:
         return True
     if "recommendations" in result and not result["recommendations"]:
+        return True
+    if "karat_options" in result and not result["karat_options"]:
+        # product_tool.list_karat_options()'s empty-list case -- a
+        # product_name that matched nothing in the catalogue, same
+        # "found the shape but not the substance" case as an empty
+        # recommendations list immediately above.
         return True
     if "message" in result and "product" not in result:
         return True

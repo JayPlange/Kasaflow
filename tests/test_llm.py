@@ -491,17 +491,40 @@ def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatc
 
 
 # ---------------------------------------------------------------------
-# converse -- the tenth outcome, for purely conversational messages
-# that need no business tool (see llm.py's tool 10 description). It
+# converse -- the last outcome, for purely conversational messages
+# that need no business tool (see llm.py's tool 11 description). It
 # moved from 8th to 9th when cancel_order was added as tool 8, then from
-# 9th to 10th when get_order_status was added as tool 9.
+# 9th to 10th when get_order_status was added as tool 9, then from 10th
+# to 11th when get_product_karat_options was added as tool 10.
 # ---------------------------------------------------------------------
 
 def test_prompt_includes_converse_tool_guidance():
     prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
-    assert "10. converse" in prompt
+    assert "11. converse" in prompt
     assert "reply" in prompt
     assert "NOT_FOUND" not in prompt  # guardrail language stays out of the prompt itself
+
+
+# ---------------------------------------------------------------------
+# get_product_karat_options -- "what karat does that come in" (a list
+# of options), distinct from get_product_price's "what about in 12k"
+# (a specific karat to price). Wired in 2026-08-24 after Webb's 50-turn
+# live test showed the first phrasing repeating a price instead.
+# ---------------------------------------------------------------------
+
+def test_prompt_includes_get_product_karat_options_tool_guidance():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "10. get_product_karat_options" in prompt
+    assert "product_name" in prompt
+
+
+def test_prompt_distinguishes_karat_options_from_a_specific_karat_price():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "what karat does that come in" in prompt
+    assert "get_product_karat_options" in prompt
+    # the disambiguating example: a bare karat number still prices one
+    # option via get_product_price, it does not ask for the list again
+    assert "okay what about 12" in prompt
 
 
 def test_prompt_tells_the_model_to_use_recommend_products_for_category_photo_requests():
