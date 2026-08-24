@@ -462,6 +462,87 @@ def test_propose_order_does_not_soften_a_genuine_international_address(monkeypat
     assert result["proposal"]["delivery_option_label"] == "shipping outside Ghana"
 
 
+def test_propose_order_overrides_a_stale_restated_address_when_switching_east_legon_to_kumasi(monkeypatch):
+    # Regression test for the live scenario 11 failure (Webb, 2026-08-22,
+    # confirmed via a real KASAFLOW_TURN_TRACE): customer builds a
+    # proposal for East Legon/accra_rider, then says "actually deliver to
+    # Kumasi instead". The LLM correctly updates delivery_option to
+    # "kumasi_rider" but restates the OLD delivery_address ("East Legon")
+    # verbatim rather than "unknown" or the new value -- confirmed NOT a
+    # fill_missing_context() backfill, a genuine LLM extraction gap on the
+    # free-text field. Without the fix, the second proposal showed
+    # "Delivery to East Legon" alongside a label saying it doesn't match
+    # "rider delivery within Kumasi" -- an internally contradictory reply.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 6810, "product": "Custom Leaf White Gold Necklace, 20g", "material": "14k", "price": 30000.0},
+    )
+
+    order_tool.propose_order(
+        "Custom Leaf White Gold Necklace", "14k", "1", "East Legon", "accra_rider", "session-1"
+    )
+    result = order_tool.propose_order(
+        "Custom Leaf White Gold Necklace", "14k", "1", "East Legon", "kumasi_rider", "session-1"
+    )
+
+    proposal = result["proposal"]
+    assert proposal["delivery_address"] == "Kumasi"
+    assert proposal["delivery_option"] == "kumasi_rider"
+    assert proposal["delivery_option_label"] == "rider delivery within Kumasi"
+    assert "East Legon" not in proposal["delivery_option_label"]
+
+
+def test_propose_order_overrides_a_stale_restated_address_when_switching_kumasi_to_east_legon(monkeypatch):
+    # The reverse direction of the fix above -- must not be a one-way patch.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 6810, "product": "Custom Leaf White Gold Necklace, 20g", "material": "14k", "price": 30000.0},
+    )
+
+    order_tool.propose_order(
+        "Custom Leaf White Gold Necklace", "14k", "1", "Kumasi", "kumasi_rider", "session-1"
+    )
+    result = order_tool.propose_order(
+        "Custom Leaf White Gold Necklace", "14k", "1", "Kumasi", "accra_rider", "session-1"
+    )
+
+    proposal = result["proposal"]
+    assert proposal["delivery_address"] == "Accra"
+    assert proposal["delivery_option"] == "accra_rider"
+    assert proposal["delivery_option_label"] == "rider delivery within Accra"
+    assert "Kumasi" not in proposal["delivery_option_label"]
+
+
+def test_propose_order_does_not_override_a_genuinely_new_conflicting_address(monkeypatch):
+    # Guard against over-firing: when the customer states a genuinely
+    # DIFFERENT new address (not identical to the one already on record),
+    # this is a real customer-stated conflict, not a stale restatement --
+    # the existing soft "team to confirm" behaviour must still apply, and
+    # the override must not silently invent an address the customer never
+    # gave. Cape Coast is a real Ghanaian town outside both rider zones
+    # (ghana_other), the related case flagged alongside the East
+    # Legon/Kumasi pair.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 6810, "product": "Custom Leaf White Gold Necklace, 20g", "material": "14k", "price": 30000.0},
+    )
+
+    order_tool.propose_order(
+        "Custom Leaf White Gold Necklace", "14k", "1", "East Legon", "accra_rider", "session-1"
+    )
+    result = order_tool.propose_order(
+        "Custom Leaf White Gold Necklace", "14k", "1", "Cape Coast", "accra_rider", "session-1"
+    )
+
+    proposal = result["proposal"]
+    assert proposal["delivery_address"] == "Cape Coast"
+    assert proposal["delivery_option"] == "accra_rider"
+    assert proposal["delivery_option_label"] == (
+        "a delivery arrangement to be confirmed by our team (this address doesn't "
+        "match our usual rider delivery within Accra zone)"
+    )
+
+
 def test_propose_order_stores_pending_order_in_session(monkeypatch, fresh_session_store):
     # Arrange
     _mock_product_lookup(
@@ -1321,11 +1402,14 @@ def test_confirm_order_does_not_renotify_staff_on_a_duplicate_confirm(monkeypatc
 # than trusting what this session last knew about it.
 # ---------------------------------------------------------------------
 
-def _mock_get_order(monkeypatch, status="on-hold", order_id=6846, status_code=200):
+def _mock_get_order(monkeypatch, status="on-hold", order_id=6846, status_code=200, extra=None):
     fake_response = MagicMock()
     fake_response.status_code = status_code
     fake_response.raise_for_status.return_value = None
-    fake_response.json.return_value = {"id": order_id, "status": status}
+    body = {"id": order_id, "status": status}
+    if extra:
+        body.update(extra)
+    fake_response.json.return_value = body
     fake_get = MagicMock(return_value=fake_response)
     monkeypatch.setattr(order_tool.requests, "get", fake_get)
     return fake_get
@@ -1549,3 +1633,125 @@ def test_cancel_order_does_not_clear_last_confirmed_when_cancelling_a_different_
 
     # Assert
     assert fresh_session_store.get("session-1", order_tool._LAST_CONFIRMED_KEY)["order_id"] == 111
+
+
+def test_get_order_status_succeeds_with_an_explicit_order_id(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    fake_get = _mock_get_order(
+        monkeypatch, status="processing", order_id=6846,
+        extra={"total": "34000.00", "line_items": [{"name": "Custom Leaf White Gold Necklace, 20g", "quantity": 1}]},
+    )
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert: looked up the exact order the customer named, read-only
+    s = result["order_status"]
+    assert s["order_id"] == 6846
+    assert s["status"] == "processing"
+    assert s["status_label"] == "confirmed and being prepared"
+    assert s["item_summary"] == "1 x Custom Leaf White Gold Necklace, 20g"
+    assert s["total"] == "34000.00"
+    assert "/orders/6846" in fake_get.call_args[0][0]
+
+
+def test_get_order_status_falls_back_to_last_confirmed_order_when_no_id_given(monkeypatch, fresh_session_store):
+    # Arrange: the LLM passes "unknown" when the customer didn't state a
+    # number -- see llm.py's get_order_status guidance
+    _woocommerce_settings(monkeypatch)
+    fresh_session_store.set(
+        "session-1", order_tool._LAST_CONFIRMED_KEY,
+        {"order_id": 6846, "total": 1200.0, "delivery_address": "Accra", "delivery_option_label": None},
+    )
+    fake_get = _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="unknown")
+
+    # Assert
+    assert result["order_status"]["order_id"] == 6846
+    assert "/orders/6846" in fake_get.call_args[0][0]
+
+
+def test_get_order_status_asks_for_a_number_when_nothing_is_on_file(monkeypatch, fresh_session_store):
+    # Arrange: no order_id given, and nothing to fall back to either
+    _woocommerce_settings(monkeypatch)
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="unknown")
+
+    # Assert
+    assert "error" in result
+    assert "order number" in result["error"].lower()
+
+
+def test_get_order_status_reports_not_found_for_a_404(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status_code=404)
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="9999")
+
+    # Assert
+    assert "error" in result
+    assert "9999" in result["error"]
+
+
+def test_get_order_status_reports_a_clean_error_when_the_lookup_fails(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    fake_get = MagicMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(order_tool.requests, "get", fake_get)
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert: a clean customer-facing message, not a raw exception
+    assert "error" in result
+    assert "boom" not in result["error"]
+
+
+def test_get_order_status_never_writes_anything(monkeypatch, fresh_session_store):
+    # Arrange: read-only, unlike cancel_order -- no PUT should ever happen
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846)
+    fake_put = _mock_put(monkeypatch)
+
+    # Act
+    order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert
+    fake_put.assert_not_called()
+
+
+def test_get_order_status_falls_back_to_raw_status_for_an_unrecognised_status(monkeypatch, fresh_session_store):
+    # Arrange: a custom WooCommerce status this store's map doesn't know
+    # about -- must surface it, not hide it
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="wc-custom-status", order_id=6846)
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert
+    assert result["order_status"]["status_label"] == "wc-custom-status"
+
+
+def test_get_order_status_summarises_multiple_line_items(monkeypatch, fresh_session_store):
+    # Arrange
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(
+        monkeypatch, status="completed", order_id=6846,
+        extra={"line_items": [
+            {"name": "Custom Leaf White Gold Necklace, 20g", "quantity": 1},
+            {"name": "Big White Crown Stone Gold Ring, 14g", "quantity": 2},
+        ]},
+    )
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert
+    assert result["order_status"]["item_summary"] == "1 x Custom Leaf White Gold Necklace, 20g (+1 more item)"

@@ -1,3 +1,5 @@
+import pytest
+
 from services.delivery_tool import (
     DELIVERY_OPTIONS,
     classify_zone_offline,
@@ -21,6 +23,90 @@ def test_get_delivery_information_lists_the_real_options():
     assert result == {"delivery_options": DELIVERY_OPTIONS}
     keys = {option["key"] for option in result["delivery_options"]}
     assert keys == {"accra_rider", "kumasi_rider", "international"}
+
+
+def test_get_delivery_information_with_no_address_is_unchanged():
+    # Backwards-compat: the default argument must not change the bare,
+    # no-address behaviour for existing callers (quote_service.py's
+    # internal call, and a genuine "how does delivery work" question).
+    assert get_delivery_information("unknown") == {"delivery_options": DELIVERY_OPTIONS}
+    assert get_delivery_information("") == {"delivery_options": DELIVERY_OPTIONS}
+    assert get_delivery_information(None) == {"delivery_options": DELIVERY_OPTIONS}
+
+
+def test_get_delivery_information_with_an_accra_address(monkeypatch):
+    # Confirmed live, 2026-08-22: a named place ("what of Bolgatanga")
+    # got the exact same generic three-way list as a bare "how does
+    # delivery work" -- this exercises the fix, using the offline
+    # classifier (no Google Maps key configured, same as CI).
+    from dataclasses import replace
+    from services import geocoding_tool
+    monkeypatch.setattr(geocoding_tool, "settings", replace(geocoding_tool.settings, google_maps_api_key=None))
+
+    result = get_delivery_information("East Legon")
+
+    assert result["matched_zone"] == "accra_rider"
+    assert result["queried_address"] == "East Legon"
+    assert result["delivery_options"] == DELIVERY_OPTIONS
+
+
+def test_get_delivery_information_with_a_kumasi_address(monkeypatch):
+    from dataclasses import replace
+    from services import geocoding_tool
+    monkeypatch.setattr(geocoding_tool, "settings", replace(geocoding_tool.settings, google_maps_api_key=None))
+
+    result = get_delivery_information("Kumasi")
+
+    assert result["matched_zone"] == "kumasi_rider"
+
+
+@pytest.mark.parametrize("address", ["Bolgatanga", "Cape Coast", "Tamale"])
+def test_get_delivery_information_with_a_ghana_other_address(monkeypatch, address):
+    # The exact live case (Bolgatanga) plus two more real Ghanaian
+    # places that are neither an Accra nor Kumasi rider zone, and NOT
+    # "international" either -- must classify as ghana_other, never
+    # guess a wrong zone (Webb/GPT review's explicit test list, 2026-08-22).
+    from dataclasses import replace
+    from services import geocoding_tool
+    monkeypatch.setattr(geocoding_tool, "settings", replace(geocoding_tool.settings, google_maps_api_key=None))
+
+    result = get_delivery_information(address)
+
+    assert result["matched_zone"] == "ghana_other"
+    assert result["queried_address"] == address
+
+
+def test_get_delivery_information_international_is_not_reachable_without_geocoding(monkeypatch):
+    # Honest limitation, not a bug: infer_delivery_option()'s offline
+    # fallback (geocoding_tool.py) deliberately never asserts
+    # "international" -- there's no positive offline signal for
+    # "genuinely outside Ghana", only Google Geocoding's country-code
+    # check can confirm that. So "London" today, without
+    # GOOGLE_MAPS_API_KEY configured, falls to None (the generic,
+    # ask/list fallback), NOT a confident "we ship internationally"
+    # answer. Recorded here explicitly so this doesn't get "fixed" into
+    # a wrong guess later, and so a live test of the London case is
+    # read correctly against whichever path is actually configured
+    # when it runs (Webb/GPT review, 2026-08-22, asked for London to be
+    # tested as part of the four-outcome sweep).
+    from dataclasses import replace
+    from services import geocoding_tool
+    monkeypatch.setattr(geocoding_tool, "settings", replace(geocoding_tool.settings, google_maps_api_key=None))
+
+    result = get_delivery_information("London")
+
+    assert result["matched_zone"] is None
+
+
+def test_get_delivery_information_with_an_unclassifiable_address(monkeypatch):
+    # No real signal either way -- must not guess a zone.
+    from dataclasses import replace
+    from services import geocoding_tool
+    monkeypatch.setattr(geocoding_tool, "settings", replace(geocoding_tool.settings, google_maps_api_key=None))
+
+    result = get_delivery_information("456 Workshop Lane, Lagos")
+
+    assert result["matched_zone"] is None
 
 
 def test_is_valid_delivery_option_accepts_real_keys():

@@ -114,10 +114,51 @@ def _contains_place(text_lower: str, places) -> bool:
     return any(re.search(rf"\b{re.escape(place)}\b", text_lower) for place in places)
 
 
-def get_delivery_information() -> dict:
+def get_delivery_information(address: str = "unknown") -> dict:
     """Lists the real delivery options rather than quoting a price/time
-    -- see module docstring for why."""
-    return {"delivery_options": DELIVERY_OPTIONS}
+    -- see module docstring for why.
+
+    `address` is optional, for a customer who names a specific place
+    while asking about delivery ("what of Bolgatanga, I'm in the
+    northern region") rather than asking generically ("how does
+    delivery work"). Confirmed live, 2026-08-22: a named-place question
+    like that got the exact same generic three-way list as a bare
+    "how does delivery work", with the actual place name silently
+    ignored -- this tool had no way to say anything about a specific
+    location at all, only ever recite the fixed menu.
+
+    When a real address is given, resolves it the same way
+    order_tool.propose_order() already resolves a delivery address
+    (geocoding_tool.infer_delivery_option(), geocoding-backed when
+    configured, the offline curated-list classifier otherwise) and
+    returns the match as `matched_zone` alongside the same
+    `delivery_options` list, so response_formatter.py can give a
+    location-aware answer instead of the generic one. `matched_zone` is
+    one of "accra_rider"/"kumasi_rider"/"international" (confident
+    enough to confirm outright), "ghana_other" (a real Ghanaian place,
+    just not a rider zone -- team confirms, same as propose_order's own
+    handling of this case), or None (genuinely unclear, same "don't
+    guess" fallback everywhere else in this file). Omitted entirely
+    (falls back to the plain shape below) when no real address was
+    given -- the bare "how does delivery work" case is unchanged.
+
+    The import below is local, not at module level, because
+    geocoding_tool.py already imports classify_zone_offline from THIS
+    module (its own offline fallback) -- importing infer_delivery_option
+    back at module level here would be a circular import. Safe as a
+    local import: it only needs resolving once this function actually
+    runs, by which point both modules are already fully loaded."""
+    address_stripped = (address or "").strip()
+    if not address_stripped or address_stripped.lower() == "unknown":
+        return {"delivery_options": DELIVERY_OPTIONS}
+
+    from services.geocoding_tool import infer_delivery_option
+
+    return {
+        "delivery_options": DELIVERY_OPTIONS,
+        "matched_zone": infer_delivery_option(address_stripped),
+        "queried_address": address_stripped,
+    }
 
 
 def is_valid_delivery_option(key: str | None) -> bool:

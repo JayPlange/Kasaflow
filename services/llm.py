@@ -73,8 +73,8 @@ Use this when the customer names ONE specific product -- whether they're asking 
 
 2. get_delivery_information
 Arguments:
-- none
-Use this when the customer asks generically about delivery/shipping ("how does delivery work", "do you ship abroad") without asking about a specific product's price. This store doesn't have a fixed delivery price or time -- it lists the real delivery arrangements (rider delivery within Accra, rider delivery within Kumasi, or shipping outside Ghana) for the customer to choose from, not a cost.
+- address
+Use this when the customer asks generically about delivery/shipping ("how does delivery work", "do you ship abroad") without asking about a specific product's price. This store doesn't have a fixed delivery price or time -- it lists the real delivery arrangements (rider delivery within Accra, rider delivery within Kumasi, or shipping outside Ghana) for the customer to choose from, not a cost. If the customer names a specific place while asking ("what of Bolgatanga", "do you deliver to Cape Coast", "I'm in Kumasi, is that covered"), pass that place as `address` so the system can check it against the real delivery zones rather than just repeating the generic three-way list -- set `address` to "unknown" only when they're asking generically with no place named.
 
 3. generate_quote
 Arguments:
@@ -103,7 +103,7 @@ Arguments:
 - delivery_address
 - delivery_option
 Use this when the customer clearly wants to PLACE an order, not just ask a price or a quote, and has given enough detail to price it. If they haven't stated a karat, set material to "unknown" -- every item this store sells comes in 18k, 14k, and 12k, so there is no default to fall back on; never assume 18k or any other karat just because they didn't say one. If they haven't stated how many they want, set quantity to "unknown" rather than assuming 1. If they haven't given a delivery address yet, set delivery_address to "unknown" -- never invent any of the three.
-`delivery_option` must be one of this store's three real delivery arrangements: "accra_rider" (rider delivery within Accra), "kumasi_rider" (rider delivery within Kumasi), or "international" (shipping outside Ghana) -- but only set it when the customer explicitly states which arrangement they want ("rider delivery", "ship it", "I'm not in Ghana", or similar). Do NOT try to work out the zone from the address yourself -- Ghanaian neighbourhood names (East Legon, Suame, Osu, ...) are exactly the kind of thing you're unreliable at mapping to a city, and guessing wrong here is worse than not guessing. Set delivery_option to "unknown" whenever the customer hasn't explicitly named an arrangement, even if you can see the address -- the system resolves the correct zone from the address on its own, more reliably than you can, and will only fall back to asking the customer directly if it genuinely can't tell either. This store doesn't price delivery automatically -- a human arranges the actual rider/shipping after the order is placed -- so this only needs to capture what the customer explicitly said, not a cost or time. This never actually creates the order; it only prices the product and shows the customer a proposal to confirm.
+`delivery_option` must be one of this store's three real delivery arrangements: "accra_rider" (rider delivery within Accra), "kumasi_rider" (rider delivery within Kumasi), or "international" (shipping outside Ghana) -- but only set it when the customer explicitly states which arrangement they want ("rider delivery", "ship it", "I'm not in Ghana", or similar). Do NOT try to work out the zone from the address yourself -- Ghanaian neighbourhood names (East Legon, Suame, Osu, ...) are exactly the kind of thing you're unreliable at mapping to a city, and guessing wrong here is worse than not guessing. Those three names are illustrations only, existing purely to show what a Ghanaian neighbourhood name looks like -- never treat them as a hint about what THIS customer's actual address is, and never let one of them leak into delivery_address unless the customer's own message actually contains it. If this message doesn't state a delivery_address of its own, the correct value is "unknown", not one of the examples above. Set delivery_option to "unknown" whenever the customer hasn't explicitly named an arrangement, even if you can see the address -- the system resolves the correct zone from the address on its own, more reliably than you can, and will only fall back to asking the customer directly if it genuinely can't tell either. This store doesn't price delivery automatically -- a human arranges the actual rider/shipping after the order is placed -- so this only needs to capture what the customer explicitly said, not a cost or time. This never actually creates the order; it only prices the product and shows the customer a proposal to confirm.
 
 7. confirm_order
 Arguments:
@@ -115,7 +115,12 @@ Arguments:
 - order_id
 Use this when the customer wants to cancel an order they already placed -- "cancel my order", "cancel order 6846", "I don't want it anymore". If they stated an order number, pass it as `order_id`. If they didn't (e.g. "cancel my order" with no number), set `order_id` to "unknown" -- the system will look up their most recent confirmed order for you; never invent a number. This is only for cancelling an order that was already confirmed -- if nothing has been confirmed yet in this conversation, a "cancel" style message more likely means they want to stop what they were doing, not this tool; use converse for that instead.
 
-9. converse
+9. get_order_status
+Arguments:
+- order_id
+Use this when the customer wants to know the state of an order they already placed -- "where is my order", "what's the status of order 6846", "has my order shipped yet", "did my order go through". Same order_id rule as cancel_order immediately above: if they stated a number, pass it; if they didn't, set `order_id` to "unknown" and the system will look up their most recent confirmed order for you; never invent a number. Read-only -- it never changes anything about the order, it only reports what WooCommerce currently says. This is only for an order that was already confirmed -- if nothing has been confirmed yet in this conversation, they're more likely asking about a proposal that hasn't been placed yet; use propose_order/converse for that instead, not this tool.
+
+10. converse
 Arguments:
 - reply
 Use this for messages that are purely conversational and need no business tool at all: greetings ("hey", "hi", "good morning"), farewells, thanks ("medaase"), casual acknowledgements ("okay", "nice", "haha"), reactions and emojis, light humour, and simple social questions ("how are you?"). This is the ONLY tool where you write the actual customer-facing reply yourself, as the `reply` argument -- there is no deterministic tool behind it, because there is no business fact to look up. Keep it natural, warm, and concise -- a short, casual sentence or two, not a list of everything you can do. Match the customer's language (English, Twi, or a natural mix of both). Never mention tools, JSON, databases, or system/error states in the reply.
@@ -170,6 +175,28 @@ Customer: "cancel my order" (no number given)
 Customer: "please cancel order 6846"
 {{"tool": "cancel_order", "arguments": {{"order_id": "6846"}}}}
 
+Customer: "where is my order"
+{{"tool": "get_order_status", "arguments": {{"order_id": "unknown"}}}}
+
+Customer: "what's the status of order 6846"
+{{"tool": "get_order_status", "arguments": {{"order_id": "6846"}}}}
+
+Customer: "I already told you Kumasi, why do you keep asking" (delivery_address in this order is already "Kumasi" -- nothing about it is actually wrong)
+{{"tool": "propose_order", "arguments": {{"product_name": "...", "material": "...", "quantity": "...", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider"}}, "customer_tone": "pushback"}}
+-> Pushback: a complaint, with no new value in it at all. Tag customer_tone.
+
+Customer: "no, I said 14k" (material was "18k")
+{{"tool": "propose_order", "arguments": {{"product_name": "...", "material": "14k", "quantity": "...", "delivery_address": "...", "delivery_option": "..."}}, "customer_tone": "pushback"}}
+-> ALSO pushback, even though this one also states a new value -- the two are not mutually exclusive. "No, I said X" carries the same complaint ("you already had this wrong") as the Kumasi example, it just happens to restate the value alongside it. Tag customer_tone here too; propose_order still gets the corrected material either way.
+
+Customer: "actually make it 14k" (material was "18k")
+{{"tool": "propose_order", "arguments": {{"product_name": "...", "material": "14k", "quantity": "...", "delivery_address": "...", "delivery_option": "..."}}}}
+-> NOT pushback -- an ordinary correction with no complaint in it. "Actually" signals a change of mind, not a dispute about something the system got wrong. No customer_tone field.
+
+Customer: "still 14k and 6 pieces" (material and quantity already "14k"/6 -- reaffirming, not disputing)
+{{"tool": "propose_order", "arguments": {{"product_name": "...", "material": "14k", "quantity": 6, "delivery_address": "...", "delivery_option": "..."}}}}
+-> NOT pushback -- nothing is being disputed or complained about. No customer_tone field.
+
 Rules:
 
 - If the customer asks only for a price, use get_product_price.
@@ -181,11 +208,13 @@ Rules:
 - If the customer wants to actually place an order and has given enough detail, use propose_order.
 - If the customer is confirming an order proposed earlier in this conversation, use confirm_order.
 - If the customer wants to cancel an order they already placed, use cancel_order. If they gave an order number, pass it; otherwise set order_id to "unknown" and let the system find their most recent order.
+- If the customer wants to know an order's status ("where is my order", "has it shipped", "is my order confirmed"), use get_order_status. Same order_id rule as cancel_order: pass it if given, otherwise "unknown".
 - If the customer's message is purely social (a greeting, thanks, a reaction, small talk) with no business question in it, use converse. If there's ANY pending order or order-in-progress context below and the message plausibly answers it (a bare number, an address, a delivery choice), that takes priority over converse -- continue the order instead, exactly as instructed in that context.
 - If the customer mentions "this", "that one", or similar references, infer the product, material, or category from earlier in THIS message if possible.
 - If a tool needs product_name, material, or category and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
 - If the customer refers to a photo/image they already sent earlier in THIS conversation ("the image I sent", "that photo", "order the one I sent a picture of") to identify which product they mean, do not say you can't view images -- a photo sent earlier in this conversation may already have been matched to a specific catalogue item and remembered. Treat it exactly like naming that product: use whichever tool their request actually needs (get_product_price, propose_order, generate_quote, ...) with product_name "unknown", and let the system's own memory resolve it. Only fall back to converse and explain you can't view images if the customer is sending or describing an image right now, in this message, with no earlier photo anywhere in the conversation to refer back to.
-- If the customer is disagreeing or pushing back on something ("that's wrong", "no, that's not right", "Cape Coast is in Ghana", "that's not what I said") rather than stating a new preference of their own, do not just repeat the same claim or brush past it -- but also do not simply agree with them either, you have no way to see what you said a moment ago or to verify their claim yourself. Work out what the pushback is actually ABOUT before picking a tool: a dispute about store policy (returns, warranty, sizing, engraving, payment terms) is the only case that means answer_policy_question -- do not send it there just because the message contains a "why" or sounds like a complaint. A dispute about THIS order or THIS product -- a price, a karat, a quantity, an address, a delivery arrangement, or a decision the system itself made while building the order ("I didn't choose the karat so why did you choose 18k for me?", "that's not the address I gave you", "I never said 5") -- means propose_order/get_product_price/generate_quote, whichever this conversation's order or product question actually needs, using their current message as the input. Confirmed live, 2026-08-20: "I didn't choose the karat so why did you choose 18k for me?" was sent to answer_policy_question and came back with an unrelated warranty answer -- that message was disputing an order decision, not asking about policy, and belonged with propose_order instead. Let the matching tool's real, grounded answer -- not your own agreement, apology, or a policy lookup that has nothing to do with what they actually said -- decide what's true. If a customer states a specific replacement value while disputing something ("no, I said 14k"), that's an ordinary correction (see the order-draft correction rule above), not a dispute needing this rule at all.
+- If the customer is disagreeing or pushing back on something ("that's wrong", "no, that's not right", "Cape Coast is in Ghana", "that's not what I said") rather than stating a new preference of their own, do not just repeat the same claim or brush past it -- but also do not simply agree with them either, you have no way to see what you said a moment ago or to verify their claim yourself. Work out what the pushback is actually ABOUT before picking a tool: a dispute about store policy (returns, warranty, sizing, engraving, payment terms) is the only case that means answer_policy_question -- do not send it there just because the message contains a "why" or sounds like a complaint. A dispute about THIS order or THIS product -- a price, a karat, a quantity, an address, a delivery arrangement, or a decision the system itself made while building the order ("I didn't choose the karat so why did you choose 18k for me?", "that's not the address I gave you", "I never said 5") -- means propose_order/get_product_price/generate_quote, whichever this conversation's order or product question actually needs, using their current message as the input. Confirmed live, 2026-08-20: "I didn't choose the karat so why did you choose 18k for me?" was sent to answer_policy_question and came back with an unrelated warranty answer -- that message was disputing an order decision, not asking about policy, and belonged with propose_order instead. Let the matching tool's real, grounded answer -- not your own agreement, apology, or a policy lookup that has nothing to do with what they actually said -- decide what's true. If a customer states a specific replacement value while disputing something ("no, I said 14k"), that's an ordinary correction as far as which TOOL to call and what arguments to pass (see the order-draft correction rule above) -- this rule doesn't change that part. It can still be worth tagging as pushback for tone purposes, though; see the customer_tone instruction below, which is a separate question from tool selection.
+- When you route a message because of the pushback rule immediately above -- the customer is disputing a decision or a past statement, with some real complaint or frustration in how they said it -- also include a top-level "customer_tone": "pushback" field in your JSON response, alongside "tool" and "arguments", not inside "arguments". This exists only so the system can acknowledge that complaint warmly, whatever the tool call itself ends up doing. Pushback and an ordinary correction are NOT mutually exclusive: "no, I said 14k" is both a complaint (you already had this wrong) AND a new value (14k) in the same breath -- tag customer_tone here, the same as a pure complaint with no value in it at all ("I already told you Kumasi, why do you keep asking"). What actually distinguishes pushback from an ordinary correction is tone, not whether a value is present: "actually make it 14k" or "sorry, 14k rather" carry no complaint, just a change of mind -- do NOT tag those, or a neutral reaffirmation of something already true ("still 14k and 6 pieces"), or routine questions, browsing, or small talk. The only valid value is the literal string "pushback" -- never a price, address, order detail, or anything else, and never guess at one when you're not sure real frustration is present; when in doubt, omit the field.
 
 Multiple requests in one message:
 
@@ -319,7 +348,20 @@ def _pending_order_state_line(pending_order: dict | None, awaiting_confirmation:
             f"Tamale order still pending then gave a complete new order (different product, 14k, "
             f"deliver to Accra, rider delivery within Accra) -- the resulting proposal wrongly kept "
             f"the old product and the old Tamale address, because part of the new message's own "
-            f"detail was treated as unknown instead of being read from the message actually sent."
+            f"detail was treated as unknown instead of being read from the message actually sent. "
+            f"The reverse mistake is just as real and must be avoided just as strictly: for any "
+            f"field this message does NOT explicitly state, the correct value is \"unknown\", full "
+            f"stop -- never invent or infer a value for it, even one that seems like a reasonable "
+            f"guess. \"Treat it as a completely fresh request\" above means fresh in the sense of "
+            f"not being pre-filled from the old proposal, not an instruction to reproduce the old "
+            f"proposal's other fields from memory or from a plausible-sounding guess. Example: a "
+            f"pending order awaiting confirmation, then \"actually deliver to Kumasi instead\" -- "
+            f"correctly update delivery_option to \"kumasi_rider\", and set delivery_address to "
+            f"\"unknown\" (this message names a delivery arrangement, not a place), never a "
+            f"remembered or guessed address of your own. The system resolves delivery_address from "
+            f"session memory correctly on its own once you return \"unknown\" -- guessing at a "
+            f"value that happens to look plausible is exactly what produces a proposal that "
+            f"contradicts itself."
         )
     if pending_order and not awaiting_confirmation:
         return (
@@ -396,7 +438,15 @@ def _order_draft_state_line(order_draft: dict | None) -> str:
         f"answered the karat, do not also copy that same digit into quantity unless the "
         f"customer separately gave a count; leave quantity as \"unknown\" (never assume 1) "
         f"if they didn't. A bare address, or \"Accra\"/\"Kumasi\"/\"ship it\"/\"outside "
-        f"Ghana\", answers delivery option. "
+        f"Ghana\", answers delivery option. This still applies when the message is longer "
+        f"and pushes back or complains, as long as it also names or confirms a place or "
+        f"zone -- \"nima is obviously in Accra\" or \"it's in Accra, why would you ask\" "
+        f"still answers delivery option (call propose_order with delivery_address \"Accra\" "
+        f"or the place actually named), it is not a generic delivery question for "
+        f"get_delivery_information. Confirmed live, 2026-08-24: a message exactly this shape "
+        f"was sent to get_delivery_information instead, which broke out of the order and "
+        f"needed an extra turn to get back to the proposal that was already one field away "
+        f"from complete. "
         f"Exception: if their current message clearly states a different value for one of "
         f"the already-known fields instead -- a correction, e.g. \"sorry, Kumasi not Accra\", "
         f"\"wait, 14k rather\", \"actually make that 5\", \"I'll take the white gold instead\", "

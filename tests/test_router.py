@@ -700,6 +700,31 @@ def test_route_customer_keeps_cancel_order_session_state_isolated(monkeypatch):
     assert captured_calls[1]["session_id"] == "session-B"
 
 
+def test_route_customer_injects_session_id_for_get_order_status(monkeypatch):
+    # Arrange: get_order_status needs to know which session's last
+    # confirmed order to fall back to when the customer doesn't state a
+    # number -- see router.py's _SESSION_AWARE_TOOLS and
+    # order_tool.get_order_status(), identical reasoning to cancel_order
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_order_status", "arguments": {"order_id": "unknown"}}),
+    )
+    captured_calls = []
+
+    def fake_execute_tool(tool_name, **kwargs):
+        captured_calls.append(kwargs)
+        return {"order_status": {"order_id": 6846, "status": "on-hold", "status_label": "received, awaiting payment confirmation", "item_summary": None, "total": None}}
+
+    monkeypatch.setattr(router, "execute_tool", fake_execute_tool)
+
+    # Act
+    router.route_customer("where is my order", "session-status-1")
+
+    # Assert
+    assert captured_calls[0]["session_id"] == "session-status-1"
+
+
 # ---------------------------------------------------------------------
 # converse -- purely conversational messages that need no business tool
 # (see llm.py's tool 9 description and router.py's _CONVERSATION_TOOL)
@@ -1538,6 +1563,64 @@ def test_try_resolve_awaiting_field_resolves_a_bare_address(reply):
     assert result["arguments"]["material"] == "unknown"
 
 
+@pytest.mark.parametrize("reply, expected_address, expected_option", [
+    ("East Legon, accra_rider", "East Legon", "accra_rider"),
+    ("accra_rider, East Legon", "East Legon", "accra_rider"),
+    ("deliver to Kumasi, kumasi_rider", "Kumasi", "kumasi_rider"),
+    ("international, 221B Baker Street", "221B Baker Street", "international"),
+])
+def test_try_resolve_awaiting_field_splits_a_trailing_delivery_option_from_the_address(
+    reply, expected_address, expected_option,
+):
+    # Caught live, 2026-08-24 (Webb): answering "What address should this
+    # be delivered to?" with "East Legon, accra_rider" stored the WHOLE
+    # string verbatim as delivery_address (nothing here does semantic
+    # splitting) -- "Delivery to East Legon, accra_rider" in the
+    # customer-facing proposal, with delivery_option left "unknown" for
+    # propose_order to separately re-infer from the address text. Must
+    # recognise the literal option key wherever it appears in the reply,
+    # strip it out of the address, and return it as delivery_option
+    # directly instead.
+    result = router._try_resolve_awaiting_field("delivery_address", reply)
+    assert result["arguments"]["delivery_address"] == expected_address
+    assert result["arguments"]["delivery_option"] == expected_option
+
+
+def test_try_resolve_awaiting_field_falls_through_when_the_reply_is_just_an_option_token():
+    # "accra_rider" on its own has no place name left after the option
+    # token is stripped out -- fall through to the LLM rather than store
+    # an empty address.
+    assert router._try_resolve_awaiting_field("delivery_address", "accra_rider") is None
+
+
+@pytest.mark.parametrize("reply, expected_address", [
+    ("deliver to East Legon", "East Legon"),
+    ("Delivery to Kumasi", "Kumasi"),
+    ("send it to Kasoa", "Kasoa"),
+    ("ship to 12 Cantonments Road, Accra", "12 Cantonments Road, Accra"),
+    ("please deliver to Tema", "Tema"),
+])
+def test_try_resolve_awaiting_field_strips_a_delivery_preamble_from_a_bare_address(reply, expected_address):
+    # Caught live, 2026-08-24 (Webb): "deliver to East Legon" answering
+    # "What address should this be delivered to?" was stored verbatim,
+    # including the "deliver to" the customer echoed from the question
+    # itself -- producing "Delivery to deliver to East Legon" in the
+    # customer-facing proposal once propose_order's own "Delivery to "
+    # prefix was added on top. The LLM path already strips this correctly
+    # (semantic extraction is its job); this deterministic bypass does no
+    # extraction at all, so it needs its own, narrow preamble strip.
+    result = router._try_resolve_awaiting_field("delivery_address", reply)
+    assert result["arguments"]["delivery_address"] == expected_address
+
+
+def test_try_resolve_awaiting_field_falls_through_when_the_whole_reply_is_just_the_preamble():
+    # "deliver to" on its own has no place name left after stripping the
+    # preamble -- storing "" as a "valid" address would be worse than
+    # falling through to the LLM, which can at least ask a clarifying
+    # question with full order_draft context.
+    assert router._try_resolve_awaiting_field("delivery_address", "deliver to") is None
+
+
 @pytest.mark.parametrize("reply", ["confirm", "Confirm!", "yes", "ok", "go ahead", "place it"])
 def test_try_resolve_awaiting_field_does_not_treat_a_bare_agreement_word_as_an_address(reply):
     # Caught live, 2026-08-21 (Webb's own first trace run): a stray
@@ -1582,6 +1665,122 @@ def test_try_resolve_awaiting_field_does_not_guess_at_a_non_address_reply(reply)
     # pushback. All must fall through to the LLM's own order_draft-aware
     # handling rather than being stored as a literal delivery address.
     assert router._try_resolve_awaiting_field("delivery_address", reply) is None
+
+
+@pytest.mark.parametrize("reply", ["Accra", "Kumasi", "Nima, Accra"])
+def test_try_resolve_awaiting_field_resolves_a_bare_reply_when_delivery_option_is_awaited(reply):
+    # Task #168, Webb live 2026-08-24: propose_order's ambiguous-delivery-
+    # option fallback ("Would you like rider delivery within Accra...")
+    # previously never tagged awaiting_field at all, unlike material/
+    # quantity/delivery_address -- so a simple reply restating the place
+    # had no deterministic bypass to catch it. Shares the delivery_address
+    # branch's extraction on purpose (see that branch's own comment):
+    # propose_order() re-derives whichever of address/option is missing
+    # from the other regardless of which one this bypass fills in.
+    result = router._try_resolve_awaiting_field("delivery_option", reply)
+    assert result["tool"] == "propose_order"
+    assert result["arguments"]["delivery_address"] == reply
+    assert result["_source"] == "awaiting_field:delivery_option"
+
+
+def test_try_resolve_awaiting_field_falls_through_to_llm_for_a_pushback_shaped_delivery_option_reply():
+    # The real live message ("nima is obviously in Accra so why would you
+    # ask this \"Would you like...?\"") contains a "?" (quoting the
+    # system's own question back), which correctly excludes it from this
+    # deterministic bypass -- pushback this compound is exactly what the
+    # LLM path, not a regex, should be resolving. See llm.py's
+    # _order_draft_state_line() for the prompt-side half of this fix.
+    reply = 'nima is obviously in Accra so why would you ask this "Would you like rider delivery within Accra, rider delivery within Kumasi, or shipping outside Ghana?"'
+    assert router._try_resolve_awaiting_field("delivery_option", reply) is None
+
+
+@pytest.mark.parametrize("reply", [
+    "yes", "Yeah", "yh", "ok", "sure.", "please", "yes, confirm",
+])
+def test_try_resolve_awaiting_field_resolves_a_delivery_interest_affirmative(reply):
+    # Confirmed live, 2026-08-22: "Want to know about delivery too?"
+    # followed by "yes" fell through to converse instead of showing
+    # delivery options, because nothing tracked that this specific
+    # question was open. Same canonical affirmative set as the
+    # "confirmation" branch -- this is the identical shape of question.
+    result = router._try_resolve_awaiting_field("delivery_interest", reply)
+    assert result == {
+        "tool": "get_delivery_information",
+        "arguments": {},
+        "_source": "awaiting_field:delivery_interest",
+    }
+
+
+@pytest.mark.parametrize("reply", ["no", "no thanks", "not now", "how much is a chain"])
+def test_try_resolve_awaiting_field_does_not_guess_at_a_non_affirmative_delivery_reply(reply):
+    # A "no", a new question, or anything else not in the canonical
+    # affirmative set must fall through to the LLM path rather than
+    # being forced into showing delivery info.
+    assert router._try_resolve_awaiting_field("delivery_interest", reply) is None
+
+
+def test_route_customer_sets_awaiting_field_after_a_bare_price_reply(monkeypatch):
+    # get_product_price's bare-price shape (no delivery_options key)
+    # always ends with "Want to know about delivery too?" -- this must
+    # track that the question is now open. See router.py's _PRICE_TOOL
+    # branch alongside the existing propose_order awaiting_field logic.
+    monkeypatch.setattr(
+        router, "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "Big White Crown Stone Gold Ring, 14g", "material": "18k", "price": 24066.0}),
+    )
+    session_id = "delivery-interest-gets-set"
+
+    router.route_customer("how much is the ring in 18k", session_id)
+
+    assert router.get_awaiting_field(session_id) == "delivery_interest"
+
+
+def test_route_customer_does_not_set_delivery_interest_for_a_combined_quote(monkeypatch):
+    # generate_quote's shape already includes delivery_options up front
+    # -- it has already answered the delivery question, so there is
+    # nothing left open to track.
+    monkeypatch.setattr(
+        router, "understand_customer",
+        MagicMock(return_value={"tool": "generate_quote", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "Ring", "material": "18k", "price": 24066.0, "delivery_options": []}),
+    )
+    session_id = "delivery-interest-not-set-for-quote"
+
+    router.route_customer("give me a full quote for the ring in 18k", session_id)
+
+    assert router.get_awaiting_field(session_id) is None
+
+
+def test_route_customer_resolves_a_bare_yes_to_delivery_info_after_a_price_reply(monkeypatch):
+    # End-to-end: the exact live scenario -- a plain price reply, then a
+    # bare "yes", must resolve to delivery info without ever calling the
+    # LLM for the second turn.
+    understand_customer_mock = MagicMock(
+        return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}
+    )
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(side_effect=[
+            {"product": "Big White Crown Stone Gold Ring, 14g", "material": "18k", "price": 24066.0},
+            {"delivery_options": [{"key": "accra_rider", "label": "rider delivery within Accra"}]},
+        ]),
+    )
+    session_id = "delivery-interest-end-to-end"
+
+    router.route_customer("how much is the ring in 18k", session_id)
+    assert understand_customer_mock.call_count == 1
+
+    result = router.route_customer("yes", session_id)
+    assert understand_customer_mock.call_count == 1  # bypassed, not called again
+    assert "delivery_options" in result
 
 
 def test_route_customer_never_calls_understand_customer_when_the_bypass_fires(monkeypatch):

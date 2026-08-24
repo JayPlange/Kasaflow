@@ -86,6 +86,17 @@ _store = get_session_store()
 _PENDING_ORDER_KEY = "pending_order"
 _LAST_CONFIRMED_KEY = "last_confirmed_order"
 
+# Canonical city name for each real rider zone -- used only by the
+# stale-address-override in propose_order() below, to derive a fresh,
+# non-contradictory delivery_address when the customer explicitly
+# switches delivery_option but the LLM restates a stale address rather
+# than updating it. Deliberately doesn't cover "international": there is
+# no single canonical city to fall back to for shipping outside Ghana,
+# and that mismatch shape (an explicit international pick against a
+# stale Ghanaian address) has not been seen live -- if it turns up, it
+# needs its own look rather than a guessed entry here.
+_RIDER_ZONE_CITY = {"accra_rider": "Accra", "kumasi_rider": "Kumasi"}
+
 # See memory.set_last_action_outcome()'s docstring. Shared by both
 # confirm_order() failure branches below -- a genuine WooCommerce write
 # failure, as opposed to the customer having anything to fix themselves.
@@ -213,7 +224,20 @@ def propose_order(
         elif inferred:
             delivery_key = inferred
         else:
-            return {"error": f"Would you like {delivery_options_phrase()}?"}
+            # awaiting_field tagged here too, matching material/quantity/
+            # delivery_address above -- previously missing, which meant a
+            # reply answering exactly this question (a bare "Accra", or a
+            # longer message that still names the zone) had no
+            # deterministic bypass to catch it and fell through to the
+            # general LLM call with no explicit signal that a delivery-
+            # option question was the one actually open. Confirmed live,
+            # 2026-08-24 (Webb): "nima is obviously in Accra" -- restating
+            # exactly the missing zone -- got routed to a standalone
+            # get_delivery_information lookup instead of continuing this
+            # order, requiring an extra turn to actually complete the
+            # proposal. See router.py's _try_resolve_awaiting_field() for
+            # the deterministic half of this fix.
+            return {"error": f"Would you like {delivery_options_phrase()}?", "awaiting_field": "delivery_option"}
 
     product = get_product_price(product_name, material)
     if not product and active_product_id and product_stripped:
@@ -379,12 +403,65 @@ def propose_order(
     # softens the *label* shown to the customer and staff --
     # delivery_option itself (the raw key) is stored unchanged, since it
     # still reflects what the customer actually chose.
-    if team_confirm:
+    #
+    # One mismatch case is NOT a genuine customer-stated conflict, and
+    # softening the label alone leaves it actively contradictory rather
+    # than just vague: the customer replaces delivery_option with an
+    # explicit, valid rider zone ("actually deliver to Kumasi instead")
+    # and the LLM correctly captures that as delivery_option="kumasi_rider",
+    # but restates the OLD delivery_address verbatim instead of leaving it
+    # "unknown" or writing the new one. Confirmed via a real
+    # KASAFLOW_TURN_TRACE, 2026-08-23 (Webb): llm_structured_output itself
+    # carried delivery_address="East Legon" unchanged alongside the fresh
+    # delivery_option="kumasi_rider" -- not a fill_missing_context()
+    # backfill (that only ever fires on the "unknown" sentinel, and never
+    # ran here), a genuine LLM extraction gap on the free-text field while
+    # the structured enum field was extracted correctly. Detect the same
+    # signature deterministically: if the address this call was given is
+    # identical to the address already on record for THIS SAME product's
+    # existing proposal, that's a stale restatement, not a fresh
+    # customer-stated address. Trust the explicit delivery_option over the
+    # stale text and derive the address from the option's own canonical
+    # zone city, rather than rendering a proposal that names two different
+    # places at once.
+    # Same-product check uses product_id, not the name string: product_name
+    # here is whatever the LLM restated this call ("Custom Leaf White Gold
+    # Necklace", dropping the ", 20g" suffix, in the live case this closes)
+    # and won't reliably string-match existing_pending["product"] (the full
+    # catalogue name). id is already resolved and stable by this point --
+    # see the karat-correction recovery fallback above for the same
+    # reasoning applied to a different problem.
+    #
+    # resolve_delivery_match() is called at most once per request (stored
+    # in `matches` below, not re-called in the stale-address condition and
+    # again in the branch that follows) -- it isn't a pure function (the
+    # live path can hit Google's Geocoding API), so calling it twice would
+    # double a real network call for no reason, on top of tripping up
+    # tests that assert call counts.
+    matches = False if team_confirm else resolve_delivery_match(delivery_key, address_stripped)
+
+    stale_address_override = None
+    if (
+        not team_confirm
+        and not matches
+        and delivery_key in _RIDER_ZONE_CITY
+        and existing_pending
+        and active_product_id is not None
+        and active_product_id == product.get("id")
+        and str(existing_pending.get("delivery_address") or "").strip().lower() == address_stripped.lower()
+    ):
+        stale_address_override = _RIDER_ZONE_CITY[delivery_key]
+
+    if stale_address_override:
+        delivery_address = stale_address_override
+        address_stripped = stale_address_override
+        resolved_label = delivery_option_label(delivery_key)
+    elif team_confirm:
         resolved_label = (
             "a delivery arrangement to be confirmed by our team (we don't have automatic "
             "rider coverage for that address yet)"
         )
-    elif resolve_delivery_match(delivery_key, address_stripped):
+    elif matches:
         resolved_label = delivery_option_label(delivery_key)
     else:
         resolved_label = (
@@ -614,6 +691,77 @@ def cancel_order(session_id: str, order_id=None) -> dict:
         _store.set(session_id, _LAST_CONFIRMED_KEY, None)
 
     return {"order_cancellation": {"order_id": resolved_id}}
+
+
+_ORDER_STATUS_LABELS = {
+    "pending": "received and awaiting confirmation",
+    "on-hold": "received, awaiting payment confirmation",
+    "processing": "confirmed and being prepared",
+    "completed": "completed",
+    "cancelled": "cancelled",
+    "refunded": "refunded",
+    "failed": "failed",
+    "trash": "no longer active",
+}
+
+
+def get_order_status(session_id: str, order_id=None) -> dict:
+    """Looks up a customer's order status -- "where is my order?".
+
+    Same order-resolution pattern as cancel_order() above, deliberately:
+    prefers an order number the customer stated explicitly; falls back
+    to this session's last confirmed order if they didn't give one (the
+    LLM passes "unknown" for order_id in that case -- see llm.py's
+    get_order_status guidance). Always re-checked live against
+    WooCommerce rather than trusted from session memory, same reasoning
+    as cancel_order()'s docstring: staff can move an order forward at
+    any point after handoff, so what this session last knew is not
+    assumed to still be true.
+
+    Read-only, unlike cancel_order() -- nothing is written anywhere, so
+    there is no idempotency concern and no staff notification to send.
+
+    _ORDER_STATUS_LABELS translates WooCommerce's own status strings
+    into something a customer can read; an unrecognised status (a custom
+    store status this map doesn't know about) falls back to the raw
+    WooCommerce string rather than hiding it."""
+    resolved_id = _resolve_order_id(session_id, order_id)
+    if resolved_id is None:
+        return {
+            "error": "I don't have an order on file for you right now -- "
+            "what's the order number you'd like me to check?"
+        }
+
+    try:
+        order = _get_woocommerce_order(resolved_id)
+    except _OrderNotFound:
+        return {"error": f"I couldn't find order #{resolved_id} -- could you double-check the number?"}
+    except Exception:
+        logger.exception("Order lookup failed for #%s during status check", resolved_id)
+        return {"error": "Something went wrong looking up that order -- let's try again in a moment."}
+
+    status = order.get("status", "")
+    line_items = order.get("line_items") or []
+    item_summary = None
+    if line_items:
+        first = line_items[0]
+        name = first.get("name")
+        qty = first.get("quantity")
+        if name and qty:
+            extra = len(line_items) - 1
+            item_summary = f"{qty} x {name}"
+            if extra > 0:
+                item_summary += f" (+{extra} more item{'s' if extra != 1 else ''})"
+
+    return {
+        "order_status": {
+            "order_id": resolved_id,
+            "status": status,
+            "status_label": _ORDER_STATUS_LABELS.get(status, status),
+            "item_summary": item_summary,
+            "total": order.get("total"),
+        }
+    }
 
 
 def _resolve_order_id(session_id: str, order_id) -> int | None:

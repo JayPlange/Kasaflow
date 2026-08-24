@@ -533,7 +533,7 @@ _AWAITING_FIELD_KEY = "awaiting_field"
 # pattern a reply could be checked against the way a bare karat or a
 # bare number does, so it's left to the existing LLM-driven path
 # entirely, same as before this existed.
-AWAITING_FIELDS = ("material", "quantity", "delivery_address", "confirmation")
+AWAITING_FIELDS = ("material", "quantity", "delivery_address", "delivery_option", "confirmation", "delivery_interest")
 
 
 def set_awaiting_field(session_id: str, field: str | None) -> None:

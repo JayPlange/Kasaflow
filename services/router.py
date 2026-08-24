@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # by name rather than added to every tool call: passing an unexpected
 # session_id kwarg to any of the other five would raise inside
 # tool_executor.py's TypeError handler.
-_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order", "cancel_order"}
+_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order", "cancel_order", "get_order_status"}
 
 # converse (services/llm.py) isn't a real registered tool -- there's no
 # deterministic business logic behind it, no lookup, nothing to execute.
@@ -84,6 +84,7 @@ _RECOMMEND_TOOL = "recommend_products"
 # _describe_order_corrections() below.
 _ORDER_TOOL = "propose_order"
 _CONFIRM_TOOL = "confirm_order"
+_PRICE_TOOL = "get_product_price"
 
 _ORDER_CORRECTION_FIELDS = {
     "product_name": "the item",
@@ -210,6 +211,42 @@ _ADDRESS_DISQUALIFYING_WORDS = ("actually", "instead", "rather", "wait", "make i
 # longer sentence.
 _EMBEDDED_KARAT_RE = re.compile(r"\b\d{1,3}\s*k\b", re.IGNORECASE)
 
+# A direct answer to "What address should this be delivered to?" often
+# restates the question's own verb ("deliver to East Legon", "send it to
+# Kumasi") rather than naming just the place. The LLM path already
+# strips this correctly when IT extracts delivery_address (semantic
+# extraction is its job) -- this deterministic bypass does no extraction
+# at all, it just stores `stripped` verbatim, so without this it stores
+# the whole phrase. Caught live, 2026-08-24 (Webb): "deliver to East
+# Legon" answering that exact question produced "Delivery to deliver to
+# East Legon" in the customer-facing proposal -- the preamble duplicated
+# rather than stripped, because propose_order's own phrasing already
+# prepends "Delivery to ". Only strips a leading match (mirrors
+# _NOT_AN_ADDRESS_STARTS_RE's conservative, start-anchored style) --
+# never touches a preamble appearing mid-message, which would risk
+# mangling a genuine address.
+_ADDRESS_PREAMBLE_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:deliver|delivery|send|ship)(?:\s+it)?\s+to\s*[:\-]?\s*",
+    re.IGNORECASE,
+)
+
+# A direct answer to "What address should this be delivered to?" can
+# also name the delivery arrangement itself in the same reply ("East
+# Legon, accra_rider") -- caught live, 2026-08-24 (Webb): stored
+# verbatim as delivery_address (nothing here does semantic splitting),
+# producing "Delivery to East Legon, accra_rider" in the customer-facing
+# proposal, and delivery_option left "unknown" for propose_order to
+# re-infer from the address separately -- inference happened to still
+# get the right zone (the address text also contains "east legon"), but
+# the raw key stayed pasted into the address either way. Only matches
+# the three literal option keys (not natural phrasing like "rider
+# delivery within Accra"), since that's the confirmed live shape -- the
+# LLM path already handles natural phrasing correctly when the message
+# goes through it instead.
+_DELIVERY_OPTION_TOKEN_RE = re.compile(
+    r"\b(accra_rider|kumasi_rider|international)\b", re.IGNORECASE,
+)
+
 
 def _try_resolve_awaiting_field(awaiting_field: str | None, message: str) -> dict | None:
     """The deterministic short-circuit Webb asked for (2026-08-21,
@@ -290,7 +327,44 @@ def _try_resolve_awaiting_field(awaiting_field: str | None, message: str) -> dic
             return None
         return {"tool": _CONFIRM_TOOL, "arguments": {}, "_source": "awaiting_field:confirmation"}
 
-    if awaiting_field == "delivery_address":
+    if awaiting_field == "delivery_interest":
+        # get_product_price's bare-price reply always ends with "Want to
+        # know about delivery too?" (see response_formatter.py's plain
+        # "price" shape) -- a bare affirmative here is unambiguously
+        # answering THAT question, not a fresh, undirected agreement.
+        # Confirmed live, 2026-08-22: "yes" fell through to converse
+        # ("Great! Let me know how I can assist you further.") instead
+        # of showing delivery options, because nothing tracked that a
+        # delivery question had just been asked. Reuses the same
+        # canonical affirmative set confirm_order's own bare "yes"
+        # check uses -- this is the identical shape of question (a
+        # yes/no CTA the assistant itself just asked). Anything that
+        # isn't in that set (a "no", a new product, a question) is
+        # deliberately left to the LLM path rather than guessed here.
+        if _normalize_for_confirmation_check(stripped) not in _BARE_CONFIRMATION_PHRASES:
+            return None
+        return {
+            "tool": "get_delivery_information",
+            "arguments": {},
+            "_source": "awaiting_field:delivery_interest",
+        }
+
+    if awaiting_field in ("delivery_address", "delivery_option"):
+        # Both fields share this one branch on purpose: propose_order()
+        # re-derives whichever of the two is missing from the other
+        # (infer_delivery_option() from an address, resolve_delivery_match()
+        # from an option), so a reply here can equally be a place name
+        # ("Nima, Accra") or an explicit arrangement ("rider delivery
+        # within Accra") regardless of which specific question was
+        # asked -- there's no reason to duplicate the same extraction
+        # twice for a distinction the tool itself doesn't need. Added for
+        # "delivery_option" 2026-08-24 (Webb): propose_order's own
+        # ambiguous-option fallback previously never tagged awaiting_field
+        # at all (unlike material/quantity/delivery_address above), so a
+        # bare reply restating the missing zone had no deterministic
+        # bypass to catch it -- see order_tool.propose_order()'s comment
+        # at the same fallback for the live bug this closes.
+        #
         # A karat- or quantity-shaped reply here is never actually an
         # address ("12k" while an address is awaited is far more likely
         # a stray correction to a field asked about earlier) -- leave
@@ -320,13 +394,23 @@ def _try_resolve_awaiting_field(awaiting_field: str | None, message: str) -> dic
             return None
         if _EMBEDDED_KARAT_RE.search(stripped) or any(w in lowered for w in _ADDRESS_DISQUALIFYING_WORDS):
             return None
+        option_match = _DELIVERY_OPTION_TOKEN_RE.search(stripped)
+        delivery_option = option_match.group(1).lower() if option_match else "unknown"
+        address_source = _DELIVERY_OPTION_TOKEN_RE.sub("", stripped, count=1) if option_match else stripped
+        address = _ADDRESS_PREAMBLE_RE.sub("", address_source).strip().strip(",;- ").strip()
+        if not address:
+            # The whole message WAS the preamble/option token ("deliver
+            # to" or "accra_rider" on their own, nothing else) -- there's
+            # no actual place name left to store. Fall through to the LLM
+            # path rather than storing an empty string as a "valid" address.
+            return None
         return {
             "tool": _ORDER_TOOL,
             "arguments": {
                 "product_name": "unknown", "material": "unknown", "quantity": "unknown",
-                "delivery_address": stripped, "delivery_option": "unknown",
+                "delivery_address": address, "delivery_option": delivery_option,
             },
-            "_source": "awaiting_field:delivery_address",
+            "_source": f"awaiting_field:{awaiting_field}",
         }
 
     return None
@@ -629,6 +713,23 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
         # carry that forward so the customer's very next reply can be
         # checked deterministically before the LLM ever runs again.
         set_awaiting_field(session_id, result["awaiting_field"])
+    elif (
+        tool_request["tool"] == _PRICE_TOOL
+        and isinstance(result, dict)
+        and "price" in result
+        and "delivery_options" not in result
+    ):
+        # get_product_price's bare-price shape (as opposed to
+        # generate_quote's combined price+delivery shape, which already
+        # answers the delivery question up front and needs no follow-up
+        # tracking) always ends with "Want to know about delivery too?"
+        # -- see response_formatter.py. Track that this specific
+        # question is now open, the same way propose_order's own
+        # missing-field questions are tracked above, so a bare "yes"
+        # next turn resolves deterministically instead of falling
+        # through to converse. See _try_resolve_awaiting_field()'s
+        # "delivery_interest" branch for the other half of this.
+        set_awaiting_field(session_id, "delivery_interest")
 
     if tool_request["tool"] == _CONFIRM_TOOL and isinstance(result, dict) and "order_confirmation" in result:
         # This turn's confirm_order call actually placed the order --
@@ -642,7 +743,54 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
     # AND found something -- see _found_nothing()'s docstring for the
     # concrete failure mode this avoids.
     if not _found_nothing(result):
-        remember_context(session_id, arguments)
+        context_to_remember = arguments
+        if tool_request["tool"] == _ORDER_TOOL and isinstance(result, dict) and "proposal" in result:
+            # propose_order can resolve delivery_address/delivery_option to
+            # something DIFFERENT from what was passed in -- inferring a
+            # zone from the address when delivery_option came in "unknown",
+            # or overriding a stale restated address entirely (see the
+            # stale-address-override comment in order_tool.propose_order()).
+            # Whatever it decided is the truth for this order going
+            # forward; `arguments` is only what was true BEFORE this call
+            # ran. Remembering `arguments` unconditionally meant the
+            # override's fix never actually persisted -- confirmed live,
+            # 2026-08-24 (Webb): an East Legon -> Kumasi correction
+            # displayed cleanly (the override caught it), then a
+            # following, unrelated quantity-only correction ("actually
+            # make the quantity 3") silently reverted delivery_address
+            # back to the stale East Legon value, because fill_missing_
+            # context() on that next turn backfilled from what was
+            # actually remembered -- the pre-override value, since only
+            # the proposal shown to the customer had been corrected, not
+            # what gets remembered for next time. Reading the correction
+            # from the proposal itself, not the pre-call arguments, is
+            # what makes the fix actually stick across turns.
+            # material has the identical problem, a different shape: the
+            # customer's raw wording ("18", "18 karat", ...) can differ
+            # textually from the catalogue's canonical form ("18k") even
+            # when propose_order() successfully matched and priced it.
+            # Remembering the raw form meant a LATER turn that restates
+            # the SAME karat using the canonical form (which is exactly
+            # what the pending-order prompt context shows the model, in
+            # prose like "5 x 18k Custom Leaf...") compared unequal
+            # against the raw remembered value and produced a false "Got
+            # it, I've updated the karat to 18k" correction_note for a
+            # karat that never actually changed. Confirmed live, 2026-08-24
+            # (Webb): "actually deliver to Kumasi instead" -- a pure
+            # delivery correction -- came back acknowledging a karat
+            # change instead. Reproduced in isolation: material passed in
+            # as "18", remembered raw, then restated as "18k" on a later
+            # turn reproduces the exact false note. Same fix shape as the
+            # delivery override above -- remember what the tool actually
+            # resolved, not the raw wording that produced it.
+            proposal = result["proposal"]
+            context_to_remember = {
+                **arguments,
+                "material": proposal.get("material", arguments.get("material")),
+                "delivery_address": proposal.get("delivery_address", arguments.get("delivery_address")),
+                "delivery_option": proposal.get("delivery_option", arguments.get("delivery_option")),
+            }
+        remember_context(session_id, context_to_remember)
 
     _update_pending_intent(session_id, tool_request["tool"], arguments, result)
     _update_last_priced_product(session_id, tool_request["tool"], result)

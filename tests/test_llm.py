@@ -194,6 +194,58 @@ def test_prompt_tells_the_model_a_new_order_description_is_not_an_update():
     assert "Do not leave a field \"unknown\" just because you're unsure" in prompt
 
 
+def test_prompt_warns_against_treating_worked_example_neighbourhoods_as_real():
+    # Task #125, Track A correction (2026-08-24): the tool 6 description
+    # cites "East Legon, Suame, Osu" as illustrations of what a Ghanaian
+    # neighbourhood name looks like -- but get_pending_order_summary()
+    # (order_tool.py) deliberately only returns product/material/
+    # quantity/total, never delivery_address, so _pending_order_state_line()
+    # cannot be showing the model a real remembered address at all. A live
+    # trace nonetheless returned the exact true prior address on a
+    # message that never stated one. The Tamale-style reconstruction fix
+    # above doesn't actually cover this (nothing was reconstructed FROM
+    # the prompt, since the prompt never contained the value) -- this is
+    # the real, decisive guard: static worked examples must never be
+    # mistaken for the current customer's actual address. Present on
+    # every prompt, not just the awaiting-confirmation branch, since the
+    # tool description itself is unconditional.
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "Those three names are illustrations only" in prompt
+    assert "never let one of them leak into delivery_address" in prompt
+
+
+def test_prompt_tells_the_model_unstated_fields_must_be_unknown_not_guessed():
+    # Task #125, Track A (Webb, 2026-08-24). "Treat it as a completely
+    # fresh propose_order request" was, on its own, ambiguous about what
+    # to do with a field the message doesn't mention at all -- and a real
+    # live trace showed a plausible-looking failure matching that
+    # ambiguity: a pending order awaiting confirmation, then "actually
+    # deliver to Kumasi instead", correctly updated delivery_option to
+    # "kumasi_rider" but returned the OLD delivery_address instead of
+    # "unknown". IMPORTANT CAVEAT, found on closer reading before this
+    # was shipped as a confirmed diagnosis: get_pending_order_summary()
+    # (order_tool.py) deliberately returns only product/material/
+    # quantity/total, never delivery_address -- so this context line
+    # cannot literally be showing the model the old address for it to
+    # copy from. The exact mechanism producing that live output is NOT
+    # proven from the code alone (a live trace of llm_structured_output
+    # for a case where the true remembered address is NOT one of the
+    # tool description's own worked examples -- see the
+    # worked-example-neighbourhoods test above -- would be needed to
+    # confirm it). This instruction is still worth having regardless:
+    # "unknown for anything not explicitly stated" is what tool 6's own
+    # base description already requires, and restating it here removes
+    # any ambiguity this specific branch introduced, whatever the exact
+    # cause of the observed failure turns out to be.
+    pending = {"product": "Ring", "material": "18k", "quantity": 2, "total": 2425.0}
+    prompt = llm._build_prompt(
+        "actually deliver to Kumasi instead", pending_order=pending, order_draft=None,
+        awaiting_confirmation=True,
+    )
+    assert "the correct value is \"unknown\", full stop" in prompt
+    assert "never invent or infer a value for it" in prompt
+
+
 def test_prompt_refuses_bare_agreement_when_something_else_was_asked_since():
     # P0 fix: a pending order can sit unconfirmed for the rest of the
     # session while the assistant goes on to ask/offer something else
@@ -288,6 +340,28 @@ def test_prompt_lets_the_model_correct_an_already_known_order_draft_field():
     assert "do not silently keep a value they just corrected" in prompt
 
 
+def test_prompt_tells_the_model_a_pushback_shaped_reply_can_still_answer_delivery_option():
+    # Task #168, Webb live 2026-08-24: "nima is obviously in Accra so why
+    # would you ask this ...?" -- a reply that both pushes back AND
+    # restates the missing delivery zone -- got routed to a standalone
+    # get_delivery_information call instead of continuing propose_order,
+    # because the existing "a bare address... answers delivery option"
+    # instruction only covered short, simple replies. This message has a
+    # "?" in it (quoting the system's own question), which also excludes
+    # it from the deterministic bypass (see test_router.py's
+    # test_try_resolve_awaiting_field_falls_through_to_llm_for_a_pushback_
+    # shaped_delivery_option_reply) -- so the LLM path is the only place
+    # left that can get this right, which is why this needs its own
+    # explicit instruction rather than relying on the bypass to cover it.
+    draft = {
+        "product_name": "Ring", "material": "18k", "quantity": 5,
+        "delivery_address": "Nima", "delivery_option": None,
+    }
+    prompt = llm._build_prompt("nima is obviously in Accra so why would you ask this", pending_order=None, order_draft=draft)
+    assert "still applies when the message is longer and pushes back or complains" in prompt
+    assert "not a generic delivery question for get_delivery_information" in prompt
+
+
 def test_prompt_tells_the_model_material_has_no_default_karat():
     # Confirmed live, 2026-08-20: a customer ordered a product and gave a
     # quantity, but never stated a karat -- propose_order's own tool
@@ -314,6 +388,50 @@ def test_prompt_routes_an_order_decision_dispute_away_from_policy_lookup():
     prompt = llm._build_prompt("hello", pending_order=None, order_draft=None)
     assert "why did you choose 18k for me" in prompt.lower()
     assert "not asking about policy" in prompt.lower()
+
+
+def test_prompt_tells_the_model_to_tag_pushback_with_no_new_value():
+    # Tasks #159-162 (humanization design, 2026-08-24): a complaint with
+    # no accompanying value change (e.g. "I already told you Kumasi, why
+    # do you keep asking" when delivery_address is already "Kumasi") has
+    # no acknowledgement mechanism anywhere in the pipeline today --
+    # _describe_order_corrections() (router.py) only fires on an actual
+    # value diff, and correctly finds nothing to diff here. This is the
+    # extraction-side half of the fix: persist the pushback classification
+    # the model already has to make internally to route the message to
+    # propose_order at all (see the dispute-routing rule immediately
+    # above this one), instead of discarding it. Prompt-content only --
+    # this sandbox has no live API access, so whether the model actually
+    # applies this reliably (and doesn't false-positive on ordinary
+    # corrections) needs Webb's live verification, same limit as Track A.
+    prompt = llm._build_prompt("hello", pending_order=None, order_draft=None)
+    assert '"customer_tone": "pushback"' in prompt
+    assert "not inside \"arguments\"" in prompt
+    assert "never guess at one when you're not sure" in prompt
+
+
+def test_prompt_gives_a_worked_example_distinguishing_pushback_from_a_correction():
+    # Self-correction, 2026-08-24: the first version of this rule and
+    # this test assumed pushback and an ordinary correction were mutually
+    # exclusive -- "no, I said 14k" was tagged in the prompt as a
+    # negative example (must NOT be pushback). Webb's live trace showed
+    # the model tagging it as pushback anyway, and on inspection that's
+    # not a false positive: "no, I said X" carries the same "you already
+    # had this wrong" complaint as a value-free dispute ("I already told
+    # you Kumasi..."), it just also happens to restate the value. The
+    # real distinguishing factor is tone (a complaint vs a plain change
+    # of mind), not whether a new value is present. Revised the rule and
+    # this test accordingly rather than forcing the model to suppress a
+    # tag that was actually right. Asserting all four worked examples,
+    # not just the instruction sentence, since Track A's own lesson was
+    # that an ambiguous instruction with no worked example is exactly
+    # what produced the original scenario 11 bug.
+    prompt = llm._build_prompt("hello", pending_order=None, order_draft=None)
+    assert "I already told you Kumasi, why do you keep asking" in prompt
+    assert "Pushback: a complaint, with no new value in it at all" in prompt
+    assert "ALSO pushback, even though this one also states a new value" in prompt
+    assert "NOT pushback -- an ordinary correction with no complaint in it" in prompt
+    assert "NOT pushback -- nothing is being disputed or complained about" in prompt
 
 
 def test_prompt_omits_order_draft_section_once_everything_is_known():
@@ -373,14 +491,15 @@ def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatc
 
 
 # ---------------------------------------------------------------------
-# converse -- the ninth outcome, for purely conversational messages
-# that need no business tool (see llm.py's tool 9 description). It moved
-# from 8th to 9th when cancel_order was added as tool 8.
+# converse -- the tenth outcome, for purely conversational messages
+# that need no business tool (see llm.py's tool 10 description). It
+# moved from 8th to 9th when cancel_order was added as tool 8, then from
+# 9th to 10th when get_order_status was added as tool 9.
 # ---------------------------------------------------------------------
 
 def test_prompt_includes_converse_tool_guidance():
     prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
-    assert "9. converse" in prompt
+    assert "10. converse" in prompt
     assert "reply" in prompt
     assert "NOT_FOUND" not in prompt  # guardrail language stays out of the prompt itself
 
@@ -448,6 +567,63 @@ def test_understand_customer_parses_a_cancel_order_response_with_a_number(monkey
 
     # Assert
     assert result["tool"] == "cancel_order"
+    assert result["arguments"]["order_id"] == "6846"
+
+
+# ---------------------------------------------------------------------
+# get_order_status -- tool 9, added 2026-08-22 (scenario 8, "where is my
+# order"). Same order_id-resolution pattern as cancel_order (tool 8)
+# immediately above, but read-only.
+# ---------------------------------------------------------------------
+
+def test_prompt_tells_the_model_to_pass_a_named_place_to_get_delivery_information():
+    # Confirmed live, 2026-08-22: "what of Bolgatanga, I'm in the
+    # northern region" got the exact same generic three-way delivery
+    # list as a bare "how does delivery work", with the place name
+    # silently ignored. The model must be told to extract and pass it.
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "2. get_delivery_information" in prompt
+    assert "address" in prompt
+    assert "Bolgatanga" in prompt
+
+
+def test_prompt_includes_get_order_status_tool_guidance():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "9. get_order_status" in prompt
+    assert "order_id" in prompt
+
+
+def test_understand_customer_parses_a_get_order_status_response_with_no_number(monkeypatch):
+    # Arrange: customer didn't state an order number -- the LLM must
+    # pass "unknown", never invent one (see llm.py's get_order_status
+    # guidance and order_tool._resolve_order_id()'s fallback)
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "get_order_status", "arguments": {"order_id": "unknown"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    result = llm.understand_customer("where is my order")
+
+    # Assert
+    assert result["tool"] == "get_order_status"
+    assert result["arguments"]["order_id"] == "unknown"
+
+
+def test_understand_customer_parses_a_get_order_status_response_with_a_number(monkeypatch):
+    # Arrange: customer gave an explicit order number
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "get_order_status", "arguments": {"order_id": "6846"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    # Act
+    result = llm.understand_customer("what's the status of order 6846")
+
+    # Assert
+    assert result["tool"] == "get_order_status"
     assert result["arguments"]["order_id"] == "6846"
 
 

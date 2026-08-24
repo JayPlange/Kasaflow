@@ -33,7 +33,7 @@ bolden the first points" was asking for).
 
 import re
 
-from services.delivery_tool import delivery_options_phrase
+from services.delivery_tool import delivery_option_label, delivery_options_phrase
 
 # Matches the karat digits at the start of any of the catalogue's real
 # material formats -- same pattern as recommendation_service.py's own
@@ -279,6 +279,21 @@ def format_for_customer(result: dict | None) -> str:
             f"directly."
         )
 
+    if "order_status" in result:
+        # order_tool.get_order_status()'s shape -- always a fresh
+        # WooCommerce lookup, never assumed from what this session last
+        # knew (see that function's docstring).
+        s = result["order_status"]
+        item_line = f" ({s['item_summary']})" if s.get("item_summary") else ""
+        total_value = s.get("total")
+        total_line = ""
+        if total_value not in (None, ""):
+            try:
+                total_line = f" Total: GH₵{float(total_value):,.2f}."
+            except (TypeError, ValueError):
+                total_line = f" Total: GH₵{total_value}."
+        return f"Order *#{s['order_id']}* is {s['status_label']}{item_line}.{total_line}"
+
     if "answer" in result:
         # answer_policy_question's shape -- already a sentence.
         return result["answer"]
@@ -362,9 +377,51 @@ def format_for_customer(result: dict | None) -> str:
     if "price" in result:
         return f"The {result['material']} {result['product']} is *GH₵{result['price']:,.2f}*. Want to know about delivery too?"
 
+    if "matched_zone" in result:
+        # get_delivery_information(address=...)'s location-aware shape --
+        # a customer named a specific place ("what of Bolgatanga"), not
+        # a generic delivery question. See that function's docstring.
+        #
+        # Every branch here leads with a direct yes/no, deliberately --
+        # the customer asked "does your delivery service cover my
+        # location?", not "what are your delivery options?" (Webb/GPT
+        # review, 2026-08-22, of the live Bolgatanga case). Opening with
+        # the generic three-way menu answers a different, more generic
+        # question than the one actually asked, even when the menu
+        # technically contains the right answer somewhere in it.
+        zone = result["matched_zone"]
+        address = result.get("queried_address") or "that address"
+        if zone in ("accra_rider", "kumasi_rider", "international"):
+            label = delivery_option_label(zone)
+            return f"Yes, we deliver to {address} -- that's covered by our {label}."
+        if zone == "ghana_other":
+            # A real Ghanaian place, just not a rider zone -- same
+            # "let our team confirm" handling propose_order() already
+            # gives this exact classification, not a guessed-at
+            # arrangement dressed up as a real one. Names cost AND
+            # timing explicitly (not just "the details") -- those are
+            # the two concrete things this business can't compute itself
+            # for a non-rider-zone delivery (see delivery_tool.py's
+            # module docstring), so naming them is what actually answers
+            # the question rather than a vague "we'll sort it".
+            return (
+                f"Yes, we can arrange delivery to {address}, although it isn't one of our usual "
+                f"rider zones -- our team will confirm the delivery cost and timing with you."
+            )
+        # Genuinely unclear (couldn't classify the address at all) --
+        # same conservative "ask/list rather than guess" fallback as
+        # everywhere else in this codebase.
+        options_phrase = delivery_options_phrase(result["delivery_options"])
+        return (
+            f"I'm not totally sure how delivery works for {address} -- we deliver a couple of "
+            f"ways: {options_phrase}. Go ahead and place your order and our team will confirm the "
+            f"best option for you."
+        )
+
     if "delivery_options" in result:
         # get_delivery_information()'s bare shape -- a customer asking
-        # generically "what are your delivery options".
+        # generically "what are your delivery options", no specific
+        # place named.
         options_phrase = delivery_options_phrase(result["delivery_options"])
         return f"We deliver a couple of ways: {options_phrase}. Which works for you?"
 

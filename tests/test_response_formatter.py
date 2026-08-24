@@ -96,6 +96,86 @@ def test_formats_bare_delivery_options_shape():
     assert "shipping outside Ghana" in formatted
 
 
+_DELIVERY_OPTIONS = [
+    {"key": "accra_rider", "label": "rider delivery within Accra"},
+    {"key": "kumasi_rider", "label": "rider delivery within Kumasi"},
+    {"key": "international", "label": "shipping outside Ghana"},
+]
+
+
+def test_formats_matched_zone_shape_for_a_rider_zone():
+    # get_delivery_information(address=...)'s shape when a named place
+    # confidently matches one of the two rider zones. Leads with a
+    # direct "Yes" -- the customer asked "does delivery cover my
+    # location?", not "what are your delivery options?" (Webb/GPT
+    # review, 2026-08-22).
+    result = {"delivery_options": _DELIVERY_OPTIONS, "matched_zone": "accra_rider", "queried_address": "East Legon"}
+    formatted = format_for_customer(result)
+    assert formatted.startswith("Yes,")
+    assert "rider delivery within Accra" in formatted
+    assert "East Legon" in formatted
+
+
+def test_formats_matched_zone_shape_for_kumasi():
+    result = {"delivery_options": _DELIVERY_OPTIONS, "matched_zone": "kumasi_rider", "queried_address": "Kumasi"}
+    formatted = format_for_customer(result)
+    assert formatted.startswith("Yes,")
+    assert "rider delivery within Kumasi" in formatted
+
+
+def test_formats_matched_zone_shape_for_ghana_other():
+    # The exact live case: Bolgatanga is real, but not a rider zone, and
+    # not "international" either -- must say so honestly, not repeat
+    # the generic three-way list as if the place name wasn't understood.
+    # Leads with "Yes" (delivery IS possible) and names cost AND timing
+    # explicitly, not a vague "we'll sort it" (Webb/GPT review, 2026-08-22).
+    result = {"delivery_options": _DELIVERY_OPTIONS, "matched_zone": "ghana_other", "queried_address": "Bolgatanga"}
+    formatted = format_for_customer(result)
+    assert formatted.startswith("Yes,")
+    assert "Bolgatanga" in formatted
+    assert "rider zone" in formatted.lower()
+    assert "cost" in formatted.lower()
+    assert "timing" in formatted.lower()
+    # Must not silently claim a zone that isn't real for this address.
+    assert "covered by our rider delivery within accra" not in formatted.lower()
+    assert "covered by our rider delivery within kumasi" not in formatted.lower()
+
+
+def test_formats_matched_zone_shape_for_ghana_other_cape_coast_and_tamale():
+    # Two more real Ghanaian places outside both rider zones -- same
+    # honest ghana_other handling, not just Bolgatanga specifically.
+    for address in ("Cape Coast", "Tamale"):
+        result = {"delivery_options": _DELIVERY_OPTIONS, "matched_zone": "ghana_other", "queried_address": address}
+        formatted = format_for_customer(result)
+        assert formatted.startswith("Yes,")
+        assert address in formatted
+
+
+def test_formats_matched_zone_shape_for_international():
+    result = {"delivery_options": _DELIVERY_OPTIONS, "matched_zone": "international", "queried_address": "London"}
+    formatted = format_for_customer(result)
+    assert formatted.startswith("Yes,")
+    assert "shipping outside Ghana" in formatted
+    assert "London" in formatted
+
+
+def test_formats_matched_zone_shape_when_unclassifiable():
+    # No real signal either way -- falls back to the generic list rather
+    # than guessing, same conservative bias as everywhere else. This is
+    # also, today, what a genuinely international address like "London"
+    # gets in practice when Google Maps geocoding isn't configured (see
+    # test_delivery_tool.py's offline-vs-geocoding coverage) -- the
+    # offline classifier never asserts "international" on its own, only
+    # this formatter shape's "international" branch does, and only once
+    # something upstream actually resolved that zone with real evidence.
+    result = {"delivery_options": _DELIVERY_OPTIONS, "matched_zone": None, "queried_address": "456 Workshop Lane"}
+    formatted = format_for_customer(result)
+    assert "456 Workshop Lane" in formatted
+    assert "rider delivery within Accra" in formatted
+    assert "rider delivery within Kumasi" in formatted
+    assert "shipping outside Ghana" in formatted
+
+
 def test_formats_empty_recommendations():
     formatted = format_for_customer({"recommendations": []})
     assert "don't have anything" in formatted.lower()
@@ -463,6 +543,39 @@ def test_formats_order_escalation_shape():
     assert "*order #6846*" in formatted
     assert "completed" in formatted
     assert "team" in formatted.lower()
+
+
+def test_formats_order_status_shape_with_item_and_total():
+    result = {
+        "order_status": {
+            "order_id": 6846,
+            "status": "processing",
+            "status_label": "confirmed and being prepared",
+            "item_summary": "1 x Custom Leaf White Gold Necklace, 20g",
+            "total": "34000.00",
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "*#6846*" in formatted
+    assert "confirmed and being prepared" in formatted
+    assert "1 x Custom Leaf White Gold Necklace, 20g" in formatted
+    assert "34,000.00" in formatted
+
+
+def test_formats_order_status_shape_without_item_or_total():
+    result = {
+        "order_status": {
+            "order_id": 6846,
+            "status": "pending",
+            "status_label": "received and awaiting confirmation",
+            "item_summary": None,
+            "total": None,
+        }
+    }
+    formatted = format_for_customer(result)
+    assert "*#6846*" in formatted
+    assert "received and awaiting confirmation" in formatted
+    assert "Total" not in formatted
 
 
 def test_formats_multi_entry_results_list_when_one_entry_errored():

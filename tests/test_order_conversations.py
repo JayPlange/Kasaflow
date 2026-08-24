@@ -689,6 +689,163 @@ def test_delivery_option_is_rederived_when_the_address_moves_to_a_different_zone
     assert "doesn't match our usual" not in proposal["delivery_option_label"]
 
 
+def test_stale_address_override_survives_a_later_unrelated_correction(monkeypatch):
+    # Webb, live, 2026-08-24: order_tool.propose_order()'s stale-address
+    # override (task #125/scenario 11 fix) corrects a proposal that
+    # restates an old address alongside a fresh delivery_option -- but
+    # the override only ever touched the PROPOSAL it returned, not what
+    # got remembered afterwards. router.py's _execute_single() called
+    # remember_context() with its own pre-call `arguments`, never the
+    # proposal's own post-override truth, so the very next turn's
+    # fill_missing_context() backfilled delivery_address from the STALE
+    # pre-override value all over again. Live sequence: East Legon/
+    # accra_rider order -> "actually deliver to Kumasi instead" (displays
+    # clean, Kumasi/kumasi_rider) -> "actually make the quantity 3" (an
+    # unrelated correction, no address/option restated) -> the address
+    # reverted to "East Legon" while delivery_option stayed
+    # "kumasi_rider", reproducing the exact contradiction the override
+    # exists to prevent. Reproduces all three turns verbatim; turns 2 and
+    # 3 use "unknown" for every field not explicitly stated in the
+    # message, matching what the Track A prompt fix now instructs the
+    # model to return.
+    monkeypatch.setattr(order_tool, "get_product_price", MagicMock(
+        return_value=_priced("14k", 30000.0),
+    ))
+    _mock_understand_customer(
+        monkeypatch,
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Gye Nyame White Necklace with Earrings, 30g", "material": "14k", "quantity": 8,
+            "delivery_address": "East Legon", "delivery_option": "accra_rider"}},
+        {"tool": "propose_order", "arguments": {
+            "product_name": "unknown", "material": "unknown", "quantity": "unknown",
+            "delivery_address": "unknown", "delivery_option": "kumasi_rider"}},
+        {"tool": "propose_order", "arguments": {
+            "product_name": "unknown", "material": "unknown", "quantity": 3,
+            "delivery_address": "unknown", "delivery_option": "unknown"}},
+    )
+    session_id = "golden-stale-address-override-persistence"
+
+    r1 = _send(
+        "8 Gye Nyame White Necklace with Earrings, 30g in 14k, deliver to East Legon, rider delivery within Accra",
+        session_id,
+    )
+    assert r1["proposal"]["delivery_address"] == "East Legon"
+    assert r1["proposal"]["delivery_option"] == "accra_rider"
+
+    r2 = _send("actually deliver to Kumasi instead", session_id)
+    proposal2 = r2["proposal"]
+    assert proposal2["delivery_address"] == "Kumasi"
+    assert proposal2["delivery_option"] == "kumasi_rider"
+    assert "doesn't match our usual" not in proposal2["delivery_option_label"]
+
+    r3 = _send("actually make the quantity 3", session_id)
+    proposal3 = r3["proposal"]
+    assert proposal3["quantity"] == 3
+    assert proposal3["delivery_address"] == "Kumasi", (
+        f"Expected the Kumasi correction to persist across an unrelated quantity correction, "
+        f"got delivery_address={proposal3['delivery_address']!r} -- the pre-override stale value "
+        f"was remembered instead of the proposal's own corrected truth."
+    )
+    assert proposal3["delivery_option"] == "kumasi_rider"
+    assert "doesn't match our usual" not in proposal3["delivery_option_label"]
+
+
+def test_material_never_generates_a_false_correction_note_across_its_own_canonical_form(monkeypatch):
+    # Webb, live, 2026-08-24: "actually deliver to Kumasi instead" -- a
+    # pure delivery correction, nothing about the karat -- came back with
+    # "Got it, I've updated the karat to 18k." Root cause has the
+    # identical shape as the delivery-address persistence bug just above,
+    # a different field: get_product_price() matches material by
+    # EXTRACTED KARAT DIGIT (product_tool.py's _extract_karat()), so a
+    # raw customer wording like "18" or "18 karat" successfully prices
+    # against the catalogue's canonical "18k" variant -- but the
+    # pre-fix context_to_remember carried forward the RAW wording that
+    # was passed in, not the catalogue's resolved form. The pending-order
+    # prompt context then echoes the CANONICAL form back to the model in
+    # prose ("5 x 18k Custom Leaf..."), and if the model ever restates
+    # that same, unchanged karat using the canonical spelling on a later
+    # turn, _describe_order_corrections() compared it against the raw
+    # remembered wording and saw two different strings for the same
+    # karat -- a false correction. Reproduced directly against the real
+    # (unmocked) product catalogue during investigation, then fixed by
+    # extending router.py's existing delivery-field "remember what the
+    # tool actually resolved, not the raw wording" pattern to material
+    # too. This test uses the mocked catalogue (matching the rest of
+    # this file's style) to keep the karat-matching mechanism itself
+    # implicit: propose_order() is called with material="18" once, and
+    # the mocked catalogue always resolves to "18k" regardless of what
+    # was asked for, standing in for a real karat-digit match.
+    monkeypatch.setattr(order_tool, "get_product_price", MagicMock(
+        return_value=_priced("18k", 34000.0),
+    ))
+    _mock_understand_customer(
+        monkeypatch,
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Custom Leaf White Gold Necklace, 20g", "material": "18", "quantity": 5,
+            "delivery_address": "East Legon", "delivery_option": "accra_rider"}},
+        {"tool": "propose_order", "arguments": {
+            "product_name": "unknown", "material": "18k", "quantity": "unknown",
+            "delivery_address": "Kumasi", "delivery_option": "unknown"}},
+    )
+    session_id = "golden-material-canonical-form"
+
+    r1 = _send(
+        "5 Custom Leaf White Gold Necklace, 20g in 18, deliver to East Legon, rider delivery within Accra",
+        session_id,
+    )
+    assert r1["proposal"]["material"] == "18k"
+    assert "correction_note" not in r1
+
+    r2 = _send("actually deliver to Kumasi instead", session_id)
+    assert "correction_note" in r2, "Expected the genuine delivery address change to be acknowledged"
+    assert r2["correction_note"] == "Got it, I've updated the delivery address to Kumasi.", (
+        f"Expected only the delivery address to be acknowledged as changed, got "
+        f"{r2['correction_note']!r} -- a karat that was never actually changed must not appear here."
+    )
+
+
+def test_ambiguous_delivery_option_reply_completes_the_order_without_another_llm_call(monkeypatch):
+    # Task #168, Webb live 2026-08-24: propose_order's ambiguous-delivery-
+    # option fallback ("Would you like rider delivery within Accra...")
+    # never tagged awaiting_field, unlike material/quantity/delivery_
+    # address -- so a reply answering exactly that question had no
+    # deterministic bypass and fell through to the general LLM call,
+    # where "nima is obviously in Accra" got routed to a standalone
+    # get_delivery_information lookup instead of continuing the order.
+    # "Nima" isn't in the curated offline neighbourhood list (see
+    # delivery_tool.py's _ACCRA_NEIGHBOURHOODS), so it's genuinely
+    # unresolvable without a live geocoding key -- reproducing the exact
+    # conditions that produced the ambiguous question in the first place.
+    # Only ONE canned understand_customer() reply is provided: if turn 2
+    # falls through to the LLM instead of being caught by the
+    # deterministic bypass, MagicMock's side_effect raises StopIteration
+    # and this test errors, proving the bypass -- not the LLM -- resolved it.
+    monkeypatch.setattr(order_tool, "get_product_price", MagicMock(
+        return_value=_priced("18k", 34000.0),
+    ))
+    _mock_understand_customer(
+        monkeypatch,
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Custom Leaf White Gold Necklace, 20g", "material": "18k", "quantity": 5,
+            "delivery_address": "Nima", "delivery_option": "unknown"}},
+    )
+    session_id = "golden-delivery-option-awaiting-field"
+
+    r1 = _send(
+        "5 Custom Leaf White Gold Necklace, 20g in 18k, deliver to Nima",
+        session_id,
+    )
+    assert r1["error"] == "Would you like rider delivery within Accra, rider delivery within Kumasi, or shipping outside Ghana?"
+
+    r2 = _send("Accra", session_id)
+    proposal = r2["proposal"]
+    assert proposal["delivery_address"] == "Accra"
+    assert proposal["delivery_option"] == "accra_rider", (
+        f"Expected the bare 'Accra' reply to resolve delivery_option deterministically, "
+        f"got {proposal['delivery_option']!r}"
+    )
+
+
 def test_delivery_option_is_rederived_when_the_address_was_never_captured_the_first_time(monkeypatch):
     # Webb's own first live trace run against the awaiting_field
     # instrumentation, 2026-08-21: a compound order message ("1 Big
