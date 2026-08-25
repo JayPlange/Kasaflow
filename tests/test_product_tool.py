@@ -151,6 +151,27 @@ def test_get_product_price_returns_karat_breakdown_when_name_matches_and_no_kara
     assert [o["material"][:2] for o in result["karat_options"]] == ["18", "12"]
 
 
+def test_get_product_price_karat_breakdown_carries_a_photo_when_the_catalogue_has_one(monkeypatch, tmp_path):
+    # Webb, 2026-08-25 (50-turn live test #2): "show me the second one"
+    # and "I want the first ring" both resolved via this exact shape but
+    # showed no photo at all -- get_product_price()'s single-variant
+    # exact-match path already carries image_url for free (it returns
+    # the raw catalogue row unchanged), but this multi-option shape is a
+    # NEW dict built from scratch, so it needs the field added
+    # explicitly (see _karat_options_result()'s docstring).
+    catalogue = [
+        {"product": "Ring", "material": "18k", "price": 20000.0, "image_url": "https://x/ring.jpg"},
+        {"product": "Ring", "material": "14k", "price": 17000.0, "image_url": "https://x/ring.jpg"},
+    ]
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(catalogue))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_price("Ring", "unknown")
+
+    assert result["image_url"] == "https://x/ring.jpg"
+
+
 def test_get_product_price_answers_directly_when_name_matches_and_only_one_karat_exists(monkeypatch, tmp_path):
     # A product with only one real karat has nothing to ask about --
     # same "no-variant product" precedent as scenario 3 in this
@@ -345,6 +366,7 @@ def test_list_karat_options_wraps_the_bare_list_in_a_dict_shape(monkeypatch, tmp
 
     assert result["product"] == "Gye Nyame White Necklace"
     assert [r["material"] for r in result["karat_options"]] == ["18k", "14k", "12k"]
+    assert result["image_url"] == "https://x/a.jpg"
 
 
 def test_list_karat_options_returns_empty_karat_options_for_no_match(monkeypatch, tmp_path):
@@ -354,7 +376,7 @@ def test_list_karat_options_returns_empty_karat_options_for_no_match(monkeypatch
 
     result = product_tool.list_karat_options("Completely Unknown Product")
 
-    assert result == {"product": "Completely Unknown Product", "karat_options": []}
+    assert result == {"product": "Completely Unknown Product", "karat_options": [], "image_url": None}
 
 
 # ---------------------------------------------------------------------
@@ -370,7 +392,7 @@ def test_get_product_weight_extracts_weight_from_the_canonical_product_name(monk
 
     result = product_tool.get_product_weight("Set Multi Stone Golf Ring, 7g")
 
-    assert result == {"product": "Set Multi Stone Golf Ring, 7g", "weight": "7g"}
+    assert result == {"product": "Set Multi Stone Golf Ring, 7g", "weight": "7g", "image_url": None}
 
 
 def test_get_product_weight_returns_none_weight_for_a_real_product_with_no_weight_in_its_name(monkeypatch, tmp_path):
@@ -384,7 +406,18 @@ def test_get_product_weight_returns_none_weight_for_a_real_product_with_no_weigh
 
     result = product_tool.get_product_weight("Gye Nyame White Necklace")
 
-    assert result == {"product": "Gye Nyame White Necklace", "weight": None}
+    assert result == {"product": "Gye Nyame White Necklace", "weight": None, "image_url": "https://x/a.jpg"}
+
+
+def test_get_product_weight_carries_a_photo_when_the_catalogue_has_one(monkeypatch, tmp_path):
+    # Webb, 2026-08-25: "how heavy is it" also showed no photo.
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_weight("Other Necklace")
+
+    assert result["image_url"] == "https://x/b.jpg"
 
 
 def test_get_product_weight_returns_none_for_no_match_at_all(monkeypatch, tmp_path):

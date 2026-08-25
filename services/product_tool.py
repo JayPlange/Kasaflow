@@ -106,7 +106,7 @@ def get_product_price(product_name: str, material: str):
         if len(options) == 1:
             return options[0]
         if options:
-            return {"product": product_name, "karat_options": options}
+            return _karat_options_result(product_name, options)
 
     logger.info(
         "No exact match for product_name=%s material=%s -- falling back to semantic search",
@@ -278,6 +278,31 @@ def get_product_karat_options(product_name: str) -> list[dict]:
     return deduped
 
 
+def _karat_options_result(product_name: str, options: list[dict]) -> dict:
+    """Shared {"product", "karat_options", "image_url"} shape for both
+    list_karat_options() and get_product_price()'s karat-less multi-
+    option fallback above -- one builder, two callers, so the two
+    call sites can never quietly diverge on this shape (same reasoning
+    as response_formatter.select_presented_groups()'s own docstring).
+
+    image_url is read off the first option that actually has one --
+    every option is the same product at a different karat/size, sharing
+    one catalogue photo in practice, but not guaranteed to each carry
+    the field individually (see woocommerce_sync.py). Webb, 2026-08-25
+    (50-turn live test #2): "show me the second one" and "I want the
+    first ring" both resolved to the correct product via this exact
+    shape but showed no photo at all -- get_product_price()'s own
+    single-variant exact-match path already carries image_url for free
+    (it returns the raw catalogue row unchanged), but this multi-option
+    shape is a NEW dict built from scratch, so it needs the same field
+    added explicitly. response_formatter.py's text is unaffected --
+    image_url is read directly off the tool result by demo_routes.py/
+    whatsapp_routes.py, the same transport-level path a photo-match
+    reply already uses, not rendered as text at all."""
+    image_url = next((option.get("image_url") for option in options if option.get("image_url")), None)
+    return {"product": product_name, "karat_options": options, "image_url": image_url}
+
+
 def list_karat_options(product_name: str) -> dict:
     """Tool-registry entry point wrapping get_product_karat_options() above
     into the {"product": ..., "karat_options": [...]} dict shape every
@@ -293,7 +318,7 @@ def list_karat_options(product_name: str) -> dict:
     point specifically so get_product_price() keeps returning a raw
     catalogue row unchanged -- nothing about that existing shape moves.
     """
-    return {"product": product_name, "karat_options": get_product_karat_options(product_name)}
+    return _karat_options_result(product_name, get_product_karat_options(product_name))
 
 
 # Matches the trailing weight on a catalogue product name -- "Gye Nyame
@@ -349,4 +374,10 @@ def get_product_weight(product_name: str) -> dict | None:
     match = next((p for p in products if p["product"] == product_name), None)
     if match is None:
         return None
-    return {"product": product_name, "weight": _extract_weight(match["product"])}
+    return {
+        "product": product_name,
+        "weight": _extract_weight(match["product"]),
+        # Same photo-attachment gap as _karat_options_result() above --
+        # Webb, 2026-08-25: a weight answer showed no photo either.
+        "image_url": match.get("image_url"),
+    }
