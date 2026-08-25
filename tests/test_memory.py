@@ -11,6 +11,7 @@ from services.memory import (
     SessionStore,
     fill_missing_context,
     get_last_action_outcome,
+    get_last_presented_products,
     get_last_priced_product,
     get_order_draft,
     get_pending_intent,
@@ -18,6 +19,7 @@ from services.memory import (
     remember_context,
     set_awaiting_confirmation,
     set_last_action_outcome,
+    set_last_presented_products,
     set_last_priced_product,
     set_pending_intent,
 )
@@ -532,6 +534,100 @@ def test_last_priced_product_sessions_stay_isolated(monkeypatch):
 
     assert get_last_priced_product("session-a") == "Ring A"
     assert get_last_priced_product("session-b") == "Ring B"
+
+
+# ---------------------------------------------------------------------
+# last_presented_products
+# ---------------------------------------------------------------------
+
+def test_get_last_presented_products_returns_none_when_nothing_set():
+    assert get_last_presented_products("session-never-seen") is None
+
+
+def test_last_presented_products_round_trips_shape(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    groups = [
+        ("Gold Hoop Earrings, 5g", [{"category": "Earrings", "material": "14k"}]),
+        ("Silver Chain Necklace, 20g", [{"category": "Necklaces", "material": "18k"}]),
+    ]
+    set_last_presented_products("session-1", groups)
+
+    stored = get_last_presented_products("session-1")
+    assert stored == {
+        "generation": 1,
+        "items": [
+            {"position": 1, "product_name": "Gold Hoop Earrings, 5g", "category": "Earrings"},
+            {"position": 2, "product_name": "Silver Chain Necklace, 20g", "category": "Necklaces"},
+        ],
+    }
+
+
+def test_last_presented_products_omits_price_and_material(monkeypatch):
+    # Webb, 2026-08-25: the stored entry must never carry price/karat as
+    # authoritative state -- only position/product_name/category.
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    groups = [("Ring", [{"category": "Rings", "material": "14k", "price": "1200"}])]
+    set_last_presented_products("session-1", groups)
+
+    item = get_last_presented_products("session-1")["items"][0]
+    assert set(item.keys()) == {"position", "product_name", "category"}
+
+
+def test_last_presented_products_generation_increments_on_each_write(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_presented_products("session-1", [("Ring", [{"category": "Rings"}])])
+    set_last_presented_products("session-1", [("Necklace", [{"category": "Necklaces"}])])
+
+    assert get_last_presented_products("session-1")["generation"] == 2
+
+
+def test_last_presented_products_overwritten_wholesale_by_next_call(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_presented_products("session-1", [("Ring", [{"category": "Rings"}])])
+    set_last_presented_products("session-1", [("Necklace", [{"category": "Necklaces"}])])
+
+    items = get_last_presented_products("session-1")["items"]
+    assert len(items) == 1
+    assert items[0]["product_name"] == "Necklace"
+
+
+def test_last_presented_products_not_cleared_by_clear_order_state(monkeypatch):
+    from services.memory import clear_order_state
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_presented_products("session-1", [("Ring", [{"category": "Rings"}])])
+    clear_order_state("session-1")
+
+    assert get_last_presented_products("session-1") is not None
+
+
+def test_last_presented_products_sessions_stay_isolated(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_presented_products("session-a", [("Ring A", [{"category": "Rings"}])])
+    set_last_presented_products("session-b", [("Ring B", [{"category": "Rings"}])])
+
+    assert get_last_presented_products("session-a")["items"][0]["product_name"] == "Ring A"
+    assert get_last_presented_products("session-b")["items"][0]["product_name"] == "Ring B"
+
+
+def test_last_presented_products_handles_missing_category(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_last_presented_products("session-1", [("Ring", [{}])])
+
+    assert get_last_presented_products("session-1")["items"][0]["category"] is None
 
 
 def test_context_round_trips_across_two_simulated_turns(monkeypatch):

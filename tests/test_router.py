@@ -344,6 +344,7 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
         last_action_outcome=None,
         last_priced_product=None,
         just_confirmed_order=None,
+        last_presented_products=None,
     )
 
 
@@ -365,6 +366,7 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
         pending_intent=None,
         last_action_outcome=None,
         last_priced_product=None,
+        last_presented_products=None,
     )
 
 
@@ -1149,6 +1151,91 @@ def test_route_customer_sets_last_priced_product_even_when_weight_lookup_finds_n
 
     # Assert
     set_last_priced_product.assert_called_once_with("session-weight-no-data", "Custom Butterfly Gold Ring")
+
+
+# ---------------------------------------------------------------------
+# last_presented_products -- a successful recommend_products call must
+# remember, via the SAME selection response_formatter.py renders with,
+# exactly what this customer was just shown (task #181).
+# ---------------------------------------------------------------------
+
+def test_route_customer_sets_last_presented_products_on_successful_recommend(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"material": "unknown", "category": "Rings"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"recommendations": [{"product": "Ring A", "category": "Rings"}]}),
+    )
+    set_last_presented_products = MagicMock()
+    monkeypatch.setattr(router, "set_last_presented_products", set_last_presented_products)
+
+    router.route_customer("what rings do you have?", "session-presented-set")
+
+    set_last_presented_products.assert_called_once()
+    call_session_id, call_groups = set_last_presented_products.call_args.args
+    assert call_session_id == "session-presented-set"
+    assert call_groups == [("Ring A", [{"product": "Ring A", "category": "Rings"}])]
+
+
+def test_route_customer_does_not_set_last_presented_products_on_an_empty_recommend(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "recommend_products", "arguments": {"material": "unknown", "category": "Bracelets"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"recommendations": [], "requested_category": "Bracelets"}),
+    )
+    set_last_presented_products = MagicMock()
+    monkeypatch.setattr(router, "set_last_presented_products", set_last_presented_products)
+
+    router.route_customer("what bracelets do you have?", "session-presented-miss")
+
+    set_last_presented_products.assert_not_called()
+
+
+def test_route_customer_does_not_set_last_presented_products_for_other_tools(monkeypatch):
+    # A single-item lookup (price, karat options, weight, ...) must not
+    # overwrite the remembered list -- only recommend_products does.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Ring", "material": "18k", "price": 1200}),
+    )
+    set_last_presented_products = MagicMock()
+    monkeypatch.setattr(router, "set_last_presented_products", set_last_presented_products)
+
+    router.route_customer("how much is the ring", "session-presented-untouched")
+
+    set_last_presented_products.assert_not_called()
+
+
+def test_route_customer_reads_last_presented_products_and_threads_it_to_understand_customer(monkeypatch):
+    understand_customer = MagicMock(
+        return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring A", "material": "unknown"}}
+    )
+    monkeypatch.setattr(router, "understand_customer", understand_customer)
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "Ring A", "karat_options": [{"material": "18k", "price": 1200}]}),
+    )
+    stored = {"generation": 1, "items": [{"position": 1, "product_name": "Ring A", "category": "Rings"}]}
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=stored))
+
+    router.route_customer("how much is the first one", "session-presented-read")
+
+    assert understand_customer.call_args.kwargs["last_presented_products"] == stored
 
 
 def test_route_customer_clears_last_priced_product_on_a_successful_category_browse(monkeypatch):

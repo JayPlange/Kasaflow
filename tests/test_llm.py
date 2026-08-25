@@ -585,6 +585,76 @@ def test_prompt_distinguishes_karat_options_from_a_specific_karat_price():
     assert "okay what about 12" in prompt
 
 
+# ---------------------------------------------------------------------
+# last_presented_products -- "the second one"/"the first ring" resolving
+# against the exact numbered list recommend_products actually showed
+# (Webb/GPT 50-turn live test, 2026-08-24: both resolved wrongly today).
+# ---------------------------------------------------------------------
+
+def test_prompt_omits_last_presented_products_section_when_nothing_shown():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "just shown this numbered list" not in prompt
+
+
+def test_prompt_describes_the_last_presented_products_list():
+    last_presented = {
+        "generation": 1,
+        "items": [
+            {"position": 1, "product_name": "Gold Hoop Earrings, 5g", "category": "Earrings"},
+            {"position": 2, "product_name": "Silver Chain Necklace, 20g", "category": "Necklaces"},
+        ],
+    }
+    prompt = llm._build_prompt(
+        "hey", pending_order=None, order_draft=None, last_presented_products=last_presented,
+    )
+    assert "just shown this numbered list" in prompt
+    assert "1. Gold Hoop Earrings, 5g (Earrings)" in prompt
+    assert "2. Silver Chain Necklace, 20g (Necklaces)" in prompt
+
+
+def test_prompt_instructs_positional_resolution_and_category_filtering():
+    last_presented = {
+        "generation": 1,
+        "items": [
+            {"position": 1, "product_name": "Ring A", "category": "Rings"},
+            {"position": 2, "product_name": "Necklace B", "category": "Necklaces"},
+            {"position": 3, "product_name": "Ring C", "category": "Rings"},
+        ],
+    }
+    prompt = llm._build_prompt(
+        "hey", pending_order=None, order_draft=None, last_presented_products=last_presented,
+    )
+    assert "the second one" in prompt
+    assert "the first ring" in prompt
+    assert "match position within that category only" in prompt
+    assert "do not guess" in prompt.lower()
+
+
+def test_prompt_omits_last_presented_products_section_when_items_list_is_empty():
+    prompt = llm._build_prompt(
+        "hey", pending_order=None, order_draft=None,
+        last_presented_products={"generation": 1, "items": []},
+    )
+    assert "just shown this numbered list" not in prompt
+
+
+def test_understand_customer_passes_last_presented_products_through_to_the_prompt(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "get_product_price", "arguments": {"product_name": "Silver Chain Necklace, 20g"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+    last_presented = {
+        "generation": 1,
+        "items": [{"position": 1, "product_name": "Silver Chain Necklace, 20g", "category": "Necklaces"}],
+    }
+
+    llm.understand_customer("how much is the first one", last_presented_products=last_presented)
+
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "1. Silver Chain Necklace, 20g (Necklaces)" in sent_prompt
+
+
 def test_prompt_tells_the_model_to_use_recommend_products_for_category_photo_requests():
     # "necklace images" etc. -- a category is enough to act on, must not
     # fall through to get_product_price("unknown") or converse

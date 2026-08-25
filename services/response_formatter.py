@@ -107,6 +107,25 @@ def _select_diverse_groups(
     return selected
 
 
+def select_presented_groups(items: list[dict], max_groups: int = 4) -> list[tuple[str, list[dict]]]:
+    """Public wrapper around _group_by_product() + _select_diverse_groups()
+    above -- the exact selection that decides what a recommend_products
+    reply actually shows a customer, in the order it's shown.
+
+    Exists as its own function, not just inlined in format_for_customer()
+    below, so router.py can call the SAME selection when persisting
+    memory.set_last_presented_products() (see that function's docstring)
+    -- one function computing the list, two callers (render it, remember
+    it), rather than two places that could quietly drift out of sync.
+    This codebase has already been bitten by exactly that shape of bug
+    twice (the karat-representation mismatch and the delivery-option
+    staleness bug both came from two code paths silently disagreeing
+    about the same fact) -- not repeating it a third time for "what did
+    we just show this customer" was the whole point of designing it this
+    way (see KasaFlow_Conversation_Context_Design.md, piece 1)."""
+    return _select_diverse_groups(_group_by_product(items), max_groups=max_groups)
+
+
 # Above this many variants of one product, listing every size/karat is a
 # wall of text, not a readable answer -- a price range plus an invitation
 # to narrow down reads the way an actual salesperson would answer "what
@@ -382,7 +401,7 @@ def format_for_customer(result: dict | None) -> str:
                     f"Want me to show you what's there?"
                 )
             return "Hmm, I don't have anything matching that right now -- want me to show you something similar instead?"
-        groups = _select_diverse_groups(_group_by_product(items), max_groups=4)
+        groups = select_presented_groups(items, max_groups=4)
         lines = [_format_recommendation_group(name, variants) for name, variants in groups]
         return (
             "Here's what I found for you:\n\n"

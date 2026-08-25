@@ -14,6 +14,7 @@ from services.memory import (
     get_awaiting_field,
     get_just_confirmed_order,
     get_last_action_outcome,
+    get_last_presented_products,
     get_last_priced_product,
     get_order_draft,
     get_pending_intent,
@@ -24,10 +25,12 @@ from services.memory import (
     set_awaiting_field,
     set_just_confirmed_order,
     set_last_action_outcome,
+    set_last_presented_products,
     set_last_priced_product,
     set_pending_intent,
 )
 from services.order_tool import get_pending_order_summary
+from services.response_formatter import select_presented_groups
 from services.tool_executor import ToolExecutionError, execute_tool
 
 logger = logging.getLogger(__name__)
@@ -492,6 +495,13 @@ def _route_customer_locked(message: str, session_id: str) -> dict:
         # memory.get_last_priced_product() and llm.py's
         # _last_priced_product_state_line().
         last_priced_product = get_last_priced_product(session_id)
+        # The exact numbered/bulleted list the most recent successful
+        # recommend_products reply showed this customer, so "the second
+        # one"/"the first ring" can resolve deterministically against a
+        # position instead of the model guessing. See
+        # memory.get_last_presented_products() and llm.py's
+        # _last_presented_products_state_line().
+        last_presented_products = get_last_presented_products(session_id)
         # Only meaningful when a pending_order actually exists -- see
         # memory.set_awaiting_confirmation()'s docstring. True only when
         # proposing THIS order was the last thing that happened in the
@@ -522,6 +532,7 @@ def _route_customer_locked(message: str, session_id: str) -> dict:
                 last_action_outcome=last_action_outcome,
                 last_priced_product=last_priced_product,
                 just_confirmed_order=just_confirmed_order,
+                last_presented_products=last_presented_products,
             )
     except ValueError as e:
         error_result = {"error": str(e)}
@@ -568,6 +579,7 @@ def _snapshot_session_state(session_id: str) -> dict:
         "pending_intent": get_pending_intent(session_id),
         "last_action_outcome": get_last_action_outcome(session_id),
         "last_priced_product": get_last_priced_product(session_id),
+        "last_presented_products": get_last_presented_products(session_id),
         "awaiting_confirmation": is_awaiting_confirmation(session_id) if pending_order else False,
         "just_confirmed_order": get_just_confirmed_order(session_id),
         "awaiting_field": get_awaiting_field(session_id),
@@ -809,6 +821,7 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
 
     _update_pending_intent(session_id, tool_request["tool"], arguments, result)
     _update_last_priced_product(session_id, tool_request["tool"], result)
+    _update_last_presented_products(session_id, tool_request["tool"], result)
 
     if _tool_succeeded(result):
         # A genuine success means whatever failed before is no longer
@@ -943,6 +956,37 @@ def _update_last_priced_product(session_id: str, tool_name: str, result: dict | 
         set_last_priced_product(session_id, result.get("product"))
     elif tool_name == _RECOMMEND_TOOL and _tool_succeeded(result):
         set_last_priced_product(session_id, None)
+
+
+def _update_last_presented_products(session_id: str, tool_name: str, result: dict | None) -> None:
+    """A successful recommend_products call remembers exactly what it
+    just showed, via the SAME selection response_formatter.py uses to
+    render it -- see response_formatter.select_presented_groups()'s own
+    docstring for why this matters, and memory.set_last_presented_
+    products()'s docstring for the shape/lifecycle. Deliberately never
+    clears this on any other tool -- see that docstring for why a
+    single-item follow-up shouldn't erase the ability to reference the
+    list it came from.
+
+    Reads recommendations via .get(), not result["recommendations"],
+    deliberately: _tool_succeeded()/_found_nothing() only guarantee "not
+    an empty recommendations list when that key IS present" -- they say
+    nothing about a result shape that lacks the key altogether (found via
+    real test failures against pre-existing tests that mock execute_tool()
+    with an unrelated shape while understand_customer() still names
+    recommend_products, e.g. a turn-trace test using {"products": []}).
+    That mismatch is only ever a test-mock artefact, never real
+    recommend_products output, but this function has no way to tell the
+    difference -- so it fails safe (remembers nothing) rather than crash,
+    the same duck-typed defensiveness every other shape check in this
+    codebase already uses."""
+    if tool_name != _RECOMMEND_TOOL or not _tool_succeeded(result):
+        return
+    recommendations = result.get("recommendations")
+    if not recommendations:
+        return
+    groups = select_presented_groups(recommendations)
+    set_last_presented_products(session_id, groups)
 
 
 def _handle_conversation(arguments: dict) -> dict:

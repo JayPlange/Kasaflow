@@ -6,11 +6,55 @@ tools can produce gets exercised directly against the real formatter,
 no mocking needed.
 """
 
-from services.response_formatter import format_for_customer
+from services.response_formatter import format_for_customer, select_presented_groups
 
 
 def test_formats_no_match():
     assert "couldn't find" in format_for_customer(None).lower()
+
+
+# ---------------------------------------------------------------------
+# select_presented_groups -- the same selection router.py persists via
+# memory.set_last_presented_products(), so it must match exactly what
+# format_for_customer() renders for a recommendations reply.
+# ---------------------------------------------------------------------
+
+def test_select_presented_groups_groups_variants_of_the_same_product():
+    items = [
+        {"product": "Ring", "category": "Rings", "material": "14k"},
+        {"product": "Ring", "category": "Rings", "material": "18k"},
+        {"product": "Necklace", "category": "Necklaces", "material": "14k"},
+    ]
+
+    groups = select_presented_groups(items)
+
+    assert [name for name, _ in groups] == ["Ring", "Necklace"]
+    assert len(groups[0][1]) == 2
+
+
+def test_select_presented_groups_caps_at_max_groups_with_round_robin():
+    items = [
+        {"product": f"Necklace {i}", "category": "Necklaces"} for i in range(5)
+    ] + [
+        {"product": "Ring 1", "category": "Rings"},
+    ]
+
+    groups = select_presented_groups(items, max_groups=4)
+
+    categories = [variants[0]["category"] for _, variants in groups]
+    assert len(groups) == 4
+    assert "Rings" in categories  # round-robin, not a plain [:4] slice
+
+
+def test_select_presented_groups_preserves_first_seen_order_when_under_cap():
+    items = [
+        {"product": "B", "category": "Rings"},
+        {"product": "A", "category": "Necklaces"},
+    ]
+
+    groups = select_presented_groups(items)
+
+    assert [name for name, _ in groups] == ["B", "A"]
 
 
 def test_formats_error_shape():

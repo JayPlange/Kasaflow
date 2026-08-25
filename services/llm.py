@@ -329,6 +329,8 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {just_confirmed_order_state}
 
+{last_presented_products_state}
+
 Customer:
 {message}
 """
@@ -627,6 +629,62 @@ def _just_confirmed_order_state_line(just_confirmed_order: dict | None) -> str:
     )
 
 
+def _last_presented_products_state_line(last_presented_products: dict | None) -> str:
+    """Describes the exact numbered list a recommend_products reply most
+    recently showed this customer, so an ordinal/positional reference
+    ("show me the second one", "I want the first ring", "number 3") can
+    resolve to the actual product_name at that position instead of the
+    model guessing or falling back to whatever it remembers as the
+    single active product.
+
+    Exists because the customer-visible list is grouped/diversity-
+    selected (see response_formatter.select_presented_groups() and
+    memory.set_last_presented_products()'s docstrings), so its order
+    is not the same as data/products.json's raw file order, and nothing
+    before this told the model what that rendered order actually was --
+    confirmed against the Webb/GPT 50-turn live test, 2026-08-24: "show
+    me the second one" (after 4 necklaces were listed) and "I want the
+    first ring" (after 4 rings were listed) both resolved to an
+    unrelated, earlier-discussed product instead of the actual 2nd/1st
+    item shown.
+
+    `category` is carried per entry specifically so "the first ring" can
+    be resolved against a category-filtered position within a MIXED
+    list (rings and necklaces together), not just raw list position 1
+    -- see the instruction text below.
+
+    Only ever describes a genuinely ORDINAL/positional reference to an
+    item in this specific list -- it does not change how "this"/"that
+    one"/"the same one" are resolved (see the existing "this"/"that one"
+    instruction elsewhere in this prompt, and llm.py's
+    _last_priced_product_state_line() -- both already handle a single
+    active product with no list involved)."""
+    if not last_presented_products:
+        return ""
+    items = last_presented_products.get("items") or []
+    if not items:
+        return ""
+    lines = "\n".join(
+        f"{item['position']}. {item['product_name']}" + (f" ({item['category']})" if item.get("category") else "")
+        for item in items
+    )
+    return (
+        f"This customer was just shown this numbered list:\n{lines}\n\n"
+        f"If their current message refers to one of these items by position -- an ordinal "
+        f"(\"the second one\", \"the first ring\", \"the last one\") or a number (\"number 3\", "
+        f"just \"2\") -- resolve product_name to that exact entry's name above, rather than "
+        f"treating the message as still-ambiguous or reusing a different, earlier-discussed "
+        f"product. When the reference names a category (\"the first RING\") and this list mixes "
+        f"categories, match position within that category only (the first entry above whose "
+        f"category is Rings), not raw position in the whole list. If the position referenced "
+        f"doesn't exist in this list (e.g. \"the fifth one\" when only {len(items)} were shown), "
+        f"do not guess -- set product_name to \"unknown\" as usual. This only resolves WHICH "
+        f"product a position means; it does not by itself decide which tool to call -- use "
+        f"whatever the rest of the message asks for (price, karat options, weight, an order, a "
+        f"photo, ...) with this resolved product_name."
+    )
+
+
 def _build_prompt(
     message: str,
     pending_order: dict | None,
@@ -636,6 +694,7 @@ def _build_prompt(
     last_priced_product: str | None = None,
     awaiting_confirmation: bool = False,
     just_confirmed_order: dict | None = None,
+    last_presented_products: dict | None = None,
 ) -> str:
     return _PROMPT_TEMPLATE.format(
         message=message,
@@ -645,6 +704,7 @@ def _build_prompt(
         last_action_outcome_state=_last_action_outcome_state_line(last_action_outcome),
         last_priced_product_state=_last_priced_product_state_line(last_priced_product),
         just_confirmed_order_state=_just_confirmed_order_state_line(just_confirmed_order),
+        last_presented_products_state=_last_presented_products_state_line(last_presented_products),
     )
 
 
@@ -657,6 +717,7 @@ def _call_llm(
     last_priced_product: str | None = None,
     awaiting_confirmation: bool = False,
     just_confirmed_order: dict | None = None,
+    last_presented_products: dict | None = None,
 ) -> str:
     """Call the model with retries on transient failures only.
 
@@ -673,6 +734,7 @@ def _call_llm(
                 input=_build_prompt(
                     message, pending_order, order_draft, pending_intent, last_action_outcome,
                     last_priced_product, awaiting_confirmation, just_confirmed_order,
+                    last_presented_products,
                 ),
                 timeout=settings.llm_timeout_seconds,
             )
@@ -750,6 +812,7 @@ def understand_customer(
     last_action_outcome: dict | None = None,
     last_priced_product: str | None = None,
     just_confirmed_order: dict | None = None,
+    last_presented_products: dict | None = None,
 ) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
@@ -784,13 +847,22 @@ def understand_customer(
     just_confirmed_order is non-None for exactly one turn: the one right
     after confirm_order succeeded, nothing since (see
     memory.get_just_confirmed_order() and
-    _just_confirmed_order_state_line())."""
+    _just_confirmed_order_state_line()).
+
+    last_presented_products is the numbered list of products this session
+    was last shown by recommend_products (see
+    memory.get_last_presented_products() and
+    _last_presented_products_state_line()), so an ordinal/positional
+    follow-up ("the second one", "the ring in the middle") can be resolved
+    to a specific product_name before the model picks whichever tool the
+    rest of the message actually asks for."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
     raw_text = _call_llm(
         message, pending_order, order_draft, pending_intent, last_action_outcome,
         last_priced_product, awaiting_confirmation, just_confirmed_order,
+        last_presented_products,
     )
     logger.info("Raw LLM output: %s", raw_text)
 

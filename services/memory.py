@@ -443,6 +443,66 @@ def get_last_priced_product(session_id: str) -> str | None:
     return _store.get(session_id, _LAST_PRICED_PRODUCT_KEY)
 
 
+_LAST_PRESENTED_PRODUCTS_KEY = "last_presented_products"
+_LAST_PRESENTED_PRODUCTS_GENERATION_KEY = "last_presented_products_generation"
+
+
+def set_last_presented_products(session_id: str, groups: list[tuple[str, list[dict]]]) -> None:
+    """Records the exact numbered/bulleted list a recommend_products
+    reply just showed this customer, so "the second one"/"the first
+    ring" can resolve deterministically against it -- see llm.py's
+    _last_presented_products_state_line().
+
+    `groups` is response_formatter.select_presented_groups()'s own
+    return shape (`[(product_name, [catalogue_row, ...]), ...]`, already
+    in shown order) -- passed straight through from router.py's call to
+    that SAME function, not recomputed here, so what gets remembered can
+    never drift from what was actually rendered (see that function's own
+    docstring for why this matters: this codebase has already been
+    bitten twice by two code paths silently disagreeing about the same
+    fact). Only `product_name` and `category` are kept per entry --
+    deliberately NOT price or material (Webb, 2026-08-25): the list
+    tells the model WHICH product a position refers to, never what it
+    costs or what karat it was shown at, since a fresh get_product_price
+    call determines the current, authoritative price once the referent
+    is resolved. A list rendered at 14k does not mean "the second one"
+    is committed to 14k if the customer then asks its price in 18k.
+
+    Overwritten wholesale by the next successful recommend_products call
+    (last write wins, same as every other single-slot memory value in
+    this file) -- deliberately NOT cleared by a single-item follow-up
+    (pricing item #2, asking its weight, ...), so a customer can still
+    say "actually show me the first one instead" after drilling into a
+    later item. Also deliberately NOT touched by clear_order_state() --
+    browsing context and order context are different things, same
+    reasoning memory.py already applies to `category`/`pending_intent`
+    there (see that function's own docstring).
+
+    A monotonically increasing `generation` is stored alongside the
+    items themselves, requested by Webb, 2026-08-25, specifically so a
+    later consumer of this state can tell "this is the list currently on
+    screen" apart from "this is some earlier, already-superseded list"
+    if this state is ever read from somewhere other than one single
+    locked turn. Belt-and-suspenders today: router.py's
+    session_lock() already serialises an entire turn end to end (see
+    that lock's own docstring), so there is no live race this actually
+    closes yet -- but it costs one integer to have ready before it's
+    needed, rather than retrofitting it once something new (a
+    background check-in process, say) reads this state outside that
+    lock."""
+    generation = (_store.get(session_id, _LAST_PRESENTED_PRODUCTS_GENERATION_KEY) or 0) + 1
+    items = [
+        {"position": position, "product_name": name, "category": variants[0].get("category")}
+        for position, (name, variants) in enumerate(groups, start=1)
+    ]
+    _store.set(session_id, _LAST_PRESENTED_PRODUCTS_GENERATION_KEY, generation)
+    _store.set(session_id, _LAST_PRESENTED_PRODUCTS_KEY, {"generation": generation, "items": items})
+
+
+def get_last_presented_products(session_id: str) -> dict | None:
+    return _store.get(session_id, _LAST_PRESENTED_PRODUCTS_KEY)
+
+
 def clear_order_state(session_id: str) -> None:
     """Clears the remembered order-relevant slots and last_priced_product.
 
