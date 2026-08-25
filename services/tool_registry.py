@@ -1,7 +1,7 @@
 from services.delivery_tool import get_delivery_information
 from services.order_tool import cancel_order, confirm_order, get_order_status, propose_order
 from services.policy_tool import answer_policy_question
-from services.product_tool import get_product_price, list_karat_options
+from services.product_tool import get_product_price, get_product_weight, list_karat_options
 from services.quote_service import generate_quote
 from services.recommendation_service import recommend_products
 
@@ -11,6 +11,7 @@ TOOLS = {
     # dict shape this registry/response_formatter.py expect -- see that
     # function's docstring in product_tool.py.
     "get_product_karat_options": list_karat_options,
+    "get_product_weight": get_product_weight,
     "get_delivery_information": get_delivery_information,
     "generate_quote": generate_quote,
     "recommend_products": recommend_products,

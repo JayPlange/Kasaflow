@@ -358,6 +358,63 @@ def test_list_karat_options_returns_empty_karat_options_for_no_match(monkeypatch
 
 
 # ---------------------------------------------------------------------
+# get_product_weight -- reads weight only from the resolved catalogue
+# product name (Webb, 2026-08-25: never inferred from the customer's
+# own raw text), same deterministic-lookup shape as get_product_price().
+# ---------------------------------------------------------------------
+
+def test_get_product_weight_extracts_weight_from_the_canonical_product_name(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_variant_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_weight("Set Multi Stone Golf Ring, 7g")
+
+    assert result == {"product": "Set Multi Stone Golf Ring, 7g", "weight": "7g"}
+
+
+def test_get_product_weight_returns_none_weight_for_a_real_product_with_no_weight_in_its_name(monkeypatch, tmp_path):
+    # "Gye Nyame White Necklace" (this fixture's name, no weight suffix)
+    # is a real, matched catalogue product -- weight genuinely isn't
+    # parseable from it, which is a different, honest situation from the
+    # product not existing at all (see the no-match test below).
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    result = product_tool.get_product_weight("Gye Nyame White Necklace")
+
+    assert result == {"product": "Gye Nyame White Necklace", "weight": None}
+
+
+def test_get_product_weight_returns_none_for_no_match_at_all(monkeypatch, tmp_path):
+    fake_file = tmp_path / "products.json"
+    fake_file.write_text(json.dumps(_necklace_catalogue()))
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(fake_file))
+
+    # Act / Assert: bare None (not a dict), same convention as
+    # get_product_price() -- response_formatter.py's existing "couldn't
+    # find that one" no-match message already handles this.
+    assert product_tool.get_product_weight("Completely Unknown Product") is None
+
+
+def test_get_product_weight_returns_none_when_file_missing(monkeypatch, tmp_path):
+    missing_file = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(product_tool, "settings", _settings_with_products_path(missing_file))
+
+    assert product_tool.get_product_weight("Anything") is None
+
+
+def test_get_product_weight_does_not_infer_from_a_decimal_gram_value():
+    # A sanity check on the regex itself, not the file lookup -- confirms
+    # it also handles a non-integer weight cleanly (real catalogue
+    # weights are all whole grams, but nothing about the regex assumes
+    # that).
+    assert product_tool._extract_weight("Some Ring, 7.5g") == "7.5g"
+    assert product_tool._extract_weight("Custom Butterfly Gold Ring") is None
+
+
+# ---------------------------------------------------------------------
 # get_product_price_by_id -- order_tool.propose_order()'s
 # correction-recovery fallback, 2026-08-21 (Webb, real
 # OpenAI-backed /demo run: a correction's restated product_name dropped

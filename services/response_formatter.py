@@ -351,6 +351,17 @@ def format_for_customer(result: dict | None) -> str:
         sub_lines = "\n".join(f"- {v['material']}: *GH₵{v['price']:,.2f}*" for v in variants)
         return f"The *{result['product']}* comes in:\n{sub_lines}\n\nWhich karat would you like?"
 
+    if "weight" in result:
+        # product_tool.get_product_weight()'s shape -- "how heavy is
+        # it"/"how many grams" (llm.py's tool 11), distinct from a price
+        # question. weight is None (not the key's absence) for the small
+        # handful of real catalogue products with no parseable weight in
+        # their name -- say so honestly rather than a generic no-match
+        # message, since the product itself WAS found.
+        if result["weight"] is None:
+            return f"I don't have the weight on file for the *{result['product']}*, sorry."
+        return f"The *{result['product']}* weighs {result['weight']}."
+
     if "recommendations" in result:
         items = result["recommendations"]
         if not items:

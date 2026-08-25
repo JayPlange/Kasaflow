@@ -1102,6 +1102,55 @@ def test_route_customer_does_not_set_last_priced_product_when_karat_options_foun
     set_last_priced_product.assert_not_called()
 
 
+def test_route_customer_sets_last_priced_product_on_successful_weight_lookup(monkeypatch):
+    # Arrange: get_product_weight is a fourth tool that resolves a
+    # specific product -- a follow-up right after a weight answer needs
+    # the same continuation handling as one right after a price quote.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_weight", "arguments": {"product_name": "Ring"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Set Multi Stone Golf Ring, 7g", "weight": "7g"}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("how heavy is it", "session-weight-set")
+
+    # Assert
+    set_last_priced_product.assert_called_once_with("session-weight-set", "Set Multi Stone Golf Ring, 7g")
+
+
+def test_route_customer_sets_last_priced_product_even_when_weight_lookup_finds_no_parseable_weight(monkeypatch):
+    # A product with no weight in its catalogue name was still genuinely
+    # identified -- unlike an empty karat_options list, this is not the
+    # "found nothing" case, and last_priced_product should still be set
+    # so the active-product context carries forward.
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_weight", "arguments": {"product_name": "Custom Butterfly Gold Ring"}}),
+    )
+    monkeypatch.setattr(
+        router,
+        "execute_tool",
+        MagicMock(return_value={"product": "Custom Butterfly Gold Ring", "weight": None}),
+    )
+    set_last_priced_product = MagicMock()
+    monkeypatch.setattr(router, "set_last_priced_product", set_last_priced_product)
+
+    # Act
+    router.route_customer("how heavy is the custom butterfly ring", "session-weight-no-data")
+
+    # Assert
+    set_last_priced_product.assert_called_once_with("session-weight-no-data", "Custom Butterfly Gold Ring")
+
+
 def test_route_customer_clears_last_priced_product_on_a_successful_category_browse(monkeypatch):
     # Arrange: recommend_products succeeding means the topic has genuinely
     # moved on from a single priced item to browsing a category

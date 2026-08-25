@@ -294,3 +294,59 @@ def list_karat_options(product_name: str) -> dict:
     catalogue row unchanged -- nothing about that existing shape moves.
     """
     return {"product": product_name, "karat_options": get_product_karat_options(product_name)}
+
+
+# Matches the trailing weight on a catalogue product name -- "Gye Nyame
+# White Necklace with Earrings, 30g" -> "30g". Checked against every
+# distinct product name in the real catalogue (2026-08-25): 163 of 166
+# match this pattern cleanly; 3 don't (2 have no weight in the name at
+# all, 1 has a bare "10" with the "g" apparently dropped at data-entry
+# time) -- a genuine, minor gap in the source data, not something this
+# regex should try to paper over by guessing.
+_WEIGHT_RE = re.compile(r",\s*([\d.]+)\s*g\s*$", re.IGNORECASE)
+
+
+def _extract_weight(product_name: str) -> str | None:
+    match = _WEIGHT_RE.search(product_name)
+    return f"{match.group(1)}g" if match else None
+
+
+def get_product_weight(product_name: str) -> dict | None:
+    """A product's weight, read only from its own resolved, canonical
+    catalogue name -- never inferred from anything in the customer's raw
+    message (Webb, 2026-08-25: "do not infer weight from arbitrary text
+    in the customer's message... only extract it from the resolved
+    canonical product name"). This is the same principle every other
+    tool in this file already follows: the catalogue is the one
+    authoritative source, never the customer's own wording.
+
+    Returns None (not a dict) when product_name doesn't match anything
+    in the catalogue at all -- same convention as get_product_price(),
+    and picked up by response_formatter.py's existing "couldn't find
+    that one" no-match message, no new handling needed for that case.
+
+    Returns {"product": ..., "weight": None} (a dict, weight explicitly
+    None) when the product IS real but its name carries no parseable
+    weight (see _WEIGHT_RE's docstring above for the 3 real catalogue
+    exceptions) -- a different, honest situation from "couldn't find
+    that one", and response_formatter.py renders it as such rather than
+    inventing a number or collapsing it into the same no-match message.
+
+    Deliberately does not fall back to semantic search the way
+    get_product_price() does: weight is read off the exact name, so a
+    fuzzy match here would risk reporting one product's weight for a
+    different, similarly-named one."""
+    try:
+        with open(settings.products_path, "r") as file:
+            products = json.load(file)
+    except FileNotFoundError:
+        logger.error("Products file not found at %s", settings.products_path)
+        return None
+    except json.JSONDecodeError as e:
+        logger.error("Products file at %s is not valid JSON: %s", settings.products_path, e)
+        return None
+
+    match = next((p for p in products if p["product"] == product_name), None)
+    if match is None:
+        return None
+    return {"product": product_name, "weight": _extract_weight(match["product"])}

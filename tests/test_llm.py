@@ -319,6 +319,25 @@ def test_prompt_tells_the_model_never_to_answer_a_past_order_detail_question_fro
     assert "Call get_order_status and answer from what it actually returns" in prompt
 
 
+# ---------------------------------------------------------------------
+# get_product_weight -- "how heavy is it"/"how many grams" (Webb/GPT
+# 50-turn live test, 2026-08-24: this collapsed into a repeated price
+# answer, same class of gap as the karat-options tool above).
+# ---------------------------------------------------------------------
+
+def test_prompt_includes_get_product_weight_tool_guidance():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "11. get_product_weight" in prompt
+    assert "product_name" in prompt
+
+
+def test_prompt_distinguishes_weight_from_a_price_question():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "how heavy is it" in prompt
+    assert "get_product_weight" in prompt
+    assert "never guess or calculate a weight yourself" in prompt
+
+
 def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypatch):
     # Arrange
     fake_client = MagicMock()
@@ -533,12 +552,13 @@ def test_understand_customer_passes_order_draft_through_to_the_prompt(monkeypatc
 # that need no business tool (see llm.py's tool 11 description). It
 # moved from 8th to 9th when cancel_order was added as tool 8, then from
 # 9th to 10th when get_order_status was added as tool 9, then from 10th
-# to 11th when get_product_karat_options was added as tool 10.
+# to 11th when get_product_karat_options was added as tool 10, then from
+# 11th to 12th when get_product_weight was added as tool 11.
 # ---------------------------------------------------------------------
 
 def test_prompt_includes_converse_tool_guidance():
     prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
-    assert "11. converse" in prompt
+    assert "12. converse" in prompt
     assert "reply" in prompt
     assert "NOT_FOUND" not in prompt  # guardrail language stays out of the prompt itself
 

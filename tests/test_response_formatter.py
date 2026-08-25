@@ -345,6 +345,21 @@ def test_formats_karat_options_with_no_matches_gives_the_same_no_match_message_a
     assert "couldn't find that one" in format_for_customer(result).lower()
 
 
+def test_formats_weight_shape():
+    result = {"product": "Set Multi Stone Golf Ring, 7g", "weight": "7g"}
+    assert format_for_customer(result) == "The *Set Multi Stone Golf Ring, 7g* weighs 7g."
+
+
+def test_formats_weight_shape_honestly_when_no_weight_is_on_file():
+    # A real, matched product with nothing parseable in its name -- says
+    # so honestly rather than inventing a number or falling back to the
+    # generic no-match message (the product WAS found).
+    result = {"product": "Custom Butterfly Gold Ring", "weight": None}
+    formatted = format_for_customer(result)
+    assert "don't have the weight on file" in formatted
+    assert "Custom Butterfly Gold Ring" in formatted
+
+
 def test_formats_identified_product_shows_every_karat_price():
     # photo_match_tool.py's confident-match shape -- unlike the
     # recommendations list (which collapses to a price range above 3

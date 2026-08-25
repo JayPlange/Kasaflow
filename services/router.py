@@ -76,7 +76,11 @@ _PENDING_INTENT_TOOLS = {"get_product_price", "generate_quote"}
 # same shape as the other two), and a bare karat-only follow-up right
 # after seeing the options list ("okay what about 12") needs the same
 # continuation handling as a follow-up right after a price quote.
-_PRICING_TOOLS = {"get_product_price", "generate_quote", "get_product_karat_options"}
+# get_product_weight() joins for the identical reason -- "how heavy is
+# it" resolves to one specific product too (product_tool.
+# get_product_weight()'s "product" key), and a follow-up right after a
+# weight answer should get the same active-product continuation.
+_PRICING_TOOLS = {"get_product_price", "generate_quote", "get_product_karat_options", "get_product_weight"}
 
 # A genuine category browse means the topic has moved on from one
 # specific priced item -- see memory.set_last_priced_product()'s
