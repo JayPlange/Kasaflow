@@ -483,6 +483,133 @@ def test_product_switch_preserves_delivery_address_already_given(monkeypatch):
     assert proposal["delivery_option"] == "accra_rider"
 
 
+def test_active_product_survives_two_consecutive_compound_corrections_with_no_product_named(monkeypatch):
+    # Repro for audit item #7 (Webb/GPT 50-turn live test, 2026-08-24):
+    # the transcript showed "I'll take 3, 14k, deliver to Osu, Accra"
+    # (naming no product) resolving to "Minimal White Stone Gold Ring,
+    # 1g" -- a DIFFERENT, much-earlier-discussed product -- instead of
+    # "Big White Crown Stone Gold Ring, 14g", the one actually active
+    # two turns prior. This reproduces the exact shape of that sequence
+    # (establish a product, then TWO consecutive compound corrections in
+    # a row that each restate karat/quantity/address but never the
+    # product name) against the real fill_missing_context()/
+    # remember_context() code, with a well-behaved LLM that correctly
+    # returns "unknown" for product_name whenever the message doesn't
+    # state one -- exactly what the prompt instructs (llm.py: "if a tool
+    # needs product_name... and you genuinely cannot determine it...
+    # set that argument to the literal string unknown").
+    #
+    # This passing demonstrates the memory layer (one remembered
+    # product_name slot, overwritten only when a call explicitly names a
+    # DIFFERENT product -- see _names_a_different_product()) correctly
+    # preserves identity across repeated compound corrections. It does
+    # NOT prove the live failure never happened -- if the real model's
+    # turn 3 extraction explicitly returned product_name "Minimal White
+    # Stone Gold Ring, 1g" instead of "unknown" (an extraction slip, not
+    # a state bug), remember_context() would have no way to know that's
+    # wrong: an explicit product name is exactly what a genuine product
+    # switch looks like from this layer's point of view, and this
+    # codebase's whole design is to trust an explicit LLM value over
+    # silently second-guessing it. See test immediately below this one,
+    # which demonstrates that second case directly. The real trace's
+    # llm_structured_output for that turn is the only way to know for
+    # certain which of the two actually happened live.
+    # propose_order checks material, then quantity, then address, THEN
+    # calls get_product_price last (see that function's own docstring on
+    # why the checks are ordered this way) -- turn 1 below states a karat
+    # but not a quantity, so it returns "How many would you like?" before
+    # ever reaching the price lookup. Only turns 2 and 3 (both fully
+    # specified) actually call get_product_price, so this list has two
+    # entries, not three.
+    monkeypatch.setattr(order_tool, "get_product_price", MagicMock(side_effect=[
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "18k", "price": 24066.0},
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "14k", "price": 20857.2},
+    ]))
+    _mock_woocommerce(monkeypatch, order_id=9008)
+    _mock_understand_customer(
+        monkeypatch,
+        # 1: establish the product, with karat and address stated up front.
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Big White Crown Stone Gold Ring, 14g", "material": "12k",
+            "quantity": "unknown", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider"}},
+        # 2: first compound correction -- karat, quantity, and address all
+        # restated in one message, but NOT the product name. A
+        # well-behaved extraction returns "unknown" here, same as the
+        # existing product-switch tests above already model.
+        {"tool": "propose_order", "arguments": {
+            "product_name": "unknown", "material": "18k", "quantity": 2,
+            "delivery_address": "East Legon", "delivery_option": "unknown"}},
+        # 3: a SECOND consecutive compound correction, same shape --
+        # this is the exact turn the live transcript showed resolving to
+        # the wrong product.
+        {"tool": "propose_order", "arguments": {
+            "product_name": "unknown", "material": "14k", "quantity": 3,
+            "delivery_address": "Osu, Accra", "delivery_option": "unknown"}},
+    )
+    session_id = "golden-product-survives-two-compound-corrections"
+
+    r1 = _send("I want one Big White Crown Stone Gold Ring, 14g in 12k, send it to Kumasi", session_id)
+    assert r1["error"] == "How many would you like?"
+
+    r2 = _send("give me 2 in 18k and send them to East Legon", session_id)
+    assert r2["proposal"]["product"] == "Big White Crown Stone Gold Ring, 14g"
+    assert order_tool.get_pending_order_summary(session_id)["product"] == "Big White Crown Stone Gold Ring, 14g"
+
+    r3 = _send("I'll take 3, 14k, deliver to Osu, Accra", session_id)
+    assert "Minimal White Stone" not in str(r3)
+    assert r3["proposal"]["product"] == "Big White Crown Stone Gold Ring, 14g"
+    assert r3["proposal"]["material"] == "14k"
+    assert r3["proposal"]["quantity"] == 3
+    assert order_tool.get_pending_order_summary(session_id)["product"] == "Big White Crown Stone Gold Ring, 14g"
+
+
+def test_an_explicit_wrong_product_name_from_the_model_overrides_memory_and_nothing_here_can_prevent_it(monkeypatch):
+    # Companion to the test above -- demonstrates the OTHER branch of
+    # the same diagnostic. If the model's own extraction explicitly
+    # names a different product (rather than returning "unknown"), this
+    # layer treats it exactly like a genuine, deliberate product switch
+    # -- the same as any customer typing "actually I'll take the X
+    # instead" would produce. There is no way for fill_missing_context()/
+    # remember_context() to distinguish "the model hallucinated this
+    # name from confused conversation history" from "the customer
+    # genuinely said this" -- an explicit product_name IS the system's
+    # only signal for a real switch, by design (see
+    # _names_a_different_product()'s docstring). This is not a state
+    # bug to fix here; if the live transcript's turn 3 looked like this
+    # instead of the "unknown" case above, the fix belongs in llm.py's
+    # extraction prompt, not memory.py.
+    # Same ordering note as the test above -- turn 1 states a karat but
+    # not a quantity, so it never reaches get_product_price. Only turn 2
+    # (fully specified) does.
+    monkeypatch.setattr(order_tool, "get_product_price", MagicMock(side_effect=[
+        {"id": 6810, "product": "Minimal White Stone Gold Ring, 1g", "material": "14k", "price": 17877.6},
+    ]))
+    _mock_woocommerce(monkeypatch, order_id=9009)
+    _mock_understand_customer(
+        monkeypatch,
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Big White Crown Stone Gold Ring, 14g", "material": "12k",
+            "quantity": "unknown", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider"}},
+        # A misbehaving extraction: explicitly restates a DIFFERENT,
+        # earlier-discussed product instead of "unknown", even though
+        # the customer's own message names no product at all.
+        {"tool": "propose_order", "arguments": {
+            "product_name": "Minimal White Stone Gold Ring, 1g", "material": "14k", "quantity": 3,
+            "delivery_address": "Osu, Accra", "delivery_option": "unknown"}},
+    )
+    session_id = "golden-explicit-wrong-product-cannot-be-caught-here"
+
+    r1 = _send("I want one Big White Crown Stone Gold Ring, 14g in 12k, send it to Kumasi", session_id)
+    assert r1["error"] == "How many would you like?"
+
+    r2 = _send("I'll take 3, 14k, deliver to Osu, Accra", session_id)
+    # Exactly the live transcript's wrong outcome -- reproduced here to
+    # prove it's a direct, unavoidable consequence of what the model
+    # returned, not something this layer's state handling could have
+    # caught or should be changed to catch.
+    assert r2["proposal"]["product"] == "Minimal White Stone Gold Ring, 1g"
+
+
 def test_active_product_never_resurrects_after_an_explicit_product_switch(monkeypatch):
     # Named, permanent regression test for the exact failure pattern
     # Webb traced live, 2026-08-21: Product A is started, the customer
