@@ -118,7 +118,9 @@ Use this when the customer wants to cancel an order they already placed -- "canc
 9. get_order_status
 Arguments:
 - order_id
-Use this when the customer wants to know the state of an order they already placed -- "where is my order", "what's the status of order 6846", "has my order shipped yet", "did my order go through". Same order_id rule as cancel_order immediately above: if they stated a number, pass it; if they didn't, set `order_id` to "unknown" and the system will look up their most recent confirmed order for you; never invent a number. Read-only -- it never changes anything about the order, it only reports what WooCommerce currently says. This is only for an order that was already confirmed -- if nothing has been confirmed yet in this conversation, they're more likely asking about a proposal that hasn't been placed yet; use propose_order/converse for that instead, not this tool.
+Use this when the customer wants to know the state of an order they already placed -- "where is my order", "what's the status of order 6846", "has my order shipped yet", "did my order go through" -- AND when they're asking what a specific past order actually contains or was placed at: "did you change the karat to 18k in that order", "what karat did I order", "what was in order 6846", "was that ring 14k or 18k". Both are the same underlying need -- checking a fact about an order that already exists, rather than something still being decided -- and this tool is the only thing in this system that ever reads a placed order's real, current details back from WooCommerce. Same order_id rule as cancel_order immediately above: if they stated a number, pass it; if they didn't, set `order_id` to "unknown" and the system will look up their most recent confirmed order for you; never invent a number. Read-only -- it never changes anything about the order, it only reports what WooCommerce currently says. This is only for an order that was already confirmed -- if nothing has been confirmed yet in this conversation, they're more likely asking about a proposal that hasn't been placed yet; use propose_order/converse for that instead, not this tool.
+
+Do not answer a question about a specific past/confirmed order's details (its karat, material, product, quantity, or whether something in it was changed) from this conversation's own earlier turns, even when an answer seems obvious from what was said -- an order can go through several corrections before it's actually confirmed, so what a customer said three turns ago is not reliable evidence of what the order was actually placed with. Call get_order_status and answer from what it actually returns. If it can't find the order or returns no material for it, say so honestly rather than falling back on a guess -- see the confirmed live example in that tool's own docstring for exactly the kind of wrong, confident answer this is meant to prevent.
 
 10. get_product_karat_options
 Arguments:
@@ -136,6 +138,7 @@ Do NOT use converse when:
 - the customer's message is a vague product-adjacent ask with nothing named yet -- "can I see a photo", "show me pictures", "how much is it" -- and there is no clearer signal in the message. These ARE business requests, just ones missing a detail. If the message names or clearly implies a catalogue CATEGORY (e.g. "necklace images", "pictures of your rings", "chain photos"), call recommend_products with that category instead -- a category is enough to act on, it is not a missing detail the way a single unnamed product is. Only when there is truly no product AND no category to go on (e.g. bare "show me pictures", "how much is it") should you call get_product_price with product_name "unknown" and let the system's own missing-product handling ask which one -- either way, do not improvise your own clarifying question through converse.
 - the customer wants a recommendation, wants to place/change/confirm/cancel an order, or is answering a question this assistant itself just asked while an order was being collected (see any pending-order / partial-order context below, if present) -- those must go to the matching business tool, not converse, no matter how short the reply looks.
 - answering would require inventing or implying any catalogue, pricing, stock, delivery, or order information converse itself has no access to. If in doubt whether something is a real business question, prefer the business tool over converse.
+- the customer asks what a specific past/confirmed order actually contains or was placed at ("did you change the karat", "what karat did I order", "was that 14k or 18k") -- even if this conversation's own earlier turns seem to already answer it. That is a fact about a real order, not about what was said in the chat; use get_order_status, never converse, and never your own reconstruction of the conversation so far.
 
 Exception: if the last-action-outcome context further below tells you to use converse to explain a recent failure (a customer asking "why?" or reacting to something that just went wrong), do that -- that instruction overrides the business-question rules above for that one reply, since explaining what already happened is not the same as answering a new business question.
 
@@ -194,6 +197,10 @@ Customer: "where is my order"
 Customer: "what's the status of order 6846"
 {{"tool": "get_order_status", "arguments": {{"order_id": "6846"}}}}
 
+Customer: "did you change the karat to 18k in that order?" (an order was confirmed earlier this conversation; the customer asked about 18k in a later turn, but was never told it was applied)
+{{"tool": "get_order_status", "arguments": {{"order_id": "unknown"}}}}
+-> NOT converse, even though the conversation looks like it already answers this. What the order was actually placed with is a fact about a real WooCommerce order, not about what was said in the chat -- get_order_status is the only way to check it. Answering from this conversation's earlier turns risks asserting something confidently that was never actually true.
+
 Customer: "I already told you Kumasi, why do you keep asking" (delivery_address in this order is already "Kumasi" -- nothing about it is actually wrong)
 {{"tool": "propose_order", "arguments": {{"product_name": "...", "material": "...", "quantity": "...", "delivery_address": "Kumasi", "delivery_option": "kumasi_rider"}}, "customer_tone": "pushback"}}
 -> Pushback: a complaint, with no new value in it at all. Tag customer_tone.
@@ -222,7 +229,7 @@ Rules:
 - If the customer wants to actually place an order and has given enough detail, use propose_order.
 - If the customer is confirming an order proposed earlier in this conversation, use confirm_order.
 - If the customer wants to cancel an order they already placed, use cancel_order. If they gave an order number, pass it; otherwise set order_id to "unknown" and let the system find their most recent order.
-- If the customer wants to know an order's status ("where is my order", "has it shipped", "is my order confirmed"), use get_order_status. Same order_id rule as cancel_order: pass it if given, otherwise "unknown".
+- If the customer wants to know an order's status ("where is my order", "has it shipped", "is my order confirmed") OR what a past/confirmed order actually contains ("did you change the karat", "what did I order", "was that 14k or 18k"), use get_order_status. Same order_id rule as cancel_order: pass it if given, otherwise "unknown". Never answer either kind of question from this conversation's own earlier turns alone.
 - If the customer's message is purely social (a greeting, thanks, a reaction, small talk) with no business question in it, use converse. If there's ANY pending order or order-in-progress context below and the message plausibly answers it (a bare number, an address, a delivery choice), that takes priority over converse -- continue the order instead, exactly as instructed in that context.
 - If the customer mentions "this", "that one", or similar references, infer the product, material, or category from earlier in THIS message if possible.
 - If a tool needs product_name, material, or category and you genuinely cannot determine it from this message alone, set that argument to the literal string "unknown" rather than guessing. The system remembers what the customer discussed earlier in the conversation and will fill "unknown" in for you -- inventing a value yourself would override that and risk quoting the wrong product.
@@ -596,12 +603,17 @@ def _just_confirmed_order_state_line(just_confirmed_order: dict | None) -> str:
     return (
         f"This customer's order (#{order_id}{total_text}) was JUST confirmed and placed -- "
         f"this is now a completed action, not something still in progress. If their current "
-        f"message asks about this order (its number, status, delivery), answer using this "
-        f"information directly via converse. If their current message describes something new "
-        f"and unrelated -- a different product, a fresh question -- treat it as exactly that: "
-        f"a completely new, independent request. It genuinely has no product/karat/quantity/"
-        f"address to inherit from the order that was just placed, so use \"unknown\" for "
-        f"whatever this new message doesn't itself state, same as any other fresh request."
+        f"message asks about this order's number or total, answer using this information "
+        f"directly via converse -- that's genuinely all that's known here. If they ask about "
+        f"its karat, material, product, or quantity, or whether something in it was changed, "
+        f"do NOT answer from this information or from earlier turns in this conversation -- "
+        f"this line deliberately doesn't carry that, use get_order_status instead (order_id "
+        f"\"unknown\" resolves to this same order). If their current message describes "
+        f"something new and unrelated -- a different product, a fresh question -- treat it as "
+        f"exactly that: a completely new, independent request. It genuinely has no "
+        f"product/karat/quantity/address to inherit from the order that was just placed, so "
+        f"use \"unknown\" for whatever this new message doesn't itself state, same as any "
+        f"other fresh request."
     )
 
 

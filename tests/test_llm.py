@@ -281,6 +281,44 @@ def test_prompt_describes_a_just_confirmed_order():
     assert "2,400.00" in prompt
 
 
+def test_prompt_tells_the_model_not_to_answer_karat_questions_about_a_just_confirmed_order_from_memory():
+    # Confirmed live, 2026-08-24/25 (Webb/GPT 50-turn test): asked
+    # several turns after confirming a 14k order whether the karat had
+    # been changed to 18k, the model answered "no, placed with 18k" --
+    # wrong. just_confirmed_order only ever carries order_id/total (see
+    # memory.set_just_confirmed_order()), never karat/material, so this
+    # line must say so explicitly rather than leave "answer using this
+    # information" open to a model generalising past what's actually
+    # there.
+    confirmation = {"order_id": 777, "total": 2400.0}
+    prompt = llm._build_prompt(
+        "did you change the karat to 18k", pending_order=None, order_draft=None,
+        just_confirmed_order=confirmation,
+    )
+    assert "do NOT answer from this information or from earlier turns" in prompt
+    assert "use get_order_status instead" in prompt
+
+
+# ---------------------------------------------------------------------
+# get_order_status -- widened, 2026-08-25, to cover a question about
+# what a past/confirmed order actually contains (karat, material,
+# whether something was changed), not just its shipping/status. See
+# order_tool.get_order_status()'s docstring for the live false-"18k"
+# answer this closes, now that the tool itself can ground a material.
+# ---------------------------------------------------------------------
+
+def test_prompt_routes_an_order_content_question_to_get_order_status_not_converse():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "did you change the karat to 18k in that order" in prompt
+    assert "what was in order 6846" in prompt
+
+
+def test_prompt_tells_the_model_never_to_answer_a_past_order_detail_question_from_conversation_history():
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "not reliable evidence of what the order was actually placed with" in prompt
+    assert "Call get_order_status and answer from what it actually returns" in prompt
+
+
 def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypatch):
     # Arrange
     fake_client = MagicMock()

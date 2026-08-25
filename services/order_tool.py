@@ -706,7 +706,10 @@ _ORDER_STATUS_LABELS = {
 
 
 def get_order_status(session_id: str, order_id=None) -> dict:
-    """Looks up a customer's order status -- "where is my order?".
+    """Looks up a customer's order status -- "where is my order?" -- and
+    now also its karat/material, for a question about what a past order
+    actually contains ("did you change the karat to 18k in that order?",
+    "what karat did I order").
 
     Same order-resolution pattern as cancel_order() above, deliberately:
     prefers an order number the customer stated explicitly; falls back
@@ -724,7 +727,25 @@ def get_order_status(session_id: str, order_id=None) -> dict:
     _ORDER_STATUS_LABELS translates WooCommerce's own status strings
     into something a customer can read; an unrecognised status (a custom
     store status this map doesn't know about) falls back to the raw
-    WooCommerce string rather than hiding it."""
+    WooCommerce string rather than hiding it.
+
+    Confirmed live, 2026-08-24/25 (Webb/GPT 50-turn test): asked, several
+    turns after confirming a 14k order, "did you change the karat to 18k
+    in that order?", the model answered "No, your order was placed with
+    18k gold as you specified" -- flatly wrong, and with nothing in this
+    codebase that ever gave it a real karat to answer from; every prior
+    tool result (order_confirmation, this function's own old shape,
+    just_confirmed_order) carried order_id/total/delivery only, never
+    karat. The model wasn't malfunctioning, it was answering a question
+    it had genuinely never been given the means to answer correctly.
+    material below (from _create_woocommerce_order()'s own
+    kasaflow_material meta_data, written at order-creation time -- see
+    that function) closes that: baked into item_summary so a question
+    like this finally has a real fact to be checked against, instead of
+    the model inferring or guessing one from earlier conversation turns.
+    See llm.py's widened get_order_status routing + guardrail for the
+    other half of this fix -- grounding the data is only useful once the
+    right questions actually reach this tool."""
     resolved_id = _resolve_order_id(session_id, order_id)
     if resolved_id is None:
         return {
@@ -748,8 +769,10 @@ def get_order_status(session_id: str, order_id=None) -> dict:
         name = first.get("name")
         qty = first.get("quantity")
         if name and qty:
+            material = _read_meta(order, "kasaflow_material")
+            material_prefix = f"{material} " if material else ""
             extra = len(line_items) - 1
-            item_summary = f"{qty} x {name}"
+            item_summary = f"{qty} x {material_prefix}{name}"
             if extra > 0:
                 item_summary += f" (+{extra} more item{'s' if extra != 1 else ''})"
 
@@ -762,6 +785,22 @@ def get_order_status(session_id: str, order_id=None) -> dict:
             "total": order.get("total"),
         }
     }
+
+
+def _read_meta(order: dict, key: str) -> str | None:
+    """Reads back one of our own meta_data entries (see
+    _create_woocommerce_order()) from a WooCommerce order response.
+    WooCommerce echoes meta_data as a list of {"key": ..., "value": ...}
+    dicts, in whatever order it likes -- not a dict keyed by name -- so
+    this is a linear scan, not a lookup. Returns None (not "") for a
+    genuinely absent or blank value, so callers can tell "we don't know"
+    apart from "known to be empty" the same way every other tool in this
+    codebase distinguishes the two."""
+    for entry in order.get("meta_data") or []:
+        if entry.get("key") == key:
+            value = entry.get("value")
+            return value or None
+    return None
 
 
 def _resolve_order_id(session_id: str, order_id) -> int | None:
@@ -977,6 +1016,17 @@ def _create_woocommerce_order(pending: dict) -> dict:
         "meta_data": [
             {"key": "kasaflow_order_token", "value": pending["token"]},
             {"key": "kasaflow_delivery_option", "value": pending.get("delivery_option") or ""},
+            # Self-authored, read back by get_order_status() below --
+            # deliberately NOT relying on WooCommerce's own variation
+            # attributes propagating onto the order line item, which
+            # this codebase has no live store to confirm the exact key
+            # naming of (see _find_existing_order_by_token()'s docstring
+            # for the same "not yet verified against a real store"
+            # caveat on a different WooCommerce assumption). Writing our
+            # own material key and reading that exact same key back
+            # removes the guesswork entirely -- see get_order_status()'s
+            # docstring for the live gap this closes.
+            {"key": "kasaflow_material", "value": pending.get("material") or ""},
         ],
     }
 

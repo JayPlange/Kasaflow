@@ -979,6 +979,10 @@ def test_confirm_order_creates_order_and_clears_pending_state(monkeypatch, fresh
     # one-off notification -- so it's still visible if that fails
     assert "rider delivery within Accra" in kwargs["json"]["customer_note"]
     assert {"key": "kasaflow_delivery_option", "value": "accra_rider"} in kwargs["json"]["meta_data"]
+    # Self-authored, read back by get_order_status() -- see that
+    # function's docstring for the false "placed with 18k" answer this
+    # closes.
+    assert {"key": "kasaflow_material", "value": "18k"} in kwargs["json"]["meta_data"]
 
     # Assert: customer-facing result and session state
     assert result["order_confirmation"]["order_id"] == 555
@@ -1755,3 +1759,64 @@ def test_get_order_status_summarises_multiple_line_items(monkeypatch, fresh_sess
 
     # Assert
     assert result["order_status"]["item_summary"] == "1 x Custom Leaf White Gold Necklace, 20g (+1 more item)"
+
+
+def test_get_order_status_includes_material_from_kasaflow_meta_data(monkeypatch, fresh_session_store):
+    # Confirmed live, 2026-08-24/25 (Webb/GPT 50-turn test): asked
+    # several turns after confirming a 14k order whether the karat had
+    # been changed to 18k, the model answered "no, placed with 18k" --
+    # wrong, and with nothing anywhere in this codebase that had ever
+    # given it a real karat to check against. This is the fix: the
+    # material _create_woocommerce_order() writes into meta_data at
+    # order-creation time, read back here.
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(
+        monkeypatch, status="on-hold", order_id=6846,
+        extra={
+            "line_items": [{"name": "Minimal White Stone Gold Ring, 1g", "quantity": 1}],
+            "meta_data": [{"key": "kasaflow_material", "value": "14k"}],
+        },
+    )
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert: the real, self-authored fact, not a guess
+    assert result["order_status"]["item_summary"] == "1 x 14k Minimal White Stone Gold Ring, 1g"
+
+
+def test_get_order_status_omits_material_prefix_when_no_kasaflow_meta_data_present(monkeypatch, fresh_session_store):
+    # An order placed before this fix shipped (or missing the meta_data
+    # for any other reason) has no material to report -- must not
+    # invent one or crash, just fall back to the old, unprefixed shape.
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(
+        monkeypatch, status="on-hold", order_id=6846,
+        extra={"line_items": [{"name": "Custom Leaf White Gold Necklace, 20g", "quantity": 1}]},
+    )
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert
+    assert result["order_status"]["item_summary"] == "1 x Custom Leaf White Gold Necklace, 20g"
+
+
+def test_get_order_status_ignores_a_blank_kasaflow_material_value(monkeypatch, fresh_session_store):
+    # _create_woocommerce_order() writes "" (not the key's absence) when
+    # propose_order() never resolved a material -- must be treated the
+    # same as genuinely absent, never rendered as a blank prefix.
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(
+        monkeypatch, status="on-hold", order_id=6846,
+        extra={
+            "line_items": [{"name": "Custom Leaf White Gold Necklace, 20g", "quantity": 1}],
+            "meta_data": [{"key": "kasaflow_material", "value": ""}],
+        },
+    )
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert
+    assert result["order_status"]["item_summary"] == "1 x Custom Leaf White Gold Necklace, 20g"
