@@ -102,3 +102,130 @@ def test_build_catalogue_captures_variation_id_and_parent_id(monkeypatch):
     assert catalogue[0]["id"] == 200
     assert catalogue[0]["variation_id"] == 301
     assert catalogue[1]["variation_id"] == 302
+
+
+# ---------------------------------------------------------------------
+# material -- task #126, confirmed live 2026-08-30 (Webb): a real
+# WooCommerce variations fetch for product id 6417 ("Minimal White Stone
+# Gold Ring, 1g") showed a "Karat" attribute (bare option "18", not
+# "18k") alongside a genuinely separate "Ring Sizes" attribute. Joining
+# both indiscriminately (the old behaviour) produced material="18 /
+# Women US 9.5 (19.4 mm)" instead of "18k".
+# ---------------------------------------------------------------------
+
+def test_build_catalogue_drops_ring_size_and_normalises_bare_karat(monkeypatch):
+    # Exact shape confirmed against the real store, not guessed.
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "_fetch_all_products",
+        lambda: [
+            {
+                "id": 6417,
+                "name": "Minimal White Stone Gold Ring, 1g",
+                "type": "variable",
+                "variations": [6452],
+                "categories": [{"name": "Rings"}],
+                "stock_status": "instock",
+                "permalink": "https://adomdejeweller.com/product/minimal-white-stone-gold-ring-1g",
+                "images": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "_fetch_variations",
+        lambda product_id: [
+            {
+                "id": 6452,
+                "price": "20628",
+                "stock_status": "instock",
+                "attributes": [
+                    {"id": 8, "name": "Karat", "slug": "pa_karat", "option": "18"},
+                    {"id": 6, "name": "Ring Sizes", "slug": "pa_ring-sizes", "option": "Women US 9.5 (19.4 mm)"},
+                ],
+            },
+        ],
+    )
+
+    catalogue = woocommerce_sync.build_catalogue()
+
+    assert len(catalogue) == 1
+    assert catalogue[0]["material"] == "18k"
+
+
+def test_build_catalogue_still_joins_a_genuinely_different_second_attribute(monkeypatch):
+    # The necklace case this join was originally built for -- a real
+    # SECOND distinguishing attribute (not a size) must still be kept,
+    # not swept up by the new size-only exclusion.
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "_fetch_all_products",
+        lambda: [
+            {
+                "id": 500,
+                "name": "Custom Necklace",
+                "type": "variable",
+                "variations": [601],
+                "categories": [{"name": "Necklaces"}],
+                "stock_status": "instock",
+                "permalink": "https://adomdejeweller.com/product/custom-necklace",
+                "images": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "_fetch_variations",
+        lambda product_id: [
+            {
+                "id": 601,
+                "price": "45000",
+                "stock_status": "instock",
+                "attributes": [
+                    {"id": 1, "name": "Karat", "slug": "pa_karat", "option": "18k"},
+                    {"id": 2, "name": "Silver Alloy Option", "slug": "pa_alloy", "option": "Sterling"},
+                ],
+            },
+        ],
+    )
+
+    catalogue = woocommerce_sync.build_catalogue()
+
+    assert catalogue[0]["material"] == "18k / Sterling"
+
+
+def test_build_catalogue_leaves_an_already_suffixed_karat_untouched(monkeypatch):
+    # A karat option that already says "18k" (not the bare "18" form)
+    # must not become "18kk" or otherwise get double-normalised.
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "_fetch_all_products",
+        lambda: [
+            {
+                "id": 700,
+                "name": "Simple Ring",
+                "type": "variable",
+                "variations": [701],
+                "categories": [{"name": "Rings"}],
+                "stock_status": "instock",
+                "permalink": "https://adomdejeweller.com/product/simple-ring",
+                "images": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        woocommerce_sync,
+        "_fetch_variations",
+        lambda product_id: [
+            {
+                "id": 701,
+                "price": "1000",
+                "stock_status": "instock",
+                "attributes": [{"id": 8, "name": "Karat", "slug": "pa_karat", "option": "18k"}],
+            },
+        ],
+    )
+
+    catalogue = woocommerce_sync.build_catalogue()
+
+    assert catalogue[0]["material"] == "18k"

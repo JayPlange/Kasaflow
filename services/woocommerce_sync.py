@@ -114,14 +114,61 @@ def _fetch_variations(product_id: int) -> list[dict]:
     return response.json()
 
 
+_SIZE_ATTRIBUTE_NAMES = {"ring sizes", "ring size", "size"}
+
+
 def _variation_label(variation: dict) -> str | None:
     """WooCommerce variations carry their distinguishing attribute (e.g.
     Karat: 18k) in `attributes`, not as a plain string. Join every
     attribute this variation sets so a two-attribute product (Karat +
     Silver Alloy Option, as adomdejeweller.com's necklaces have) doesn't
-    silently collapse to just one of them."""
+    silently collapse to just one of them.
+
+    Two things confirmed against a real WooCommerce variations fetch,
+    2026-08-30 (Webb, live product id 6417, "Minimal White Stone Gold
+    Ring, 1g"), after this exact ring's karat display broke live during
+    a demo (task #126):
+
+    1. This store's ring products carry a SECOND, genuinely different
+       attribute alongside Karat: "Ring Sizes" (real values like "Women
+       US 9.5 (19.4 mm)"). Joining every attribute indiscriminately --
+       correct for the necklace two-attribute case this function was
+       originally built for -- produced material="18 / Women US 9.5
+       (19.4 mm)" for every ring variant. That string then bled into
+       everywhere material is used: the customer-facing karat display,
+       propose_order's stored material, the WooCommerce order's
+       kasaflow_material meta, and get_order_status's "what karat was my
+       order" answer. Ring size isn't a purchase-relevant attribute
+       anywhere in KasaFlow's domain model -- no tool has a size
+       argument, nothing ever asks a customer for one -- so it's
+       dropped here rather than surfaced as if it were a real choice.
+    2. This store's Karat attribute option is the bare number ("18"),
+       not "18k". Every karat value everywhere else in this codebase
+       (get_product_price's exact string match, the karat-mismatch
+       invariant in order_tool.py, every live trace/reply this session)
+       is "18k"/"14k"/"12k". Normalised here, at the one place this gets
+       read from WooCommerce, rather than teaching every consumer to
+       also accept the bare form -- see _KARAT_RE's own comment in
+       product_tool.py, which already had to tolerate the bare form
+       because of this gap.
+
+    Only ever excludes an attribute by NAME (a small, explicit
+    denylist), never guesses from the option's shape -- an unknown
+    future attribute (a genuine second necklace option, say) still gets
+    joined in exactly as before, so this stays a targeted fix for the
+    one confirmed problem, not a rewrite of the whole join."""
     attrs = variation.get("attributes", [])
-    labels = [a["option"] for a in attrs if a.get("option")]
+    labels = []
+    for attr in attrs:
+        option = attr.get("option")
+        if not option:
+            continue
+        name = (attr.get("name") or "").strip().lower()
+        if name in _SIZE_ATTRIBUTE_NAMES:
+            continue
+        if name == "karat" and option.strip().isdigit():
+            option = f"{option.strip()}k"
+        labels.append(option)
     return " / ".join(labels) if labels else None
 
 
