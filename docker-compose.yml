@@ -5,4 +5,19 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    # Bind-mounts the real data/products.json into the container, both
+    # ways -- without this, the Dockerfile's COPY data/ ./data/ bakes a
+    # copy into the image that appuser (the non-root runtime user, see
+    # Dockerfile) can't write to, and even if it could, the write would
+    # only land in the container's throwaway layer, not this repo's
+    # actual file, so it would vanish on the next rebuild. This is what
+    # lets `docker compose exec kasaflow python -m services.woocommerce_
+    # sync` (see that module's own docstring on running it "by hand
+    # after a known price change") actually update the file you'll
+    # commit, instead of failing with a permission error or writing
+    # somewhere that gets thrown away. Confirmed live, 2026-08-30
+    # (Webb): PermissionError: [Errno 13] Permission denied:
+    # '/app/data/products.json' before this was added.
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
