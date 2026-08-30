@@ -8,8 +8,10 @@ the exact bug the old shared-dict version had.
 """
 
 from services.memory import (
+    AWAITING_FIELDS,
     SessionStore,
     fill_missing_context,
+    get_awaiting_field,
     get_last_action_outcome,
     get_last_presented_products,
     get_last_priced_product,
@@ -19,6 +21,7 @@ from services.memory import (
     is_awaiting_confirmation,
     remember_context,
     set_awaiting_confirmation,
+    set_awaiting_field,
     set_last_action_outcome,
     set_last_presented_products,
     set_last_priced_product,
@@ -469,6 +472,40 @@ def test_awaiting_confirmation_can_be_cleared(monkeypatch):
     set_awaiting_confirmation("session-1", False)
 
     assert is_awaiting_confirmation("session-1") is False
+
+
+# ---------------------------------------------------------------------
+# awaiting_field -- P0.4. "product_name" joined the AWAITING_FIELDS set
+# 2026-08-30 (task #60, Webb): before this, propose_order's missing-item
+# error was the one of its five field checks that never tagged
+# awaiting_field at all, so set_awaiting_field() had never been asked to
+# store it -- confirming it doesn't raise (AWAITING_FIELDS was previously
+# a closed set that explicitly excluded it) is the actual regression this
+# guards, not just a round-trip.
+# ---------------------------------------------------------------------
+
+def test_awaiting_fields_includes_product_name():
+    assert "product_name" in AWAITING_FIELDS
+
+
+def test_awaiting_field_product_name_round_trips(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_awaiting_field("session-1", "product_name")
+
+    assert get_awaiting_field("session-1") == "product_name"
+
+
+def test_set_awaiting_field_still_rejects_an_unknown_value(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    try:
+        set_awaiting_field("session-1", "not_a_real_field")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
 
 
 # ---------------------------------------------------------------------

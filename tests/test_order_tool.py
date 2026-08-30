@@ -73,6 +73,28 @@ def _mock_post(monkeypatch, order_id=987, status_code=201):
 # propose_order
 # ---------------------------------------------------------------------
 
+def test_propose_order_tags_awaiting_field_when_no_product_is_named(fresh_session_store):
+    # task #60, 2026-08-30 (Webb): the one field of the five this
+    # function checks (product/material/quantity/delivery_address/
+    # delivery_option) whose missing-detail error didn't tag
+    # awaiting_field -- see memory.AWAITING_FIELDS's comment for why
+    # that left this exact case with no trace anywhere a later turn
+    # could read.
+    result = order_tool.propose_order("unknown", "unknown", "unknown", "unknown", "unknown", "session-1")
+
+    assert result == {
+        "error": "Sure -- which item would you like to order?",
+        "awaiting_field": "product_name",
+    }
+
+
+def test_propose_order_tags_awaiting_field_for_an_empty_product_name(fresh_session_store):
+    # Same branch, the other way a missing product reaches it -- an
+    # empty string rather than the literal sentinel "unknown".
+    result = order_tool.propose_order("", "unknown", "unknown", "unknown", "unknown", "session-1")
+
+    assert result.get("awaiting_field") == "product_name"
+
 def test_propose_order_returns_priced_proposal(monkeypatch):
     # Arrange
     _mock_product_lookup(

@@ -623,12 +623,30 @@ _AWAITING_FIELD_KEY = "awaiting_field"
 # last action. Deliberately a small, closed set: only the fields
 # propose_order's own missing-detail questions ask for one at a time,
 # plus "confirmation" for the question a full proposal itself poses
-# ("would you like to go ahead?"). Not every gap in an order needs an
-# entry here -- e.g. "which product" has no single deterministic
-# pattern a reply could be checked against the way a bare karat or a
-# bare number does, so it's left to the existing LLM-driven path
-# entirely, same as before this existed.
-AWAITING_FIELDS = ("material", "quantity", "delivery_address", "delivery_option", "confirmation", "delivery_interest")
+# ("would you like to go ahead?").
+#
+# "product_name" joined this set 2026-08-30 (task #60, Webb) for
+# tracking purposes only -- router.py's generic "elif ... 'awaiting_field'
+# in result: set_awaiting_field(...)" already stores whatever propose_order
+# tags, for every field, and product_name's own missing-detail branch
+# started tagging it that same day (see order_tool.propose_order()'s
+# comment at that return) once it turned out to be the ONE of the five
+# fields propose_order checks that left no trace anywhere -- not here,
+# not _PENDING_INTENT_TOOLS (get_product_price/generate_quote only), not
+# order_draft (empty, since nothing else about the order is known yet
+# either at that point). Being a member of this set does NOT mean
+# router._try_resolve_awaiting_field() has a matching deterministic
+# branch for it -- it deliberately does not: "which product" has no
+# single pattern a reply could be checked against the way a bare karat
+# or a bare number does ("the crown ring", "that white one", "the
+# second one" are all valid answers). Add a branch there only if a live
+# test shows the plain LLM path (with this now at least being stored,
+# even though nothing reads it out into the prompt yet) still isn't
+# enough on its own.
+AWAITING_FIELDS = (
+    "material", "quantity", "delivery_address", "delivery_option",
+    "confirmation", "delivery_interest", "product_name",
+)
 
 
 def set_awaiting_field(session_id: str, field: str | None) -> None:

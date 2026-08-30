@@ -149,7 +149,26 @@ def propose_order(
 
     product_stripped = str(product_name).strip() if product_name else ""
     if not product_stripped or product_stripped.lower() == "unknown":
-        return {"error": "Sure -- which item would you like to order?"}
+        # Tagged for the same reason material/quantity/delivery_address/
+        # delivery_option are below (task #60, 2026-08-30): without this,
+        # this was the one field of the five this function checks whose
+        # missing-detail error left no trace anywhere a later turn could
+        # read -- not awaiting_field (this was the only branch that
+        # skipped it), not _PENDING_INTENT_TOOLS (that set only covers
+        # get_product_price/generate_quote), and not order_draft (empty,
+        # since nothing else about this order has been given yet either,
+        # this check running first). A customer who then names the
+        # product on their very next message had nothing telling the
+        # system that reply completes an open order request rather than
+        # starting an unrelated one. Deliberately just the tag for now,
+        # no deterministic fast-path branch in
+        # router._try_resolve_awaiting_field() yet -- unlike a bare
+        # karat or a bare number, a product reference can take too many
+        # shapes ("the crown ring", "that white one", "the second one")
+        # to pattern-match safely. Test live first; only add a resolver
+        # if the plain LLM path still doesn't pick this up (Webb,
+        # 2026-08-30).
+        return {"error": "Sure -- which item would you like to order?", "awaiting_field": "product_name"}
 
     # Clear a stale pending order the moment a genuinely different
     # product is named -- independent of, and earlier than, whatever

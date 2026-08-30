@@ -2107,9 +2107,84 @@ def test_awaiting_field_does_not_survive_an_unrelated_turn_in_between(monkeypatc
     assert router.get_awaiting_field(session_id) is None
     assert understand_customer_mock.call_count == 2
 
-    # A bare "12k" now must go through the LLM (recommend_products, per
-    # the canned mock) rather than being silently resolved as the
-    # karat -- proving the deterministic path did NOT fire now that
-    # awaiting_field has reset.
-    router.route_customer("12k", session_id)
-    assert understand_customer_mock.call_count == 3
+
+# ---------------------------------------------------------------------
+# product_name awaiting_field -- task #60, 2026-08-30 (Webb). propose_order's
+# missing-item error ("Sure -- which item would you like to order?") is now
+# tagged the same way material/quantity/delivery_address/delivery_option
+# already were, so the session at least records that this specific question
+# was just asked. Deliberately no matching branch in
+# _try_resolve_awaiting_field() yet -- see that function's docstring and
+# order_tool.propose_order()'s comment at this exact return for why a
+# product reference isn't pattern-matchable the way a bare karat or a bare
+# number is. These tests lock in the current, deliberately-incomplete state:
+# the tag is stored, but nothing bypasses the LLM for it yet. Whether the
+# LLM path alone is enough once it can see this stored is a live-test
+# question (see order_tool.propose_order()'s comment), not something these
+# mocked-LLM tests can answer either way.
+# ---------------------------------------------------------------------
+
+def test_route_customer_sets_awaiting_field_after_an_unresolved_product_reference(monkeypatch):
+    monkeypatch.setattr(
+        router, "understand_customer",
+        MagicMock(return_value={"tool": "propose_order", "arguments": {
+            "product_name": "unknown", "material": "unknown", "quantity": "unknown",
+            "delivery_address": "unknown", "delivery_option": "unknown",
+        }}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={
+            "error": "Sure -- which item would you like to order?",
+            "awaiting_field": "product_name",
+        }),
+    )
+    session_id = "product-name-awaiting-field-gets-set"
+
+    result = router.route_customer("I'll take that one", session_id)
+
+    assert router.get_awaiting_field(session_id) == "product_name"
+    # Same internal-key stripping every other awaiting_field case gets --
+    # see _execute_single()'s awaiting_field stripping.
+    assert "awaiting_field" not in result
+
+
+@pytest.mark.parametrize("reply", [
+    "Big White Crown Stone Gold Ring, 14g",
+    "the crown ring",
+    "that white one",
+    "the second one",
+    "what's the price of the ring?",
+])
+def test_try_resolve_awaiting_field_never_guesses_at_a_product_reference(reply):
+    # No branch for "product_name" exists in _try_resolve_awaiting_field()
+    # -- deliberately, per Webb's 2026-08-30 instruction: a product
+    # reference can take too many shapes to pattern-match safely, unlike
+    # a bare karat or a bare number. Every one of these -- a full
+    # canonical name, a partial/descriptive reference, an ordinal that
+    # would need last_presented_products to resolve, and a genuinely
+    # unrelated question -- must all fall through to the LLM path
+    # unchanged. This test exists to make a future addition of a
+    # deterministic branch here a deliberate, visible diff, not an
+    # accidental regression of this one.
+    assert router._try_resolve_awaiting_field("product_name", reply) is None
+
+
+def test_route_customer_still_calls_the_llm_after_an_unresolved_product_reference(monkeypatch):
+    # Companion to the bypass tests above (material/delivery_interest):
+    # confirms the *absence* of a bypass for product_name is real, not
+    # just an artifact of _try_resolve_awaiting_field() being untested --
+    # understand_customer must still run for the very next turn.
+    understand_customer_mock = MagicMock(
+        return_value={"tool": "get_product_price", "arguments": {"product_name": "unknown", "material": "unknown"}}
+    )
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(router, "get_awaiting_field", MagicMock(return_value="product_name"))
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"message": "I couldn't find that product.", "product": None}),
+    )
+
+    router.route_customer("Big White Crown Stone Gold Ring, 14g", "no-bypass-product-name-session")
+
+    understand_customer_mock.assert_called_once()
