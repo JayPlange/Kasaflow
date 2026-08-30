@@ -345,6 +345,7 @@ def test_route_customer_passes_pending_order_state_to_understand_customer(monkey
         last_priced_product=None,
         just_confirmed_order=None,
         last_presented_products=None,
+        awaiting_field=None,
     )
 
 
@@ -367,6 +368,7 @@ def test_route_customer_passes_none_when_nothing_pending(monkeypatch):
         last_action_outcome=None,
         last_priced_product=None,
         last_presented_products=None,
+        awaiting_field=None,
     )
 
 
@@ -2188,3 +2190,27 @@ def test_route_customer_still_calls_the_llm_after_an_unresolved_product_referenc
     router.route_customer("Big White Crown Stone Gold Ring, 14g", "no-bypass-product-name-session")
 
     understand_customer_mock.assert_called_once()
+
+
+def test_route_customer_passes_awaiting_field_through_to_understand_customer(monkeypatch):
+    # Follow-up to the two tests above, 2026-08-30 (Webb): tagging
+    # awaiting_field alone (order_tool.py) didn't change live behaviour,
+    # because nothing was passing it from router.py into
+    # understand_customer()'s own arguments -- confirmed by the live
+    # test itself, not assumed. This is the wiring that closes that.
+    understand_customer_mock = MagicMock(
+        return_value={"tool": "propose_order", "arguments": {
+            "product_name": "Big White Crown Stone Gold Ring, 14g", "material": "unknown",
+            "quantity": "unknown", "delivery_address": "unknown", "delivery_option": "unknown",
+        }}
+    )
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(router, "get_awaiting_field", MagicMock(return_value="product_name"))
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"error": "Sure -- which item would you like to order?", "awaiting_field": "product_name"}),
+    )
+
+    router.route_customer("Big White Crown Stone Gold Ring, 14g", "awaiting-field-passthrough-session")
+
+    assert understand_customer_mock.call_args.kwargs["awaiting_field"] == "product_name"

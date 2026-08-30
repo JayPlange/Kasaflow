@@ -852,6 +852,58 @@ def test_understand_customer_passes_pending_intent_through_to_the_prompt(monkeyp
 
 
 # ---------------------------------------------------------------------
+# awaiting_field=product_name -- task #60 follow-up, 2026-08-30 (Webb).
+# Confirmed live: tagging awaiting_field alone (order_tool.py) didn't
+# change behaviour, because nothing threaded it into the prompt. Scoped
+# to ONLY "product_name" -- the other five values this can hold already
+# have their own deterministic fast-path branch in
+# router._try_resolve_awaiting_field() and are deliberately left out of
+# this prompt line for now, see llm._awaiting_field_state_line()'s
+# docstring.
+# ---------------------------------------------------------------------
+
+def test_prompt_omits_awaiting_field_section_when_nothing_awaited():
+    prompt = llm._build_prompt("this one", pending_order=None, order_draft=None, awaiting_field=None)
+    assert "just asked which item they'd like to order" not in prompt
+
+
+def test_prompt_describes_an_awaited_product_name():
+    prompt = llm._build_prompt(
+        "Big White Crown Stone Gold Ring, 14g",
+        pending_order=None, order_draft=None, awaiting_field="product_name",
+    )
+    assert "just asked which item they'd like to order" in prompt
+    assert "call propose_order with that product name" in prompt
+    assert "do not route it to" in prompt.lower()
+
+
+@pytest.mark.parametrize("other_field", [
+    "material", "quantity", "delivery_address", "delivery_option", "confirmation", "delivery_interest",
+])
+def test_prompt_says_nothing_for_the_other_five_awaiting_field_values(other_field):
+    # Deliberate: these already have their own deterministic fast-path
+    # branch (or are declined by design) -- adding prompt text for them
+    # here risks changing five other, already-tested behaviours while
+    # fixing the one gap this line exists for.
+    prompt = llm._build_prompt("some reply", pending_order=None, order_draft=None, awaiting_field=other_field)
+    assert "just asked which item they'd like to order" not in prompt
+
+
+def test_understand_customer_passes_awaiting_field_through_to_the_prompt(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.responses.create.return_value = _mock_openai_response(
+        '{"tool": "propose_order", "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g", '
+        '"material": "unknown", "quantity": "unknown", "delivery_address": "unknown", "delivery_option": "unknown"}}'
+    )
+    monkeypatch.setattr(llm, "client", fake_client)
+
+    llm.understand_customer("Big White Crown Stone Gold Ring, 14g", awaiting_field="product_name")
+
+    sent_prompt = fake_client.responses.create.call_args.kwargs["input"]
+    assert "just asked which item they'd like to order" in sent_prompt
+
+
+# ---------------------------------------------------------------------
 # last_action_outcome -- a fully-specified business action that still
 # failed for a real reason (see llm.py's _last_action_outcome_state_line())
 # ---------------------------------------------------------------------

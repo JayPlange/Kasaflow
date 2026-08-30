@@ -535,6 +535,14 @@ def _route_customer_locked(message: str, session_id: str) -> dict:
                 last_priced_product=last_priced_product,
                 just_confirmed_order=just_confirmed_order,
                 last_presented_products=last_presented_products,
+                # Only reaches here at all when the fast-path check just
+                # above declined to resolve it -- for product_name that's
+                # every time, since it has no fast-path branch (see
+                # llm._awaiting_field_state_line()'s docstring). Task #60
+                # follow-up, 2026-08-30 (Webb): tagging awaiting_field
+                # alone didn't change behaviour live, because nothing was
+                # passing it into the prompt at all.
+                awaiting_field=awaiting_field,
             )
     except ValueError as e:
         error_result = {"error": str(e)}

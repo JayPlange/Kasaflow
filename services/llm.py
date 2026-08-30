@@ -331,6 +331,8 @@ Customer said: "how much is a gold ring and a silver chain"
 
 {pending_intent_state}
 
+{awaiting_field_state}
+
 {last_action_outcome_state}
 
 {last_priced_product_state}
@@ -539,6 +541,60 @@ def _pending_intent_state_line(pending_intent: str | None) -> str:
     )
 
 
+def _awaiting_field_state_line(awaiting_field: str | None) -> str:
+    """Describes that this assistant's own immediately preceding message
+    asked which product the customer wants to order, so a reply naming
+    or describing one continues that order instead of being read as an
+    unrelated new lookup.
+
+    Deliberately scoped to ONLY "product_name" -- material, quantity,
+    delivery_address, delivery_option, confirmation, and
+    delivery_interest all already have their own deterministic
+    fast-path branch in router._try_resolve_awaiting_field(), which
+    either resolves the reply before this prompt is ever built, or
+    (Webb, 2026-08-30) is deliberately left unhandled here too, so as
+    not to change five other fields' already-tested behaviour while
+    fixing the one gap this was written for. See memory.AWAITING_FIELDS'
+    comment for why product_name has no fast-path branch of its own: a
+    product reference has no single deterministic shape ("the crown
+    ring", "that white one", "the second one" are all valid), unlike a
+    bare karat or a bare number.
+
+    Exists because propose_order()'s missing-item question previously
+    left literally no trace anywhere a later turn could read -- not
+    pending_intent (that mechanism only covers get_product_price/
+    generate_quote), not order_draft (empty at this point, since
+    product_name is the first of propose_order's five checks, so
+    nothing else about the order is known yet either). Confirmed live,
+    2026-08-30 (Webb): tagging awaiting_field alone, without this line,
+    did not change anything -- "I'll take that one" -> "Sure -- which
+    item?" -> "Big White Crown Stone Gold Ring, 14g" still went to the
+    karat/price breakdown instead of continuing the order, because
+    nothing told the model the second message was answering the first
+    question. This is the same fix pending_intent already used
+    successfully for an identical gap (confirmed live, 2026-08-13) --
+    describe what was just asked in the prompt, let the model's own
+    reference resolution do the rest, rather than building a
+    deterministic resolver before proving the model can't already do
+    this on its own."""
+    if awaiting_field != "product_name":
+        return ""
+    return (
+        f"This customer was just asked which item they'd like to order, nothing else about "
+        f"this order is known yet. If their current message now names, describes, or "
+        f"otherwise identifies a specific product -- a full name, a partial description "
+        f"(\"the crown ring\", \"that white one\"), or a reference to something shown earlier "
+        f"in this conversation -- treat that as continuing this order: call propose_order with "
+        f"that product name, \"unknown\" for material/quantity/delivery_address/delivery_option "
+        f"unless this same message also states one of those. Do not route it to "
+        f"get_product_price, get_product_karat_options, or recommend_products instead -- the "
+        f"customer already said they want to order it, they are now just saying what. If their "
+        f"message is clearly NOT identifying a product -- a genuinely unrelated question, a "
+        f"policy question, a greeting -- treat it as that instead; this line only applies when "
+        f"the message plausibly answers \"which item\"."
+    )
+
+
 def _last_action_outcome_state_line(last_action_outcome: dict | None) -> str:
     """Describes a genuine, unrecoverable failure of a real business
     action the customer just tried -- not a "still missing a detail"
@@ -703,12 +759,14 @@ def _build_prompt(
     awaiting_confirmation: bool = False,
     just_confirmed_order: dict | None = None,
     last_presented_products: dict | None = None,
+    awaiting_field: str | None = None,
 ) -> str:
     return _PROMPT_TEMPLATE.format(
         message=message,
         pending_order_state=_pending_order_state_line(pending_order, awaiting_confirmation),
         order_draft_state=_order_draft_state_line(order_draft),
         pending_intent_state=_pending_intent_state_line(pending_intent),
+        awaiting_field_state=_awaiting_field_state_line(awaiting_field),
         last_action_outcome_state=_last_action_outcome_state_line(last_action_outcome),
         last_priced_product_state=_last_priced_product_state_line(last_priced_product),
         just_confirmed_order_state=_just_confirmed_order_state_line(just_confirmed_order),
@@ -726,6 +784,7 @@ def _call_llm(
     awaiting_confirmation: bool = False,
     just_confirmed_order: dict | None = None,
     last_presented_products: dict | None = None,
+    awaiting_field: str | None = None,
 ) -> str:
     """Call the model with retries on transient failures only.
 
@@ -742,7 +801,7 @@ def _call_llm(
                 input=_build_prompt(
                     message, pending_order, order_draft, pending_intent, last_action_outcome,
                     last_priced_product, awaiting_confirmation, just_confirmed_order,
-                    last_presented_products,
+                    last_presented_products, awaiting_field,
                 ),
                 timeout=settings.llm_timeout_seconds,
             )
@@ -821,6 +880,7 @@ def understand_customer(
     last_priced_product: str | None = None,
     just_confirmed_order: dict | None = None,
     last_presented_products: dict | None = None,
+    awaiting_field: str | None = None,
 ) -> dict:
     """pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
@@ -863,14 +923,21 @@ def understand_customer(
     _last_presented_products_state_line()), so an ordinal/positional
     follow-up ("the second one", "the ring in the middle") can be resolved
     to a specific product_name before the model picks whichever tool the
-    rest of the message actually asks for."""
+    rest of the message actually asks for.
+
+    awaiting_field is router.py's own record of the one specific thing
+    THIS assistant's immediately preceding message asked for (see
+    memory.get_awaiting_field()) -- only ever meaningfully described
+    here for "product_name" (see _awaiting_field_state_line()'s
+    docstring for why the other five values it can hold are
+    deliberately left out of this prompt for now)."""
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
     raw_text = _call_llm(
         message, pending_order, order_draft, pending_intent, last_action_outcome,
         last_priced_product, awaiting_confirmation, just_confirmed_order,
-        last_presented_products,
+        last_presented_products, awaiting_field,
     )
     logger.info("Raw LLM output: %s", raw_text)
 
