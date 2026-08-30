@@ -15,6 +15,7 @@ from services.memory import (
     get_last_priced_product,
     get_order_draft,
     get_pending_intent,
+    increment_weight_ask_count,
     is_awaiting_confirmation,
     remember_context,
     set_awaiting_confirmation,
@@ -534,6 +535,41 @@ def test_last_priced_product_sessions_stay_isolated(monkeypatch):
 
     assert get_last_priced_product("session-a") == "Ring A"
     assert get_last_priced_product("session-b") == "Ring B"
+
+
+# ---------------------------------------------------------------------
+# weight_ask_count -- Webb, 2026-08-30 live transcript: three follow-ups
+# about the same product's weight ("that's the weight?", "is that really
+# 1g?", "how many grams is that?") all came back character-for-character
+# identical. response_formatter.py keys its phrasing variant off this.
+# ---------------------------------------------------------------------
+
+def test_increment_weight_ask_count_starts_at_one(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    assert increment_weight_ask_count("session-1") == 1
+
+
+def test_increment_weight_ask_count_climbs_on_each_call(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    assert increment_weight_ask_count("session-1") == 1
+    assert increment_weight_ask_count("session-1") == 2
+    assert increment_weight_ask_count("session-1") == 3
+
+
+def test_increment_weight_ask_count_sessions_stay_isolated(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    increment_weight_ask_count("session-a")
+    increment_weight_ask_count("session-a")
+    increment_weight_ask_count("session-b")
+
+    assert increment_weight_ask_count("session-a") == 3
+    assert increment_weight_ask_count("session-b") == 2
 
 
 # ---------------------------------------------------------------------

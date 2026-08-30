@@ -404,6 +404,55 @@ def test_formats_weight_shape_honestly_when_no_weight_is_on_file():
     assert "Custom Butterfly Gold Ring" in formatted
 
 
+# ---------------------------------------------------------------------
+# weight phrasing variants -- task #186, live evidence 2026-08-30
+# (Webb): "that's the weight?", "is that really 1g?", and "how many
+# grams is that?" asked back to back about the same product all came
+# back character-for-character identical. weight_ask_count (threaded
+# on by router.py) selects a different phrasing each time instead.
+# ---------------------------------------------------------------------
+
+def test_weight_variant_defaults_to_the_original_wording_when_count_is_absent():
+    # Every pre-existing caller/test builds a bare {"product", "weight"}
+    # dict with no weight_ask_count key -- must render exactly as before.
+    result = {"product": "Set Multi Stone Golf Ring, 7g", "weight": "7g"}
+    assert format_for_customer(result) == "The *Set Multi Stone Golf Ring, 7g* weighs 7g."
+
+
+def test_weight_variant_changes_on_repeated_asks_of_the_same_fact():
+    product = "Minimal White Stone Gold Ring, 1g"
+    replies = [
+        format_for_customer({"product": product, "weight": "1g", "weight_ask_count": count})
+        for count in (1, 2, 3, 4)
+    ]
+    # The specific live failure: three (here, all four) replies must not
+    # all be the same sentence.
+    assert len(set(replies)) > 1
+    # First ask keeps today's original wording -- no behaviour change
+    # for the common, single-ask case.
+    assert replies[0] == f"The *{product}* weighs 1g."
+    # Every variant still states the actual weight -- varying phrasing
+    # must never drop or alter the fact itself.
+    for reply in replies:
+        assert "1g" in reply
+
+
+def test_weight_variant_cycles_rather_than_erroring_past_the_pool_length():
+    product = "Minimal White Stone Gold Ring, 1g"
+    # 4 known-weight variants exist -- the 5th ask must reuse variant 0,
+    # not crash or run off the end of the list.
+    reply = format_for_customer({"product": product, "weight": "1g", "weight_ask_count": 5})
+    assert reply == f"The *{product}* weighs 1g."
+
+
+def test_weight_variant_also_applies_when_no_weight_is_on_file():
+    product = "Custom Butterfly Gold Ring"
+    first = format_for_customer({"product": product, "weight": None, "weight_ask_count": 1})
+    second = format_for_customer({"product": product, "weight": None, "weight_ask_count": 2})
+    assert first != second
+    assert "don't have the weight on file" in first or "don't have that one's weight" in first
+
+
 def test_formats_identified_product_shows_every_karat_price():
     # photo_match_tool.py's confident-match shape -- unlike the
     # recommendations list (which collapses to a price range above 3

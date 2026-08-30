@@ -503,6 +503,41 @@ def get_last_presented_products(session_id: str) -> dict | None:
     return _store.get(session_id, _LAST_PRESENTED_PRODUCTS_KEY)
 
 
+_WEIGHT_ASK_COUNT_KEY = "weight_ask_count"
+
+
+def increment_weight_ask_count(session_id: str) -> int:
+    """Increments and returns this session's running count of
+    get_product_weight calls that actually reached a weight-bearing
+    result (found a value or confirmed none is on file -- see
+    router.py's _update_weight_ask_count(), the only caller). response_
+    formatter.py uses the returned count to select a phrasing variant,
+    so a customer questioning or re-asking about the same fact
+    ("that's the weight?", "is that really 1g?", "how many grams is
+    that?") doesn't get the identical canned sentence every time.
+
+    Confirmed live, 2026-08-30 (Webb): those three follow-ups, asked
+    back to back about the same product, all came back character-for-
+    character identical -- "The Minimal White Stone Gold Ring, 1g
+    weighs 1g." three times. The routing underneath was correct each
+    time (a fresh get_product_weight call, not an answer pulled from
+    conversation memory -- see llm.py's disputed-weight guardrail), the
+    repetition was purely in response_formatter.py's single fixed
+    template. This counter is the fix's other half.
+
+    Deliberately a single per-session count, not per-product: this
+    exists to fix "the same question sounds robotic asked twice in a
+    row", not to track which specific product's weight has been
+    discussed how many times. Deliberately never reset by anything else
+    in this file (not clear_order_state, not a product switch) --
+    unlike last_priced_product, phrasing variety has no business-state
+    correctness requirement to protect, so there's no failure mode from
+    letting it keep climbing for the rest of the session."""
+    count = (_store.get(session_id, _WEIGHT_ASK_COUNT_KEY) or 0) + 1
+    _store.set(session_id, _WEIGHT_ASK_COUNT_KEY, count)
+    return count
+
+
 def clear_order_state(session_id: str) -> None:
     """Clears the remembered order-relevant slots and last_priced_product.
 

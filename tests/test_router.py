@@ -1221,6 +1221,91 @@ def test_route_customer_does_not_set_last_presented_products_for_other_tools(mon
     set_last_presented_products.assert_not_called()
 
 
+# ---------------------------------------------------------------------
+# weight_ask_count -- task #186, live evidence: three follow-ups about
+# the same product's weight ("that's the weight?", "is that really
+# 1g?", "how many grams is that?") all came back character-for-character
+# identical, 2026-08-30. response_formatter.py picks its phrasing
+# variant off this count.
+# ---------------------------------------------------------------------
+
+def test_route_customer_threads_weight_ask_count_onto_a_successful_weight_result(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_weight", "arguments": {"product_name": "Ring"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "Ring", "weight": "7g"}),
+    )
+    monkeypatch.setattr(router, "increment_weight_ask_count", MagicMock(return_value=3))
+
+    result = router.route_customer("how many grams is that?", "session-weight-count")
+
+    assert result["weight_ask_count"] == 3
+
+
+def test_route_customer_increments_weight_ask_count_even_when_no_weight_is_on_file(monkeypatch):
+    # "weight" is None, not absent -- a genuinely resolved "nothing on
+    # file" answer, same as the found case, still deserves variety on a
+    # repeat ask (see response_formatter.py's own two-variant pool for
+    # this shape).
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_weight", "arguments": {"product_name": "Ring"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "Ring", "weight": None}),
+    )
+    increment_weight_ask_count = MagicMock(return_value=1)
+    monkeypatch.setattr(router, "increment_weight_ask_count", increment_weight_ask_count)
+
+    router.route_customer("what's the weight?", "session-weight-unknown")
+
+    increment_weight_ask_count.assert_called_once_with("session-weight-unknown")
+
+
+def test_route_customer_does_not_increment_weight_ask_count_on_a_failed_weight_lookup(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_weight", "arguments": {"product_name": "unknown"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"error": "Sure -- which item would you like to know the weight of?"}),
+    )
+    increment_weight_ask_count = MagicMock()
+    monkeypatch.setattr(router, "increment_weight_ask_count", increment_weight_ask_count)
+
+    result = router.route_customer("how heavy is it", "session-weight-failed")
+
+    increment_weight_ask_count.assert_not_called()
+    assert "weight_ask_count" not in result
+
+
+def test_route_customer_does_not_increment_weight_ask_count_for_other_tools(monkeypatch):
+    monkeypatch.setattr(
+        router,
+        "understand_customer",
+        MagicMock(return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring", "material": "18k"}}),
+    )
+    monkeypatch.setattr(
+        router, "execute_tool",
+        MagicMock(return_value={"product": "Ring", "material": "18k", "price": 1200}),
+    )
+    increment_weight_ask_count = MagicMock()
+    monkeypatch.setattr(router, "increment_weight_ask_count", increment_weight_ask_count)
+
+    result = router.route_customer("how much is the ring", "session-weight-untouched")
+
+    increment_weight_ask_count.assert_not_called()
+    assert "weight_ask_count" not in result
+
+
 def test_route_customer_reads_last_presented_products_and_threads_it_to_understand_customer(monkeypatch):
     understand_customer = MagicMock(
         return_value={"tool": "get_product_price", "arguments": {"product_name": "Ring A", "material": "unknown"}}

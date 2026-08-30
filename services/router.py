@@ -19,6 +19,7 @@ from services.memory import (
     get_order_draft,
     get_pending_intent,
     get_session_store,
+    increment_weight_ask_count,
     is_awaiting_confirmation,
     remember_context,
     set_awaiting_confirmation,
@@ -97,6 +98,7 @@ _RECOMMEND_TOOL = "recommend_products"
 _ORDER_TOOL = "propose_order"
 _CONFIRM_TOOL = "confirm_order"
 _PRICE_TOOL = "get_product_price"
+_WEIGHT_TOOL = "get_product_weight"
 
 _ORDER_CORRECTION_FIELDS = {
     "product_name": "the item",
@@ -822,6 +824,7 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
     _update_pending_intent(session_id, tool_request["tool"], arguments, result)
     _update_last_priced_product(session_id, tool_request["tool"], result)
     _update_last_presented_products(session_id, tool_request["tool"], result)
+    weight_ask_count = _update_weight_ask_count(session_id, tool_request["tool"], result)
 
     if _tool_succeeded(result):
         # A genuine success means whatever failed before is no longer
@@ -845,6 +848,9 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
 
     if correction_note and isinstance(result, dict):
         result = {**result, "correction_note": correction_note}
+
+    if weight_ask_count is not None and isinstance(result, dict):
+        result = {**result, "weight_ask_count": weight_ask_count}
 
     _log_turn_trace(
         session_id, message, pre_state, tool_request,
@@ -987,6 +993,27 @@ def _update_last_presented_products(session_id: str, tool_name: str, result: dic
         return
     groups = select_presented_groups(recommendations)
     set_last_presented_products(session_id, groups)
+
+
+def _update_weight_ask_count(session_id: str, tool_name: str, result: dict | None) -> int | None:
+    """Returns an incremented weight-ask count for response_formatter.py
+    to key its phrasing variant off, or None when this turn isn't a
+    weight question at all -- see memory.increment_weight_ask_count()'s
+    docstring for the live failure this closes (Webb, 2026-08-30: three
+    follow-ups about the same product's weight came back
+    character-for-character identical).
+
+    Checks "weight" in result, not _tool_succeeded(result) -- unlike
+    every other _update_* helper here, a genuinely resolved "no weight
+    on file for this product" (result["weight"] is None) is not a
+    failure to vary phrasing on; get_product_weight's own shape (see
+    product_tool.py) always includes the "weight" key once a product
+    was actually found, whether or not a value was parseable. A real
+    failure (product not found at all) has no "weight" key and is
+    correctly excluded here, same as every other tool's error shape."""
+    if tool_name != _WEIGHT_TOOL or not isinstance(result, dict) or "weight" not in result:
+        return None
+    return increment_weight_ask_count(session_id)
 
 
 def _handle_conversation(arguments: dict) -> dict:

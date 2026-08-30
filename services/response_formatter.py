@@ -377,9 +377,41 @@ def format_for_customer(result: dict | None) -> str:
         # handful of real catalogue products with no parseable weight in
         # their name -- say so honestly rather than a generic no-match
         # message, since the product itself WAS found.
+        #
+        # weight_ask_count (router.py's _update_weight_ask_count(), via
+        # memory.increment_weight_ask_count()) selects a phrasing variant
+        # instead of always returning variant 0 -- confirmed live,
+        # 2026-08-30 (Webb): "that's the weight?", "is that really 1g?",
+        # and "how many grams is that?" asked back to back about the
+        # same product all produced the exact same sentence, verbatim,
+        # three times. Absent (every existing test/caller that builds a
+        # bare {"product", "weight"} dict directly, and any future one
+        # that doesn't thread it through) defaults to variant 0 --
+        # today's original, unchanged wording -- not an error.
+        #
+        # Deliberately no "not heavy, right?"-style commentary on the
+        # actual number (Webb's own example phrasing for "is that really
+        # 1g?"): true for a 1g ring, not generalisable to every product
+        # in this catalogue (a 30g necklace is not "light"), and this
+        # formatter has no judgement layer to decide when a comment like
+        # that is honest -- see this module's own docstring on staying
+        # deterministic. Varying the SENTENCE, not adding an opinion the
+        # code can't actually back up product to product, is the safe
+        # version of the same idea.
+        variant = (result.get("weight_ask_count") or 1) - 1
         if result["weight"] is None:
-            return f"I don't have the weight on file for the *{result['product']}*, sorry."
-        return f"The *{result['product']}* weighs {result['weight']}."
+            variants = [
+                f"I don't have the weight on file for the *{result['product']}*, sorry.",
+                "Still don't have that one's weight on record, sorry.",
+            ]
+            return variants[variant % len(variants)]
+        variants = [
+            f"The *{result['product']}* weighs {result['weight']}.",
+            f"Yes, that's the weight -- {result['weight']}.",
+            f"Yes, it really is -- {result['weight']}.",
+            f"It's {result['weight']}.",
+        ]
+        return variants[variant % len(variants)]
 
     if "recommendations" in result:
         items = result["recommendations"]
