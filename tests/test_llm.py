@@ -338,6 +338,27 @@ def test_prompt_distinguishes_weight_from_a_price_question():
     assert "never guess or calculate a weight yourself" in prompt
 
 
+def test_prompt_instructs_re_checking_a_disputed_weight_rather_than_answering_from_memory():
+    # Webb, 2026-08-30: "is that really 1g?"/"that's the weight?" must not
+    # be answered (confirmed or corrected) from what this conversation
+    # already said -- same anti-hallucination principle as
+    # get_order_status's docstring for a disputed order fact.
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "questioning or disputing a weight" in prompt
+    assert "call this tool again with the same product_name" in prompt
+    assert "is that really 1g?" in prompt
+
+
+def test_prompt_includes_a_worked_example_combining_positional_reference_and_weight():
+    # The compound case Webb specifically flagged: list-position
+    # resolution and the weight question have to compose, not just each
+    # work in isolation.
+    prompt = llm._build_prompt("hey", pending_order=None, order_draft=None)
+    assert "how many grams does the second one have?" in prompt
+    assert '"product_name": "Necklace B"' in prompt
+    assert "Two instructions compose here" in prompt
+
+
 def test_understand_customer_passes_pending_order_through_to_the_prompt(monkeypatch):
     # Arrange
     fake_client = MagicMock()

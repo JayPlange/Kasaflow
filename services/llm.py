@@ -130,7 +130,7 @@ Use this when the customer is asking WHICH karats/purities a specific product co
 11. get_product_weight
 Arguments:
 - product_name
-Use this when the customer is asking how heavy a specific product is -- "how heavy is it", "how many grams", "what's the weight" -- as opposed to its price or karat. This is a genuinely separate question from price: weight is a fixed, physical fact about the item, not something that changes with karat or quantity. If the product itself isn't named in this message, resolve it from what was already discussed (see the product context below), same as get_product_karat_options above; set product_name to "unknown" only if genuinely nothing in this conversation names one yet. Weight is read only from the product's own catalogue name -- never guess or calculate a weight yourself from anything the customer said.
+Use this when the customer is asking how heavy a specific product is -- "how heavy is it", "how many grams", "what's the weight", "how many grams is that" -- as opposed to its price or karat. This is a genuinely separate question from price: weight is a fixed, physical fact about the item, not something that changes with karat or quantity. If the product itself isn't named in this message, resolve it from what was already discussed (see the product context below), same as get_product_karat_options above; set product_name to "unknown" only if genuinely nothing in this conversation names one yet. Weight is read only from the product's own catalogue name -- never guess or calculate a weight yourself from anything the customer said. This applies even when the customer is questioning or disputing a weight this assistant already gave earlier in this conversation ("is that really 1g?", "that's the weight?") -- call this tool again with the same product_name rather than reassuring or re-confirming from memory of what was said before. Same principle as get_order_status's docstring above for a past order's real details: what this conversation said earlier is not reliable evidence on its own, re-check the actual fact.
 
 12. converse
 Arguments:
@@ -178,6 +178,14 @@ Customer: "okay what about 12" (right after being quoted a price, or after being
 Customer: "how heavy is it" (just quoted the price of the Custom Leaf White Gold Necklace, 20g)
 {{"tool": "get_product_weight", "arguments": {{"product_name": "Custom Leaf White Gold Necklace, 20g"}}}}
 -> A weight question, not a price question -- get_product_weight, not get_product_price, even though a price was just discussed.
+
+Customer: "is that really 1g?" (this assistant already told them the Set Multi Stone Golf Ring, 7g weighs 7g)
+{{"tool": "get_product_weight", "arguments": {{"product_name": "Set Multi Stone Golf Ring, 7g"}}}}
+-> Still a weight question, even phrased as disbelief and even though a different number ("1g") was thrown in -- do not answer from what was already said in this conversation (right or wrong), and do not use converse to reassure them. Call the tool again and let the real catalogue figure answer it.
+
+Customer: "how many grams does the second one have?" (just shown a numbered list: 1. Ring A, 2. Necklace B, 3. Ring C)
+{{"tool": "get_product_weight", "arguments": {{"product_name": "Necklace B"}}}}
+-> Two instructions compose here, not one: resolve "the second one" against the numbered list above first (see that context below), then apply the weight question to whatever product that position resolves to.
 
 Customer: "do you have bracelets?"
 -> NOT converse. Use recommend_products.
