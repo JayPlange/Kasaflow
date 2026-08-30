@@ -401,6 +401,204 @@ def test_propose_order_recovery_reprices_against_the_canonical_id_not_the_restat
 
 
 # ---------------------------------------------------------------------
+# C7-FIX 2026-08-30 (Webb): deferred-clear transaction model. Before
+# this fix, _PENDING_ORDER_KEY was wiped the instant a restated name
+# differed at all, before the call was known to succeed -- see the
+# early-clear block's own comment in order_tool.py. These tests assert
+# the other half of that fix: any failure encountered AFTER this session
+# is recognised as a possible same-product correction (a restated name
+# that's a prefix of the one already active) must leave the existing
+# draft exactly as it was, not just recoverable-in-principle. A
+# genuinely different, unmatched product must still behave exactly as
+# before (test_propose_order_does_not_recover_when_the_restated_name_is_
+# not_a_prefix_of_the_active_product, above, already covers that with no
+# draft to lose in the first place).
+# ---------------------------------------------------------------------
+
+def test_propose_order_retains_existing_draft_when_the_correction_product_is_unrecoverable(monkeypatch, fresh_session_store):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    # Primary lookup fails, AND the id-recovery fallback also fails
+    # (get_product_price_by_id itself can't resolve anything for this
+    # id/material combination) -- a genuine dead end, not just a
+    # truncated restatement of something recoverable.
+    _mock_product_lookup(monkeypatch, None)
+    _mock_product_lookup_by_id(monkeypatch, None)
+
+    result = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring", "18k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    assert "error" in result
+    assert "kept your current order" in result["error"]
+    assert "12k Big White Crown Stone Gold Ring, 14g" in result["error"]
+    # The old draft is still the one actually sitting in the store, not
+    # just referenced in the error text.
+    still_pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
+    assert still_pending is not None
+    assert still_pending["product_id"] == 5892
+    assert still_pending["material"] == "12k"
+
+
+def test_propose_order_retains_existing_draft_when_recovered_karat_fails_the_price_invariant(monkeypatch, fresh_session_store):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    # Recovery finds a row by id, but it disagrees with the karat the
+    # customer actually selected -- the hard price/variant invariant
+    # must refuse it, same as the ordinary (non-recovery) path.
+    _mock_product_lookup(monkeypatch, None)
+    _mock_product_lookup_by_id(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+
+    result = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring", "18k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    assert "error" in result
+    assert "couldn't apply that karat" in result["error"]
+    assert "kept your current order" in result["error"]
+    assert "still in 12k" in result["error"]
+    still_pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
+    assert still_pending is not None
+    assert still_pending["material"] == "12k"
+
+
+def test_propose_order_retains_existing_draft_when_recovered_product_has_no_woocommerce_id(monkeypatch, fresh_session_store):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    _mock_product_lookup(monkeypatch, None)
+    # Recovered row exists but has no WooCommerce id yet (products.json
+    # synced before this feature shipped -- see the "id" not in product
+    # branch's own comment).
+    _mock_product_lookup_by_id(
+        monkeypatch,
+        {"product": "Big White Crown Stone Gold Ring, 14g", "material": "18k", "price": 132000.0},
+    )
+
+    result = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring", "18k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    assert "error" in result
+    assert "kept your current order" in result["error"]
+    still_pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
+    assert still_pending is not None
+    assert still_pending["product_id"] == 5892
+
+
+def test_propose_order_retains_existing_draft_when_a_correction_cannot_resolve_delivery(monkeypatch, fresh_session_store):
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    # A karat correction that also carries an address neither a known
+    # rider zone nor infer_delivery_option() can place -- delivery
+    # itself is what fails to resolve this turn, before the product
+    # lookup is ever reached.
+    monkeypatch.setattr(order_tool, "infer_delivery_option", MagicMock(return_value=None))
+
+    result = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring", "18k", 5, "Somewhere Unmappable", "unknown", "session-1",
+    )
+
+    assert "error" in result
+    assert "couldn't apply that delivery change" in result["error"]
+    assert "kept your current order" in result["error"]
+    assert result.get("awaiting_field") == "delivery_option"
+    still_pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
+    assert still_pending is not None
+    assert still_pending["product_id"] == 5892
+
+
+def test_propose_order_explicit_product_switch_still_replaces_the_old_draft(monkeypatch, fresh_session_store):
+    # The deferred-clear change must not weaken this: a genuinely
+    # different, unrelated product_name (not a prefix of the active
+    # one) still replaces the old draft outright, exactly as before.
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 42, "product": "Custom Leaf White Gold Necklace, 20g", "material": "18k", "price": 4000.0},
+    )
+    result = order_tool.propose_order(
+        "Custom Leaf White Gold Necklace, 20g", "18k", 1, "Accra", "accra_rider", "session-1",
+    )
+
+    assert result["proposal"]["product_id"] == 42
+    still_pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
+    assert still_pending["product_id"] == 42
+
+
+def test_confirm_order_does_not_confirm_a_retained_draft_after_a_failed_correction(monkeypatch, fresh_session_store):
+    # Commerce-integrity check: retaining the old draft on a failed
+    # correction must never make it MORE confirmable than before. A bare
+    # "yes" right after a failed correction must still be refused, the
+    # same way it's refused after any other non-propose_order turn --
+    # confirmation_allowed comes from router.py's per-turn reset of
+    # is_awaiting_confirmation(), not from whether a pending_order dict
+    # happens to exist in the store (see confirm_order()'s own docstring
+    # and test_confirm_order_refuses_a_stale_confirmation above).
+    _woocommerce_settings(monkeypatch)
+    fake_post = _mock_post(monkeypatch)
+    _mock_product_lookup(
+        monkeypatch,
+        {"id": 5892, "product": "Big White Crown Stone Gold Ring, 14g", "material": "12k", "price": 88242.0},
+    )
+    order_tool.propose_order(
+        "Big White Crown Stone Gold Ring, 14g", "12k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+
+    _mock_product_lookup(monkeypatch, None)
+    _mock_product_lookup_by_id(monkeypatch, None)
+    failed = order_tool.propose_order(
+        "Big White Crown Stone Gold Ring", "18k", 5, "Kumasi", "kumasi_rider", "session-1",
+    )
+    assert "error" in failed
+
+    # Simulates router.py's unconditional per-turn reset: this turn's
+    # propose_order call did not produce a proposal, so
+    # is_awaiting_confirmation() is False when confirm_order runs.
+    result = order_tool.confirm_order("session-1", confirmation_allowed=False)
+
+    assert "anything pending to confirm" in result["error"].lower()
+    fake_post.assert_not_called()
+    # The retained draft is still there, untouched -- refused, not lost.
+    still_pending = fresh_session_store.get("session-1", order_tool._PENDING_ORDER_KEY)
+    assert still_pending is not None
+    assert still_pending["product_id"] == 5892
+
+
+# ---------------------------------------------------------------------
 # delivery_option/address mismatch -- see delivery_tool.
 # delivery_option_matches_address() for the underlying check. Confirmed
 # live, 2026-08-14 (Tamale/kumasi_rider) and 2026-08-18 (Cape Coast/

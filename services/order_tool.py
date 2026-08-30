@@ -172,15 +172,47 @@ def propose_order(
     # call) so they survive as a fallback identity for the product_id
     # recovery further down -- see that block's comment for why this
     # exists and what live bug it closes.
+    # C7-FIX 2026-08-30 (Webb): this used to clear _PENDING_ORDER_KEY the
+    # instant the restated name differed at all, before this call was
+    # known to succeed. In the one case that already had a recovery path
+    # (the prefix check below, shared with get_product_price_by_id()'s
+    # fallback further down), that was invisible -- the clear-then-
+    # rebuild happened within the same call. In every OTHER failure
+    # between here and a successful proposal (the product genuinely
+    # unmatched even after the fallback, the karat-mismatch invariant,
+    # a missing WooCommerce id), it silently destroyed a perfectly good
+    # existing order with no way back and no indication to the customer
+    # anything was lost -- a live KASAFLOW_TURN_TRACE from 2026-08-21
+    # (pre-dating the id-recovery fix itself) is exactly this failure
+    # mode. Fix: the only place _PENDING_ORDER_KEY is written now is the
+    # unconditional success path at the bottom of this function -- old
+    # is replaced by new only once new is actually built and validated,
+    # never before. is_same_product_correction (true only when the
+    # restated name is a case-insensitive PREFIX of the one product
+    # already active in this session -- the exact relationship the
+    # id-recovery fallback checks again once the primary lookup is known
+    # to have failed) gates every tailored "kept your current order"
+    # message below. A genuinely different, unrelated product_name still
+    # clears immediately, exactly as before -- see
+    # test_active_product_never_resurrects_after_an_explicit_product_
+    # switch (test_order_conversations.py), which must keep passing
+    # unchanged: that guarantee is about confirmability, already
+    # independently enforced by confirm_order()'s confirmation_allowed
+    # gate (see that function's docstring), not about this dict's mere
+    # existence, so deferring the clear here doesn't reopen it.
     active_product_id = None
     active_product_name = None
     existing_pending = _store.get(session_id, _PENDING_ORDER_KEY)
+    is_same_product_correction = False
     if existing_pending is not None:
         active_product_id = existing_pending.get("product_id")
         active_product_name = existing_pending.get("product")
         existing_product = str(active_product_name or "").strip().lower()
         if existing_product and existing_product != product_stripped.lower():
-            _store.set(session_id, _PENDING_ORDER_KEY, None)
+            if existing_product.startswith(product_stripped.lower()):
+                is_same_product_correction = True
+            else:
+                _store.set(session_id, _PENDING_ORDER_KEY, None)
 
     material_stripped = str(material).strip() if material else ""
     if not material_stripped or material_stripped.lower() == "unknown":
@@ -237,6 +269,15 @@ def propose_order(
             # order, requiring an extra turn to actually complete the
             # proposal. See router.py's _try_resolve_awaiting_field() for
             # the deterministic half of this fix.
+            if is_same_product_correction and existing_pending:
+                return {
+                    "error": (
+                        f"I couldn't apply that delivery change, so I've kept your current order: "
+                        f"{existing_pending.get('material')} {existing_pending.get('product')}. "
+                        f"Would you like {delivery_options_phrase()}?"
+                    ),
+                    "awaiting_field": "delivery_option",
+                }
             return {"error": f"Would you like {delivery_options_phrase()}?", "awaiting_field": "delivery_option"}
 
     product = get_product_price(product_name, material)
@@ -323,6 +364,14 @@ def propose_order(
                 product = recovered
 
     if not product:
+        if is_same_product_correction and existing_pending:
+            return {
+                "error": (
+                    f"I couldn't find that product, so I've kept your current order: "
+                    f"{existing_pending.get('material')} {existing_pending.get('product')}. "
+                    f"Which product did you mean?"
+                )
+            }
         return {"error": "Sorry, we couldn't find that product."}
 
     # Hard, LLM-independent price/variant invariant: refuse to build a
@@ -362,6 +411,14 @@ def propose_order(
             "guard has a gap somewhere and needs investigating, not just this check.",
             selected_karat, product.get("product"), priced_karat, product_name, material,
         )
+        if is_same_product_correction and existing_pending:
+            return {
+                "error": (
+                    f"I couldn't apply that karat to this piece, so I've kept your current order. "
+                    f"The {existing_pending.get('product')} is still in {existing_pending.get('material')}. "
+                    f"Which karat would you like?"
+                )
+            }
         return {"error": "Sorry, we couldn't find that product."}
 
     if "id" not in product:
@@ -388,6 +445,14 @@ def propose_order(
                 "ordering system yet, so I can't take an order for it right now."
             ),
         })
+        if is_same_product_correction and existing_pending:
+            return {
+                "error": (
+                    f"I found that item in the catalogue, but it isn't linked to our ordering "
+                    f"system yet, so I can't apply that change right now. I've kept your current "
+                    f"order: {existing_pending.get('material')} {existing_pending.get('product')}."
+                )
+            }
         return {"error": "Sorry, I can't take orders for that item right now."}
 
     subtotal = product["price"] * quantity_int
