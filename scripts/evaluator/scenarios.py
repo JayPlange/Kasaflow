@@ -326,14 +326,14 @@ _add(Scenario(
     category="ORDERS",
     description="Naming a different product mid-proposal should switch the order to it cleanly, not blend fields from both.",
     turns=[
-        Turn(message=f"I want the {NECKLACE} in 14k", expected_tool="propose_order"),
+        Turn(message=f"I want to order the {NECKLACE}, in 14k, deliver to Osu", expected_tool="propose_order"),
         Turn(
             message=f"actually make it the {RING} instead",
             expected_tool="propose_order",
             expected_fields={"product_name": RING},
         ),
     ],
-    source="task #64 (\"change product mid-proposal\")",
+    source="task #64 (\"change product mid-proposal\") -- turn 1 rewritten 2026-09-01: the original \"I want the necklace in 14k\" phrasing is genuinely ambiguous between a price ask and an order ask (it has no quantity or delivery detail, unlike orders-01/02's phrasing, which both passed live), and that ambiguity is what the live run's failure (get_product_price instead of propose_order) most likely reflects -- not a bug in the product-switch logic this scenario actually means to test. \"I want to order... deliver to Osu\" removes that ambiguity.",
 ))
 
 
@@ -471,14 +471,26 @@ _add(Scenario(
 ))
 
 _add(Scenario(
-    id="ambiguity-02-unique-category-not-flagged",
+    id="ambiguity-02-category-not-in-list-not-flagged",
     category="AMBIGUITY",
-    description="A bare category name that matches exactly ONE item just shown should resolve normally, not be wrongly flagged ambiguous.",
+    description="A bare category reference for something that was NOT in the list just shown (no necklace among the rings) must not be forced through the ambiguity clarification either -- there is nothing to disambiguate.",
     turns=[
-        Turn(message=f"show me the {NECKLACE} and the {RING}", expected_tool=("recommend_products", "get_product_price")),
-        Turn(message="the necklace", expected_tool=("get_product_price", "get_product_karat_options", "propose_order")),
+        Turn(message="show me the rings", expected_tool="recommend_products"),
+        Turn(
+            message="the necklace",
+            expected_tool=("recommend_products", "get_product_price", "get_product_karat_options", "propose_order"),
+            manner_note=(
+                "If this comes back converse instead, check by hand whether it is the #197 "
+                "list-ambiguity guard misfiring (a real regression -- 'Necklaces' was never "
+                "even a category in the list just shown, so it should never appear in "
+                "ambiguous_categories) or an ordinary 'I don't have enough to go on' "
+                "clarification unrelated to #197. The evaluator cannot tell these apart from "
+                "the tool name alone, so expected_tool deliberately excludes converse here "
+                "rather than guessing which case a converse result would be."
+            ),
+        ),
     ],
-    source="regression guard for task #197 -- this must NOT trigger the ambiguity clarification, since only one necklace was shown",
+    source="regression guard for task #197's category-position logic, rewritten 2026-09-01 -- the original version's setup turn named two specific products directly rather than browsing a category, so last_presented_products was never populated the way the scenario assumed, and the live run's failure (recommend_products instead of a price/karat/order tool) was this scenario's own design flaw, not a KasaFlow bug",
 ))
 
 _add(Scenario(

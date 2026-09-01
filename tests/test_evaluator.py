@@ -16,7 +16,7 @@ import logging
 
 import pytest
 
-from scripts.evaluator.report import print_summary, to_json
+from scripts.evaluator.report import print_repeat_summary, print_summary, to_json
 from scripts.evaluator.runner import run_scenario, run_turn
 from scripts.evaluator.schema import CATEGORIES, Scenario, Turn
 
@@ -278,6 +278,79 @@ def test_print_summary_does_not_raise(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "unit-10" in captured.out
     assert "FAIL" in captured.out
+
+
+# ---------------------------------------------------------------------
+# runner.py -- the _final_text() None-handling regression (found live,
+# 2026-09-01, via ambiguity-03's false failure)
+# ---------------------------------------------------------------------
+
+def test_run_scenario_reads_the_real_no_match_wording_when_final_result_is_none(monkeypatch):
+    # A no-match IS a real, valid final_result shape (None), and
+    # format_for_customer(None) has its own specific wording for it --
+    # an earlier version of _final_text() short-circuited on None and
+    # returned "" instead of calling format_for_customer, which broke
+    # every scenario checking a no-match reply's actual text.
+    monkeypatch.setattr(
+        "scripts.evaluator.runner.route_customer",
+        _fake_route_customer({"final_result": None}),
+    )
+    scenario = Scenario(
+        id="unit-11",
+        category="PRICE",
+        description="unit test",
+        turns=[Turn(message="how much is the unicorn pendant", expected_contains=["couldn't find"])],
+    )
+    result = run_scenario(scenario)
+    assert result.passed is True
+    assert "couldn't find" in result.turn_results[0].final_text
+
+
+# ---------------------------------------------------------------------
+# report.py -- print_repeat_summary()
+# ---------------------------------------------------------------------
+
+def test_print_repeat_summary_reports_flaky_when_some_but_not_all_runs_fail(monkeypatch, capsys):
+    calls = {"n": 0}
+
+    def _flaky(message, session_id):
+        calls["n"] += 1
+        # Fails on the first call, passes on the rest -- simulates a
+        # one-off stochastic miss rather than a consistent failure.
+        overrides = {} if calls["n"] > 1 else {
+            "llm_structured_output": {"tool": "propose_order", "arguments": {}},
+        }
+        return _fake_route_customer(overrides)(message, session_id)
+
+    monkeypatch.setattr("scripts.evaluator.runner.route_customer", _flaky)
+    scenario = Scenario(
+        id="unit-12",
+        category="PRICE",
+        description="unit test",
+        turns=[Turn(message="how much is the ring", expected_tool="get_product_price")],
+    )
+    results = [run_scenario(scenario) for _ in range(3)]
+    print_repeat_summary({"unit-12": results})
+    captured = capsys.readouterr()
+    assert "FLAKY" in captured.out
+    assert "2/3 passed" in captured.out
+
+
+def test_print_repeat_summary_reports_pass_when_every_run_passes(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "scripts.evaluator.runner.route_customer",
+        _fake_route_customer({}),
+    )
+    scenario = Scenario(
+        id="unit-13",
+        category="PRICE",
+        description="unit test",
+        turns=[Turn(message="how much is the ring", expected_tool="get_product_price")],
+    )
+    results = [run_scenario(scenario) for _ in range(3)]
+    print_repeat_summary({"unit-13": results})
+    captured = capsys.readouterr()
+    assert "[PASS] unit-13: 3/3 passed" in captured.out
 
 
 # ---------------------------------------------------------------------

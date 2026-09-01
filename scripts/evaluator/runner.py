@@ -92,10 +92,15 @@ def run_turn(message: str, session_id: str) -> dict:
 
 
 def _final_text(trace: dict) -> str:
-    final_result = trace.get("final_result")
-    if final_result is None:
-        return ""
-    return format_for_customer(final_result)
+    # format_for_customer(None) is itself meaningful -- it's the "Hmm,
+    # I couldn't find that one" no-match reply, a real, valid shape of
+    # final_result, not an empty/nothing state. An earlier version of
+    # this function short-circuited on final_result is None and
+    # returned "" instead of calling format_for_customer, which quietly
+    # broke every scenario checking a no-match reply's actual wording
+    # (confirmed live, 2026-09-01, on ambiguity-03) -- always delegate,
+    # exactly like router.py's own callers do.
+    return format_for_customer(trace.get("final_result"))
 
 
 def _check_turn(turn: Turn, trace: dict, final_text: str) -> list[CheckResult]:

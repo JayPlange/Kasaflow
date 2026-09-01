@@ -54,6 +54,42 @@ def to_json(results: list[ScenarioResult]) -> str:
     return json.dumps(payload, indent=2, default=str)
 
 
+def print_repeat_summary(results_by_id: dict[str, list[ScenarioResult]]) -> None:
+    """For --repeat N runs: one line per scenario giving pass count out
+    of N, plus one example detail per distinct failing check -- not
+    every run's full dump, since with N repeats the point is whether
+    failures are CONSISTENT, not a wall of near-duplicate output.
+
+    This is the tool for the specific question Webb asked, 2026-09-01:
+    is a given failure a real, repeatable compliance gap, or a one-off
+    sampling fluke from a single stochastic LLM call? A scenario
+    passing 6/6 after one earlier failure means the original run was
+    noise. A scenario failing most or all repeats means it's real."""
+    print("\nRepeated-run summary (checking whether failures are consistent or one-off):\n")
+    for scenario_id, results in results_by_id.items():
+        passed = sum(1 for r in results if r.passed)
+        total = len(results)
+        status = "PASS" if passed == total else ("FAIL" if passed == 0 else "FLAKY")
+        print(f"[{status}] {scenario_id}: {passed}/{total} passed")
+        if passed == total:
+            continue
+        seen_labels: set[str] = set()
+        for result in results:
+            if result.passed:
+                continue
+            if result.error:
+                if "error" not in seen_labels:
+                    seen_labels.add("error")
+                    print(f"    e.g. error: {result.error}")
+                continue
+            for turn_result in result.turn_results:
+                for check in turn_result.checks:
+                    if not check.passed and check.label not in seen_labels:
+                        seen_labels.add(check.label)
+                        print(f"    e.g. {turn_result.turn.message!r} -- {check.label}: {check.detail}")
+    print()
+
+
 def print_summary(results: list[ScenarioResult]) -> None:
     by_category: dict[str, list[ScenarioResult]] = defaultdict(list)
     for result in results:

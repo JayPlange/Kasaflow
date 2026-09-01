@@ -15,6 +15,12 @@ it up automatically):
     python3 scripts/run_evaluator.py --category "REFERENCES"
     python3 scripts/run_evaluator.py --id references-04-golden-path-full-journey
     python3 scripts/run_evaluator.py --json report.json
+    python3 scripts/run_evaluator.py --id ambiguity-01-bare-category-two-matches --repeat 6
+
+--repeat N runs each selected scenario N times (fresh session each
+time) and reports a pass count per scenario, to tell a genuine,
+repeatable failure apart from one unlucky LLM call. Only sensible
+alongside --id or --category, not against the whole corpus.
 
 Exits non-zero if any scenario failed, so this is CI/pre-demo-gate
 friendly if Webb ever wants it wired into GitHub Actions -- not done
@@ -38,8 +44,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from scripts.evaluator.report import print_summary, to_json
-from scripts.evaluator.runner import run_all
+from scripts.evaluator.report import print_repeat_summary, print_summary, to_json
+from scripts.evaluator.runner import run_all, run_scenario
 from scripts.evaluator.scenarios import SCENARIOS
 
 
@@ -48,6 +54,14 @@ def main() -> int:
     parser.add_argument("--category", help="Only run scenarios in this category (exact match).")
     parser.add_argument("--id", dest="scenario_id", help="Only run the scenario with this id.")
     parser.add_argument("--json", dest="json_path", help="Write the full report as JSON to this path.")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Run each selected scenario this many times (fresh session per run) and report a "
+        "pass count, to check whether a failure is consistent or a one-off. Use with --id or "
+        "--category, not the whole corpus.",
+    )
     args = parser.parse_args()
 
     scenarios = SCENARIOS
@@ -59,6 +73,16 @@ def main() -> int:
     if not scenarios:
         print("No scenarios matched --category/--id.", file=sys.stderr)
         return 2
+
+    if args.repeat > 1:
+        results_by_id = {s.id: [run_scenario(s) for _ in range(args.repeat)] for s in scenarios}
+        print_repeat_summary(results_by_id)
+        all_results = [r for results in results_by_id.values() for r in results]
+        if args.json_path:
+            with open(args.json_path, "w", encoding="utf-8") as f:
+                f.write(to_json(all_results))
+            print(f"Full report (every run, not just failures) written to {args.json_path}")
+        return 0 if all(r.passed for r in all_results) else 1
 
     results = run_all(scenarios)
     print_summary(results)
