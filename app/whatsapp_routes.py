@@ -21,7 +21,11 @@ import os
 from fastapi import APIRouter, BackgroundTasks, Request, Response
 
 from app.config import settings
-from services.response_formatter import format_for_customer
+from services.response_formatter import (
+    format_for_customer,
+    format_recommendation_caption,
+    select_presented_groups,
+)
 from services.router import route_customer
 from services.vision_tool import VisionServiceError, describe_product_image
 from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
@@ -137,6 +141,9 @@ def _handle_message(message: dict) -> None:
         # has a single photo to attach, so only single-product results
         # get an image reply.
         image_url = result.get("image_url") if isinstance(result, dict) else None
+        recommendations = (
+            result.get("recommendations") if isinstance(result, dict) else None
+        )
 
         if message_type == "audio":
             try:
@@ -144,6 +151,44 @@ def _handle_message(message: dict) -> None:
                 send_audio_message(from_number, audio_reply)
             except VoiceServiceError as e:
                 logger.warning("TTS reply failed, falling back to text: %s", e)
+                send_text_message(from_number, reply_text)
+        elif recommendations:
+            # A genuine browse ("show me the rings"), not one named
+            # product -- Webb, 2026-09-01: "visual browsing is part of
+            # the jewellery experience", one image message per product
+            # rather than the single price/karat text reply below.
+            # Same grouping/selection (up to 4, category-diversified)
+            # already used to build demo_routes.py's /demo cards and to
+            # persist memory.set_last_presented_products() -- one
+            # function computing the list, every caller sharing it, see
+            # select_presented_groups()'s own docstring.
+            groups = select_presented_groups(recommendations)
+            sent_any = False
+            missing_photo_lines = []
+            for name, variants in groups:
+                photo_variant = next((v for v in variants if v.get("image_url")), None)
+                caption = format_recommendation_caption(name, variants)
+                if photo_variant is None:
+                    missing_photo_lines.append(caption)
+                    continue
+                try:
+                    send_image_message(from_number, photo_variant["image_url"], caption=caption)
+                    sent_any = True
+                except WhatsAppError as e:
+                    logger.warning("Recommendation image failed for %r, sending as text: %s", name, e)
+                    missing_photo_lines.append(caption)
+            if missing_photo_lines:
+                # Catalogue rows without a photo, or a send that failed
+                # mid-list, still need to reach the customer -- one
+                # trailing text message rather than silently dropping
+                # them, same "say what's true, don't just fail quiet"
+                # rule this codebase applies everywhere else.
+                send_text_message(from_number, "\n\n".join(missing_photo_lines))
+            if not sent_any and not missing_photo_lines:
+                # Nothing in the selected groups had an image or a
+                # caption at all (shouldn't happen -- every group
+                # produces a caption above) -- fall back to the
+                # ordinary text reply rather than sending nothing.
                 send_text_message(from_number, reply_text)
         elif image_url:
             try:

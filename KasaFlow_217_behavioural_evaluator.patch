@@ -1,0 +1,1574 @@
+From 2ef1985002f9f29349ef40067919e4f89f79d1a5 Mon Sep 17 00:00:00 2001
+From: unknown <jayplange07@gmail.com>
+Date: Tue, 1 Sep 2026 07:58:57 +0000
+Subject: [PATCH] Build KasaFlow behavioural evaluator (task #217)
+
+Webb, 2026-09-01: stop adding isolated fixes, freeze the transaction
+architecture, and prove the whole conversational system against a
+structured evaluation suite before the next architectural change.
+
+- scripts/evaluator/schema.py: Scenario/Turn/CheckResult/ScenarioResult
+  dataclasses. A Turn checks whatever subset of expected_tool,
+  expected_fields, expected_contains, expected_not_contains it
+  specifies. Correctness and manner are deliberately separate axes --
+  manner_note is carried into the report for a human (or a future
+  LLM-judge pass) to score; this evaluator does not fabricate an
+  automated manner verdict for something it cannot actually judge.
+- scripts/evaluator/runner.py: runs a scenario's turns through the
+  real route_customer() pipeline, sharing one session across turns,
+  and reads router.py's own KASAFLOW_TURN_TRACE log line (built
+  2026-08-21) as its data source rather than re-deriving
+  llm_structured_output/resolved_arguments a second time.
+- scripts/evaluator/scenarios.py: 46 scenarios across all fifteen
+  categories Webb specified. Every scenario's source states plainly
+  whether it is an exact case lifted from this repo's existing test
+  script, task history, or live traces (confirmed live, dated) or
+  newly designed from the category spec and not yet live-tested --
+  these are not presented as equally verified. Includes Webb's own
+  end-to-end golden-path journey as references-04.
+- scripts/run_evaluator.py: CLI (--category/--id/--json), exits
+  non-zero on any failure.
+- tests/test_evaluator.py: 17 tests against the harness mechanics
+  (trace capture, comparison logic, corpus well-formedness), all with
+  route_customer() mocked -- no real API key needed for these. Full
+  suite: 720 passed, 29 skipped.
+
+Not done here, and cannot be done in this sandbox: an actual scored
+run needs a real OPENAI_API_KEY. The corpus is a starting point Webb
+asked for explicitly, not another batch of manually chosen questions,
+built to be extended as real failures turn up.
+---
+ README.md                      |  13 +
+ scripts/evaluator/__init__.py  |   0
+ scripts/evaluator/report.py    |  83 ++++
+ scripts/evaluator/runner.py    | 170 ++++++++
+ scripts/evaluator/scenarios.py | 688 +++++++++++++++++++++++++++++++++
+ scripts/evaluator/schema.py    | 136 +++++++
+ scripts/run_evaluator.py       |  75 ++++
+ tests/test_evaluator.py        | 299 ++++++++++++++
+ 8 files changed, 1464 insertions(+)
+ create mode 100644 scripts/evaluator/__init__.py
+ create mode 100755 scripts/evaluator/report.py
+ create mode 100755 scripts/evaluator/runner.py
+ create mode 100755 scripts/evaluator/scenarios.py
+ create mode 100755 scripts/evaluator/schema.py
+ create mode 100755 scripts/run_evaluator.py
+ create mode 100755 tests/test_evaluator.py
+
+diff --git a/README.md b/README.md
+index 6447aef..d596e3e 100644
+--- a/README.md
++++ b/README.md
+@@ -94,6 +94,19 @@ pytest --run-regression       # + prompt regression tests against the real OpenA
+ 
+ Regression tests are opt-in by design — the everyday test loop stays fast, offline, and free, while still allowing a real-API accuracy check when it's actually wanted.
+ 
++### Behavioural evaluator
++
++`scripts/evaluator/` is a separate, heavier tool from the pytest suite above: scenario-based, multi-turn conversations run against the real `route_customer()` pipeline (real OpenAI calls, real cost), checked against an expected tool/fields/response per turn across fifteen categories (product discovery, price, weight, karat, delivery, photo, orders, corrections, references, ambiguity, confirmation, post-confirmation, global delivery, Ghanaian language, social/reactive). Built to answer one question pytest can't: not just "does the code do what the code is supposed to do", but "does a real conversation actually resolve the way a customer would expect it to".
++
++```bash
++python3 scripts/run_evaluator.py                                        # every scenario
++python3 scripts/run_evaluator.py --category "REFERENCES"                # one category
++python3 scripts/run_evaluator.py --id references-04-golden-path-full-journey
++python3 scripts/run_evaluator.py --json report.json                     # full detail, incl. actual LLM output per turn
++```
++
++The scenario corpus (`scripts/evaluator/scenarios.py`) is a starting point, not a finished suite — extend it turn by turn as real live failures turn up, the same way `llm.py`'s own prompt already carries dated, confirmed-live examples. Correctness (right tool/fields/facts) and manner (does the reply actually read like a natural answer to what was asked) are checked separately on purpose — see `schema.py`'s `Turn.manner_note`: this evaluator does not auto-score manner, that's flagged for a human (or a future LLM-judge pass) to read off the JSON report's `manner_rating` field, left `null`.
++
+ ## Running Locally
+ 
+ ```bash
+diff --git a/scripts/evaluator/__init__.py b/scripts/evaluator/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/scripts/evaluator/report.py b/scripts/evaluator/report.py
+new file mode 100755
+index 0000000..b8ad749
+--- /dev/null
++++ b/scripts/evaluator/report.py
+@@ -0,0 +1,83 @@
++"""
++Turns a list of ScenarioResult into the two things Webb actually asked
++for: a scannable console summary (pass/fail by category), and a full
++JSON export carrying every field his spec named (customer message,
++expected intent/product/fields/tool/business result, actual LLM output,
++actual tool, actual final response, pass/fail) plus each turn's
++manner_note for a human reviewer to score -- this file does not invent
++an automated manner verdict, see schema.py's Turn docstring for why.
++"""
++
++from __future__ import annotations
++
++import json
++from collections import defaultdict
++
++from scripts.evaluator.schema import ScenarioResult
++
++
++def to_json(results: list[ScenarioResult]) -> str:
++    payload = []
++    for result in results:
++        scenario_entry = {
++            "id": result.scenario.id,
++            "category": result.scenario.category,
++            "description": result.scenario.description,
++            "source": result.scenario.source,
++            "passed": result.passed,
++            "error": result.error,
++            "turns": [],
++        }
++        for turn_result in result.turn_results:
++            llm_output = turn_result.trace.get("llm_structured_output") or {}
++            scenario_entry["turns"].append({
++                "customer_message": turn_result.turn.message,
++                "expected_tool": turn_result.turn.expected_tool,
++                "expected_fields": turn_result.turn.expected_fields,
++                "expected_contains": turn_result.turn.expected_contains,
++                "expected_not_contains": turn_result.turn.expected_not_contains,
++                "manner_note": turn_result.turn.manner_note,
++                "actual_tool": llm_output.get("tool"),
++                "actual_llm_output": llm_output,
++                "actual_resolved_arguments": turn_result.trace.get("resolved_arguments"),
++                "actual_final_response": turn_result.final_text,
++                "passed": turn_result.passed,
++                "checks": [
++                    {"label": c.label, "passed": c.passed, "detail": c.detail} for c in turn_result.checks
++                ],
++                # Left blank on purpose -- correct/wrong x natural/robotic
++                # is a human (or future LLM-judge) call, not something
++                # this evaluator scores itself. See schema.py.
++                "manner_rating": None,
++            })
++        payload.append(scenario_entry)
++    return json.dumps(payload, indent=2, default=str)
++
++
++def print_summary(results: list[ScenarioResult]) -> None:
++    by_category: dict[str, list[ScenarioResult]] = defaultdict(list)
++    for result in results:
++        by_category[result.scenario.category].append(result)
++
++    total = len(results)
++    total_passed = sum(1 for r in results if r.passed)
++    print(f"\nKasaFlow behavioural evaluator: {total_passed}/{total} scenarios passed\n")
++
++    for category in sorted(by_category):
++        cat_results = by_category[category]
++        cat_passed = sum(1 for r in cat_results if r.passed)
++        print(f"{category}: {cat_passed}/{len(cat_results)}")
++        for result in cat_results:
++            status = "PASS" if result.passed else "FAIL"
++            print(f"  [{status}] {result.scenario.id} -- {result.scenario.description}")
++            if result.error:
++                print(f"         error: {result.error}")
++                continue
++            for turn_result in result.turn_results:
++                if turn_result.passed:
++                    continue
++                print(f"         turn {turn_result.turn.message!r}:")
++                for check in turn_result.checks:
++                    if not check.passed:
++                        print(f"           - {check.label}: {check.detail}")
++        print()
+diff --git a/scripts/evaluator/runner.py b/scripts/evaluator/runner.py
+new file mode 100755
+index 0000000..07cd729
+--- /dev/null
++++ b/scripts/evaluator/runner.py
+@@ -0,0 +1,170 @@
++"""
++Runs Scenario objects (scripts/evaluator/schema.py) against the real
++route_customer() pipeline and checks the result against each turn's
++expectations.
++
++Requires a real OPENAI_API_KEY (and, for scenarios using
++delivery/geocoding, whatever else router.py's own dependencies need) --
++this drives the actual LLM tool-selection call, same as a real customer
++message would, not a mock. There is no offline mode for the pass/fail
++result itself; see tests/test_evaluator.py for how the harness's own
++comparison/reporting logic is unit tested instead, with route_customer()
++mocked out.
++
++Every scenario gets its own fresh session_id (a uuid4, not a customer
++phone number) so scenarios never share memory state with each other or
++with a real conversation, even when run against the same backing store
++a live deployment uses.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import uuid
++
++from scripts.evaluator.schema import CheckResult, Scenario, ScenarioResult, Turn, TurnResult
++from services.response_formatter import format_for_customer
++from services.router import route_customer
++
++_TRACE_PREFIX = "KASAFLOW_TURN_TRACE "
++
++
++class _TraceCapture(logging.Handler):
++    """Captures router.py's own KASAFLOW_TURN_TRACE log lines (built
++    2026-08-21) rather than re-deriving llm_structured_output/
++    resolved_arguments by reaching into router.py's private functions a
++    second time -- one source of truth for "what actually happened this
++    turn", already battle-tested as the thing Webb reads to debug real
++    failures."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.traces: list[dict] = []
++
++    def emit(self, record: logging.LogRecord) -> None:
++        message = record.getMessage()
++        if not message.startswith(_TRACE_PREFIX):
++            return
++        try:
++            self.traces.append(json.loads(message[len(_TRACE_PREFIX):]))
++        except json.JSONDecodeError:
++            # A malformed trace line is a router.py logging bug, not an
++            # evaluator bug -- don't let it crash the run, just drop it
++            # silently the same way _log_turn_trace() itself never lets
++            # a logging failure touch the customer-facing turn.
++            pass
++
++
++def run_turn(message: str, session_id: str) -> dict:
++    """Runs one turn through the real pipeline and returns the exact
++    trace dict router.py logged for it. Raises RuntimeError if nothing
++    was captured -- almost always means router.py's logger name changed
++    or its level was raised above INFO somewhere else in the process,
++    not that the turn silently did nothing."""
++    router_logger = logging.getLogger("services.router")
++    capture = _TraceCapture()
++    capture.setLevel(logging.INFO)
++    prior_level = router_logger.level
++    prior_propagate = router_logger.propagate
++    router_logger.addHandler(capture)
++    router_logger.setLevel(logging.INFO)
++    try:
++        route_customer(message, session_id=session_id)
++    finally:
++        router_logger.removeHandler(capture)
++        router_logger.setLevel(prior_level)
++        router_logger.propagate = prior_propagate
++
++    if not capture.traces:
++        raise RuntimeError(
++            f"No KASAFLOW_TURN_TRACE captured for message {message!r} -- "
++            "is services.router's logger reachable at INFO level?"
++        )
++    # A multi-request message ("requests" plural, see llm.py) logs one
++    # trace per sub-request plus none at the top level -- last one is
++    # the most recent tool actually run this turn, matching what a
++    # scenario asserting a single expected_tool means to check. Multi-
++    # intent-in-one-message scenarios should be written as the intended
++    # tool being the LAST distinct ask in the message, or should assert
++    # on resolved_arguments/expected_contains instead of expected_tool.
++    return capture.traces[-1]
++
++
++def _final_text(trace: dict) -> str:
++    final_result = trace.get("final_result")
++    if final_result is None:
++        return ""
++    return format_for_customer(final_result)
++
++
++def _check_turn(turn: Turn, trace: dict, final_text: str) -> list[CheckResult]:
++    checks: list[CheckResult] = []
++    llm_output = trace.get("llm_structured_output") or {}
++    resolved_arguments = trace.get("resolved_arguments") or {}
++    actual_tool = llm_output.get("tool")
++
++    if turn.expected_tool is not None:
++        expected = (
++            turn.expected_tool if isinstance(turn.expected_tool, tuple) else (turn.expected_tool,)
++        )
++        checks.append(
++            CheckResult(
++                label="tool",
++                passed=actual_tool in expected,
++                detail=f"expected tool in {expected!r}, got {actual_tool!r}",
++            )
++        )
++
++    if turn.expected_fields:
++        for key, expected_value in turn.expected_fields.items():
++            actual_value = resolved_arguments.get(key) if isinstance(resolved_arguments, dict) else None
++            checks.append(
++                CheckResult(
++                    label=f"field:{key}",
++                    passed=actual_value == expected_value,
++                    detail=f"expected {key}={expected_value!r}, got {actual_value!r}",
++                )
++            )
++
++    lowered_text = final_text.lower()
++    for substring in turn.expected_contains:
++        checks.append(
++            CheckResult(
++                label=f"contains:{substring!r}",
++                passed=substring.lower() in lowered_text,
++                detail=final_text,
++            )
++        )
++    for substring in turn.expected_not_contains:
++        checks.append(
++            CheckResult(
++                label=f"not_contains:{substring!r}",
++                passed=substring.lower() not in lowered_text,
++                detail=final_text,
++            )
++        )
++
++    return checks
++
++
++def run_scenario(scenario: Scenario, session_id: str | None = None) -> ScenarioResult:
++    """Runs every turn in a scenario against ONE shared session, in
++    order -- a multi-turn scenario is a single conversation, not several
++    independent messages, so later turns see the memory state earlier
++    turns left behind, same as a real customer would."""
++    session_id = session_id or f"eval-{scenario.id}-{uuid.uuid4()}"
++    turn_results: list[TurnResult] = []
++    try:
++        for turn in scenario.turns:
++            trace = run_turn(turn.message, session_id)
++            final_text = _final_text(trace)
++            checks = _check_turn(turn, trace, final_text)
++            turn_results.append(TurnResult(turn=turn, trace=trace, final_text=final_text, checks=checks))
++    except Exception as e:  # noqa: BLE001 -- a scenario blowing up is itself a result, not a crash
++        return ScenarioResult(scenario=scenario, turn_results=turn_results, error=str(e))
++    return ScenarioResult(scenario=scenario, turn_results=turn_results)
++
++
++def run_all(scenarios: list[Scenario]) -> list[ScenarioResult]:
++    return [run_scenario(scenario) for scenario in scenarios]
+diff --git a/scripts/evaluator/scenarios.py b/scripts/evaluator/scenarios.py
+new file mode 100755
+index 0000000..1573a5b
+--- /dev/null
++++ b/scripts/evaluator/scenarios.py
+@@ -0,0 +1,688 @@
++"""
++The KasaFlow behavioural evaluator's scenario corpus, organized under
++Webb's fifteen categories (2026-09-01).
++
++This is a starting corpus, not a finished one -- built to be extended
++scenario by scenario as real live failures turn up, the same way
++llm.py's own prompt already carries dated, confirmed-live examples
++rather than invented ones. Every scenario's `source` says plainly
++where it came from: an exact wording lifted from an existing test file
++or design doc in this repo is marked "confirmed live" with its date;
++anything constructed fresh for this corpus is marked "designed from
++category spec, not yet live-tested" -- see schema.py's Scenario
++docstring for why that distinction has to stay visible rather than
++being flattened into one undifferentiated list.
++
++Two real, confirmed-in-stock catalogue items recur across scenarios
++(same two KasaFlow_Scenario_Test_Script.md already used, 2026-08-2x):
++Big White Crown Stone Gold Ring, 14g (id 5892) and Custom Leaf White
++Gold Necklace, 20g (id 6810). Where a scenario needs a product this
++corpus hasn't independently confirmed against the live catalogue, that
++is noted in `source` rather than assumed.
++"""
++
++from __future__ import annotations
++
++from scripts.evaluator.schema import Scenario, Turn
++
++RING = "Big White Crown Stone Gold Ring, 14g"
++NECKLACE = "Custom Leaf White Gold Necklace, 20g"
++
++SCENARIOS: list[Scenario] = []
++
++
++def _add(scenario: Scenario) -> None:
++    SCENARIOS.append(scenario)
++
++
++# ---------------------------------------------------------------------
++# PRODUCT DISCOVERY
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="discovery-01-browse-category",
++    category="PRODUCT DISCOVERY",
++    description="A category browse with no karat stated should recommend, not ask for one product name.",
++    turns=[
++        Turn(
++            message="what rings do you have",
++            expected_tool="recommend_products",
++            expected_fields={"category": "Rings"},
++        ),
++    ],
++    source="designed from category spec, not yet live-tested",
++))
++
++_add(Scenario(
++    id="discovery-02-browse-with-karat",
++    category="PRODUCT DISCOVERY",
++    description="A category browse that also states a karat should narrow by it, not drop it.",
++    turns=[
++        Turn(
++            message="show me your necklaces in 18k",
++            expected_tool="recommend_products",
++            expected_fields={"category": "Necklaces", "material": "18k"},
++        ),
++    ],
++    source="designed from category spec, not yet live-tested",
++))
++
++_add(Scenario(
++    id="discovery-03-unstocked-category",
++    category="PRODUCT DISCOVERY",
++    description="Asking for a category this store doesn't stock (bracelets/earrings) should say what IS available, not a flat no.",
++    turns=[
++        Turn(
++            message="do you have any bracelets",
++            expected_tool="recommend_products",
++            expected_not_contains=["I don't have anything matching that right now -- want me to show you something similar"],
++        ),
++    ],
++    source="designed from category spec, not yet live-tested; response_formatter.py's available_categories branch is confirmed to exist in code, exact live wording not independently re-verified here",
++))
++
++
++# ---------------------------------------------------------------------
++# PRICE
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="price-01-named-product-no-karat",
++    category="PRICE",
++    description="A price ask for a real, named product with no karat stated must not fall through to a no-match message (regression: confirmed live 2026-08-24 that this used to say 'couldn't find that one').",
++    turns=[
++        Turn(
++            message=f"how much is the {RING}",
++            expected_tool="get_product_price",
++            expected_not_contains=["couldn't find that one"],
++        ),
++    ],
++    source="regression case confirmed live 2026-08-24 (Webb/GPT 50-turn test), see product_tool.py's get_product_price() docstring",
++))
++
++_add(Scenario(
++    id="price-02-named-product-with-karat",
++    category="PRICE",
++    description="A price ask naming both product and karat should quote that exact karat's price.",
++    turns=[
++        Turn(
++            message=f"{RING}, in 18k",
++            expected_tool="get_product_price",
++            expected_fields={"product_name": RING, "material": "18k"},
++            expected_contains=["18", "GH₵"],
++        ),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turn 1",
++))
++
++_add(Scenario(
++    id="price-03-karat-change-follow-up",
++    category="PRICE",
++    description="A bare karat follow-up right after a price quote should re-quote the SAME product at the new karat, not misroute to a browse.",
++    turns=[
++        Turn(message=f"{NECKLACE}, in 14k", expected_tool="get_product_price"),
++        Turn(
++            message="what about in 18k",
++            expected_tool="get_product_price",
++            expected_fields={"product_name": NECKLACE, "material": "18k"},
++        ),
++    ],
++    source="task #72 (\"price after karat change\"), designed to reproduce that fixed class of bug",
++))
++
++
++# ---------------------------------------------------------------------
++# WEIGHT
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="weight-01-direct-question",
++    category="WEIGHT",
++    description="A direct weight question is a factual answer, not a price or karat response.",
++    turns=[
++        Turn(message=f"how heavy is the {RING}", expected_tool="get_product_weight"),
++    ],
++    source="designed from category spec; get_product_weight tool built task #180",
++))
++
++_add(Scenario(
++    id="weight-02-confirmation-phrasing",
++    category="WEIGHT",
++    description="'That's the weight?' after being told a weight is a confirmation, not a fresh factual question -- same underlying fact, different expected register.",
++    turns=[
++        Turn(message=f"how many grams is the {RING}", expected_tool="get_product_weight"),
++        Turn(
++            message="is that really 14g?",
++            expected_tool="get_product_weight",
++            manner_note="Should read as a grounded reassurance referencing the catalogue fact already given, not a bare re-statement or an apology.",
++        ),
++    ],
++    source="designed from Webb's 2026-09-01 message (\"Is that really 1g?\" example); task #190 hardened get_product_weight's prompt for skeptical phrasings but this exact two-turn case is not independently confirmed live here",
++))
++
++_add(Scenario(
++    id="weight-03-weight-after-list",
++    category="WEIGHT",
++    description="A weight question referring to a just-shown list position should resolve against last_presented_products, not ask which product.",
++    turns=[
++        Turn(message="show me the rings", expected_tool="recommend_products"),
++        Turn(message="how heavy is the second one", expected_tool="get_product_weight"),
++    ],
++    source="designed from category spec, combining task #181 (last_presented_products) with task #180 (get_product_weight); not yet live-tested together",
++))
++
++
++# ---------------------------------------------------------------------
++# KARAT
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="karat-01-options-question",
++    category="KARAT",
++    description="'What karat does it come in' asks for the LIST of options, not one price.",
++    turns=[
++        Turn(message=f"what karats do you have the {NECKLACE} in", expected_tool="get_product_karat_options"),
++    ],
++    source="llm.py tool 10's own worked example",
++))
++
++_add(Scenario(
++    id="karat-02-specific-karat-after-options",
++    category="KARAT",
++    description="Naming one specific karat right after an options list is pricing that option, not re-asking for the list.",
++    turns=[
++        Turn(message=f"what karats do you have the {NECKLACE} in", expected_tool="get_product_karat_options"),
++        Turn(message="and in 18k?", expected_tool="get_product_price", expected_fields={"material": "18k"}),
++    ],
++    source="llm.py tool 10's own worked distinction (\"what about 12\", \"and in 18k?\" is get_product_price, not this tool)",
++))
++
++_add(Scenario(
++    id="karat-03-no-default-assumption",
++    category="KARAT",
++    description="propose_order must never assume 18k (or any karat) when the customer hasn't stated one.",
++    turns=[
++        Turn(
++            message=f"I want to order the {RING}",
++            expected_tool="propose_order",
++            expected_fields={"material": "unknown"},
++        ),
++    ],
++    source="llm.py tool 6's explicit rule + task #73 (\"karat defaulting to 18k without asking\")",
++))
++
++
++# ---------------------------------------------------------------------
++# DELIVERY
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="delivery-01-generic-question",
++    category="DELIVERY",
++    description="A generic delivery question with no place named lists the three real arrangements, not a cost.",
++    turns=[
++        Turn(message="how does delivery work", expected_tool="get_delivery_information", expected_fields={"address": "unknown"}),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turn 2",
++))
++
++_add(Scenario(
++    id="delivery-02-named-place-in-zone",
++    category="DELIVERY",
++    description="Naming a specific covered place should get a direct yes, not the generic three-way menu repeated.",
++    turns=[
++        Turn(message="do you deliver to Kumasi", expected_tool="get_delivery_information", expected_fields={"address": "Kumasi"}),
++    ],
++    source="response_formatter.py's matched_zone branch, built per Webb/GPT review 2026-08-22",
++))
++
++_add(Scenario(
++    id="delivery-03-price-then-delivery-continuation",
++    category="DELIVERY",
++    description="Confirming interest in delivery right after a price quote should pick up the delivery question, not restart.",
++    turns=[
++        Turn(message=f"{RING}, in 18k", expected_tool="get_product_price"),
++        Turn(message="yh", expected_tool=("get_delivery_information", "generate_quote")),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turns 1-2",
++))
++
++
++# ---------------------------------------------------------------------
++# PHOTO
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="photo-01-direct-photo-request",
++    category="PHOTO",
++    description="A direct photo request for a named product should carry an image, and read as answering 'can I see it', not as an unsolicited price quote.",
++    turns=[
++        Turn(
++            message=f"can I see a photo of the {NECKLACE}",
++            expected_tool="get_product_price",
++            manner_note="Right tool, image correctly attached per the intent/presentation audit (2026-09-01) -- but the caption text still defaults to a price template ('...Want to know about delivery too?') regardless of the ask being purely visual. Flag as a manner failure even if tool/data checks pass.",
++        ),
++    ],
++    source="intent/presentation resolution audit, 2026-09-01 -- the one concrete gap it found",
++))
++
++_add(Scenario(
++    id="photo-02-show-me-ordinal",
++    category="PHOTO",
++    description="'Show me the second one' after a list should resolve the ordinal and effectively show that product, not restart the browse.",
++    turns=[
++        Turn(message="show me the rings", expected_tool="recommend_products"),
++        Turn(message="show me the second one", expected_tool="get_product_price"),
++    ],
++    source="Webb's 2026-09-01 golden-path example, combined with task #181's ordinal resolution",
++))
++
++_add(Scenario(
++    id="photo-03-browse-sends-one-image-per-product",
++    category="PHOTO",
++    description="A genuine category browse should present visually -- multiple products, each with its own recommendation entry -- not a text-only wall.",
++    turns=[
++        Turn(
++            message="show me some rings",
++            expected_tool="recommend_products",
++            manner_note="Tool-level check only: the evaluator cannot see WhatsApp's actual sent messages from route_customer()'s return value alone (task #214 sends photos at the transport layer, not in the returned result dict). A full check of 'one image message per product, capped at 4' needs a transport-level test or a live WhatsApp run, not this harness as built.",
++        ),
++    ],
++    source="task #214 (visual recommend_products browse), transport-layer behaviour not fully observable through this evaluator's route_customer()-only capture -- see manner_note",
++))
++
++
++# ---------------------------------------------------------------------
++# ORDERS
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="orders-01-fully-specified-single-message",
++    category="ORDERS",
++    description="A fully-specified order in one message should produce one complete proposal, not a missing-field question.",
++    turns=[
++        Turn(
++            message=f"I want the {RING}, in 18k, 1 of them, deliver to East Legon, rider delivery within Accra",
++            expected_tool="propose_order",
++            expected_contains=["CONFIRM"],
++        ),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turn 5",
++))
++
++_add(Scenario(
++    id="orders-02-quantity-phrasing",
++    category="ORDERS",
++    description="'I'll take two' should be read as quantity 2 for the active product, not a new, separate ask.",
++    turns=[
++        Turn(message=f"{NECKLACE}, in 14k", expected_tool="get_product_price"),
++        Turn(message="I'll take two", expected_tool="propose_order", expected_fields={"quantity": 2}),
++    ],
++    source="Webb's 2026-09-01 golden-path example",
++))
++
++_add(Scenario(
++    id="orders-03-change-product-mid-proposal",
++    category="ORDERS",
++    description="Naming a different product mid-proposal should switch the order to it cleanly, not blend fields from both.",
++    turns=[
++        Turn(message=f"I want the {NECKLACE} in 14k", expected_tool="propose_order"),
++        Turn(
++            message=f"actually make it the {RING} instead",
++            expected_tool="propose_order",
++            expected_fields={"product_name": RING},
++        ),
++    ],
++    source="task #64 (\"change product mid-proposal\")",
++))
++
++
++# ---------------------------------------------------------------------
++# CORRECTIONS
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="corrections-01-karat-correction-acknowledged",
++    category="CORRECTIONS",
++    description="Correcting a karat mid-proposal should be acknowledged, not silently applied or ignored.",
++    turns=[
++        Turn(message=f"I want the {RING} in 12k, deliver to Osu", expected_tool="propose_order"),
++        Turn(
++            message="wait, 14k rather",
++            expected_tool="propose_order",
++            expected_fields={"material": "14k"},
++            manner_note="Should acknowledge the change (a correction_note), not just silently re-quote as if nothing was said.",
++        ),
++    ],
++    source="response_formatter.py's correction_note handling, task #90",
++))
++
++_add(Scenario(
++    id="corrections-02-pushback-not-just-repeated",
++    category="CORRECTIONS",
++    description="Pushback on a system decision ('why did you choose 18k for me') must route to the order/product question it's actually about, not answer_policy_question.",
++    turns=[
++        Turn(message=f"I want the {RING}, deliver to Osu", expected_tool="propose_order"),
++        Turn(
++            message="I didn't choose the karat so why did you choose 18k for me?",
++            expected_tool=("propose_order", "get_product_price"),
++            expected_not_contains=["warranty", "return"],
++        ),
++    ],
++    source="confirmed live, 2026-08-20 -- llm.py's own documented failure case this rule exists to prevent",
++))
++
++_add(Scenario(
++    id="corrections-03-address-change-updates-zone",
++    category="CORRECTIONS",
++    description="A genuinely different delivery address must clear the old delivery_option, not leave a Kumasi address paired with an Accra rider.",
++    turns=[
++        Turn(message=f"I want the {NECKLACE}, in 14k", expected_tool="get_product_price"),
++        Turn(message="I'll take 1, deliver to East Legon", expected_tool="propose_order"),
++        Turn(
++            message="actually deliver to Kumasi instead",
++            expected_tool="propose_order",
++            expected_not_contains=["rider delivery within Accra"],
++        ),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 11, fixed task #136",
++))
++
++
++# ---------------------------------------------------------------------
++# REFERENCES
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="references-01-ordinal-into-list",
++    category="REFERENCES",
++    description="'The second one' after a list must resolve by POSITION against last_presented_products, not a guess.",
++    turns=[
++        Turn(message="show me the rings", expected_tool="recommend_products"),
++        Turn(message="tell me more about the second one", expected_tool=("get_product_price", "get_product_karat_options")),
++    ],
++    source="task #181 (last_presented_products)",
++))
++
++_add(Scenario(
++    id="references-02-bare-demonstrative-after-multi-item-list",
++    category="REFERENCES",
++    description="A bare 'I'll take that one' with no ordinal, after MULTIPLE items shown, must ask which one -- not silently guess (this is the exact bug in the real 2026-08-30 trace that motivated task #197).",
++    turns=[
++        Turn(message="show me the rings", expected_tool="recommend_products"),
++        Turn(
++            message="I'll take that one",
++            expected_tool="converse",
++            manner_note="Must ask which item, not silently resolve to a position and jump into propose_order.",
++        ),
++    ],
++    source="real live trace, session b5591185-3f3f-4d3a-ac94-6cfe8b675f87, 2026-08-30 (pre-#197) -- this is the reproduction of that exact failure, now expected to be fixed by task #197's commits a20b313/62665df",
++))
++
++_add(Scenario(
++    id="references-04-golden-path-full-journey",
++    category="REFERENCES",
++    description="Webb's own end-to-end journey (2026-09-01): browse, refer, inspect, price, order, correct delivery twice, confirm -- without the customer ever having to repeat a product name. This is the corpus's single highest-value scenario: if this passes end to end, KasaFlow is doing what Webb defined as done ('a real customer can shop naturally for five minutes without having to repeat themselves or correct the assistant').",
++    turns=[
++        Turn(message="Show me some rings.", expected_tool="recommend_products"),
++        Turn(message="Second one.", expected_tool=("get_product_price", "get_product_karat_options", "propose_order")),
++        Turn(message="Can I see it?", expected_tool="get_product_price"),
++        Turn(message="How heavy?", expected_tool="get_product_weight"),
++        Turn(message="What about 18k?", expected_tool="get_product_price", expected_fields={"material": "18k"}),
++        Turn(message="I'll take two.", expected_tool="propose_order", expected_fields={"quantity": 2}),
++        Turn(message="Actually send them to Kumasi.", expected_tool="propose_order", expected_not_contains=["rider delivery within Accra"]),
++        Turn(message="No, Cape Coast.", expected_tool="propose_order", expected_not_contains=["Kumasi"]),
++        Turn(message="Okay confirm.", expected_tool="confirm_order"),
++    ],
++    source="Webb, 2026-09-01, given verbatim as the target experience -- not yet live-tested as one continuous run",
++))
++
++_add(Scenario(
++    id="references-03-details-preserved-through-clarification",
++    category="REFERENCES",
++    description="Details stated alongside an ambiguous reference ('that one, in 14k, two pieces') must survive the clarification round-trip, not be dropped.",
++    turns=[
++        Turn(message="show me the rings", expected_tool="recommend_products"),
++        Turn(message="that one, in 14k, two pieces", expected_tool="converse"),
++        Turn(
++            message="the second one",
++            expected_tool=("propose_order", "get_product_price"),
++            expected_fields={"material": "14k", "quantity": 2},
++            manner_note="material/quantity from the earlier ambiguous turn must reappear here without being restated.",
++        ),
++    ],
++    source="Webb's exact test case, 2026-08-31 (\"that one, in 14k\") -- task #197 follow-up commit 62665df's clarification_details mechanism",
++))
++
++
++# ---------------------------------------------------------------------
++# AMBIGUITY
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="ambiguity-01-bare-category-two-matches",
++    category="AMBIGUITY",
++    description="A bare category name that matches more than one item just shown must be flagged ambiguous, not silently resolved to the first match.",
++    turns=[
++        Turn(message="show me the rings", expected_tool="recommend_products"),
++        Turn(message="the ring", expected_tool="converse"),
++    ],
++    source="task #197's core case (bare category list reference)",
++))
++
++_add(Scenario(
++    id="ambiguity-02-unique-category-not-flagged",
++    category="AMBIGUITY",
++    description="A bare category name that matches exactly ONE item just shown should resolve normally, not be wrongly flagged ambiguous.",
++    turns=[
++        Turn(message=f"show me the {NECKLACE} and the {RING}", expected_tool=("recommend_products", "get_product_price")),
++        Turn(message="the necklace", expected_tool=("get_product_price", "get_product_karat_options", "propose_order")),
++    ],
++    source="regression guard for task #197 -- this must NOT trigger the ambiguity clarification, since only one necklace was shown",
++))
++
++_add(Scenario(
++    id="ambiguity-03-genuinely-unclear-product-name",
++    category="AMBIGUITY",
++    description="An unstocked/made-up product name should say so honestly, not guess at a similar-sounding real item.",
++    turns=[
++        Turn(message="how much is the unicorn pendant", expected_tool="get_product_price", expected_contains=["couldn't find"]),
++    ],
++    source="confirmed live, 2026-08-12 -- product_tool.py's get_product_price() min_keyword_overlap=1 guard exists specifically for this case",
++))
++
++
++# ---------------------------------------------------------------------
++# CONFIRMATION
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="confirmation-01-plain-yes",
++    category="CONFIRMATION",
++    description="A plain 'yes' right after a proposal should confirm it.",
++    turns=[
++        Turn(message=f"I want the {RING}, in 18k, 1 of them, deliver to East Legon, rider delivery within Accra", expected_tool="propose_order"),
++        Turn(message="confirm", expected_tool="confirm_order"),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turns 5-6",
++))
++
++_add(Scenario(
++    id="confirmation-02-stale-yes-not-confirmed",
++    category="CONFIRMATION",
++    description="A bare 'yes' is NOT a confirmation once something else has been asked/offered since the proposal (awaiting_confirmation must be False by then).",
++    turns=[
++        Turn(message=f"I want the {RING}, in 18k, 1 of them, deliver to East Legon, rider delivery within Accra", expected_tool="propose_order"),
++        Turn(message="do you deliver internationally too", expected_tool="get_delivery_information"),
++        Turn(message="yes", expected_tool=("confirm_order",), manner_note="This is the one genuinely ambiguous case in the corpus -- whether a bare 'yes' here should re-confirm the ORIGINAL order or be treated as answering the delivery question is a real product judgement call, not obviously wrong either way. Flag for Webb's own read rather than a hard pass/fail."),
++    ],
++    source="designed from memory.py's is_awaiting_confirmation() docstring and task #99 (awaiting_field/awaiting_action state machine); the expected_tool here is a placeholder, not a confirmed-correct answer -- see manner_note",
++))
++
++_add(Scenario(
++    id="confirmation-03-bare-agreement-not-address",
++    category="CONFIRMATION",
++    description="A bare agreement word ('yh', 'okay') must never be captured as a delivery_address.",
++    turns=[
++        Turn(message=f"{RING}, in 18k", expected_tool="get_product_price"),
++        Turn(message="yh", expected_tool=("get_delivery_information", "generate_quote"), expected_not_contains=["deliver to Yh", "deliver to yh"]),
++    ],
++    source="task #101 (\"bare-agreement word wrongly resolved as delivery address\")",
++))
++
++
++# ---------------------------------------------------------------------
++# POST-CONFIRMATION
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="post-confirmation-01-order-status-by-memory",
++    category="POST-CONFIRMATION",
++    description="'Where is my order' right after confirming should resolve to that same order without the customer repeating the number.",
++    turns=[
++        Turn(message=f"I want the {RING}, in 18k, 1 of them, deliver to East Legon, rider delivery within Accra", expected_tool="propose_order"),
++        Turn(message="confirm", expected_tool="confirm_order"),
++        Turn(message="where is my order", expected_tool="get_order_status", expected_fields={"order_id": "unknown"}),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turns 6-7",
++))
++
++_add(Scenario(
++    id="post-confirmation-02-cancel-nonexistent",
++    category="POST-CONFIRMATION",
++    description="Cancelling an order number that doesn't exist should say so honestly, not silently succeed.",
++    turns=[
++        Turn(message="cancel order 99999", expected_tool="cancel_order", expected_contains=["couldn't find"]),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 9",
++))
++
++_add(Scenario(
++    id="post-confirmation-03-order-details-from-woocommerce-not-conversation",
++    category="POST-CONFIRMATION",
++    description="A question about what a CONFIRMED order actually contains must be answered from get_order_status's real WooCommerce read, not from what the conversation said a few turns ago.",
++    turns=[
++        Turn(message=f"I want the {RING}, in 12k, deliver to Osu, rider delivery within Accra", expected_tool="propose_order"),
++        Turn(message="wait, 14k rather", expected_tool="propose_order"),
++        Turn(message="confirm", expected_tool="confirm_order"),
++        Turn(message="what karat did I order", expected_tool="get_order_status"),
++    ],
++    source="task #175/#176 (grounding confirmed-order facts, anti-hallucination guardrail) -- llm.py's own documented rule that a mid-conversation correction is not reliable evidence of the final confirmed karat",
++))
++
++
++# ---------------------------------------------------------------------
++# GLOBAL DELIVERY
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="global-delivery-01-non-rider-ghana-zone",
++    category="GLOBAL DELIVERY",
++    description="A real Ghanaian place outside the rider zones should say yes with an honest caveat, not force it into Accra/Kumasi rider or refuse it.",
++    turns=[
++        Turn(
++            message="what of bolgatanga, I'm in the northern region",
++            expected_tool="get_delivery_information",
++            expected_contains=["Bolgatanga"],
++        ),
++    ],
++    source="confirmed live, KasaFlow_Scenario_Test_Script.md scenario 8 turn 3",
++))
++
++_add(Scenario(
++    id="global-delivery-02-international",
++    category="GLOBAL DELIVERY",
++    description="A non-Ghana destination should map to the international shipping arrangement or the honest generic fallback, not a Ghana-only zone.",
++    turns=[
++        Turn(message="what about London", expected_tool="get_delivery_information"),
++    ],
++    source="confirmed live (structurally), KasaFlow_Scenario_Test_Script.md scenario 8 turn 4 -- exact response depends on whether the Google Maps key is live, script names both valid outcomes explicitly",
++))
++
++_add(Scenario(
++    id="global-delivery-03-wrong-region-not-assumed",
++    category="GLOBAL DELIVERY",
++    description="A Tamale address must never be silently priced under the Kumasi rider zone.",
++    turns=[
++        Turn(
++            message=f"I want the {RING}, in 18k, deliver to Tamale",
++            expected_tool="propose_order",
++            expected_not_contains=["kumasi_rider", "rider delivery within Kumasi"],
++        ),
++    ],
++    source="task #61 (\"wrong region: Kumasi rider chosen, Tamale address\")",
++))
++
++
++# ---------------------------------------------------------------------
++# GHANAIAN LANGUAGE
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="ghanaian-language-01-twi-greeting",
++    category="GHANAIAN LANGUAGE",
++    description="A Twi greeting should get a warm, natural converse reply in kind, not an English-only stock phrase.",
++    turns=[
++        Turn(message="Maakye", expected_tool="converse"),
++    ],
++    source="designed from llm.py's own converse guidance (\"match the customer's language\"), not yet live-tested with this exact greeting",
++))
++
++_add(Scenario(
++    id="ghanaian-language-02-medaase-thanks",
++    category="GHANAIAN LANGUAGE",
++    description="'Medaase' (thank you) should be recognised as thanks, not routed as an unclear/unknown message.",
++    turns=[
++        Turn(message="medaase", expected_tool="converse"),
++    ],
++    source="llm.py's own worked converse example",
++))
++
++_add(Scenario(
++    id="ghanaian-language-03-mixed-twi-english-product-ask",
++    category="GHANAIAN LANGUAGE",
++    description="A natural mixed Twi/English product question should still route to the right business tool, not fall back to converse just because it isn't pure English.",
++    turns=[
++        Turn(message=f"3ho b3n na {RING} y3", expected_tool="get_product_price"),
++    ],
++    source="designed from category spec, not yet live-tested -- flagged as the corpus's weakest-confidence scenario, since exact live Twi phrasing accuracy has not been independently confirmed here",
++))
++
++
++# ---------------------------------------------------------------------
++# SOCIAL/REACTIVE
++# ---------------------------------------------------------------------
++
++_add(Scenario(
++    id="social-01-greeting",
++    category="SOCIAL/REACTIVE",
++    description="A bare greeting is converse, not routed to any business tool.",
++    turns=[
++        Turn(message="hey", expected_tool="converse"),
++    ],
++    source="llm.py's own worked converse example",
++))
++
++_add(Scenario(
++    id="social-02-reaction-does-not-derail-order",
++    category="SOCIAL/REACTIVE",
++    description="A reaction/emoji mid-order should not clear or restart the in-progress proposal.",
++    turns=[
++        Turn(message=f"I want the {RING}, in 18k, deliver to Osu", expected_tool="propose_order"),
++        Turn(message="😍", expected_tool="converse"),
++        Turn(message="confirm", expected_tool="confirm_order"),
++    ],
++    source="designed from task #66 (\"unrelated question mid-order\") applied to a reaction instead of a question; not independently live-tested with an emoji specifically",
++))
++
++_add(Scenario(
++    id="social-03-unrelated-question-mid-order-does-not-lose-state",
++    category="SOCIAL/REACTIVE",
++    description="An unrelated question mid-order should be answered without discarding the pending order.",
++    turns=[
++        Turn(message=f"I want the {RING}, in 18k, deliver to Osu", expected_tool="propose_order"),
++        Turn(message="do you have a physical shop", expected_tool=("answer_policy_question", "converse")),
++        Turn(message="confirm", expected_tool="confirm_order"),
++    ],
++    source="confirmed live (as a class of bug), task #66 (\"Scenario 7: unrelated question mid-order\")",
++))
+diff --git a/scripts/evaluator/schema.py b/scripts/evaluator/schema.py
+new file mode 100755
+index 0000000..16f1bbc
+--- /dev/null
++++ b/scripts/evaluator/schema.py
+@@ -0,0 +1,136 @@
++"""
++Scenario and result data types for the KasaFlow behavioural evaluator.
++
++Deliberately separate from runner.py and scenarios.py: this file has no
++dependency on route_customer() or the OpenAI client, so it can be
++imported (and unit tested) anywhere without needing OPENAI_API_KEY set,
++same reasoning as this codebase's own services modules staying
++independently importable.
++
++Categories are Webb's own list (2026-09-01), kept as a plain tuple
++rather than an enum so a new category never needs a code change to add
++-- scenarios.py just uses a new string and report.py groups by whatever
++strings actually appear.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++
++CATEGORIES = (
++    "PRODUCT DISCOVERY",
++    "PRICE",
++    "WEIGHT",
++    "KARAT",
++    "DELIVERY",
++    "PHOTO",
++    "ORDERS",
++    "CORRECTIONS",
++    "REFERENCES",
++    "AMBIGUITY",
++    "CONFIRMATION",
++    "POST-CONFIRMATION",
++    "GLOBAL DELIVERY",
++    "GHANAIAN LANGUAGE",
++    "SOCIAL/REACTIVE",
++)
++
++
++@dataclass
++class Turn:
++    """One customer message within a scenario, and what's expected of
++    KasaFlow's response to it. Every expectation field is optional --
++    a turn only checks what it actually specifies, so a scenario whose
++    point is "does this resolve the right product" doesn't also have to
++    spell out exact response wording, and vice versa.
++
++    expected_tool: the tool llm.py should have selected. A single
++    string, or a tuple of acceptable alternatives when more than one
++    tool choice is legitimately correct (e.g. generate_quote vs
++    get_product_price both being defensible for a bare price ask).
++
++    expected_fields: a subset of resolved_arguments (router.py's
++    post-fill_missing_context() values, i.e. after memory resolution,
++    not just what the LLM guessed) that must match exactly. Only the
++    keys listed are checked -- this is a subset match, not an equality
++    check against the whole dict, so a scenario can assert
++    "product_name resolved to X" without also having to predict every
++    other argument.
++
++    expected_contains / expected_not_contains: substrings (case
++    insensitive) the final customer-facing text (format_for_customer()
++    output) must or must not contain. This is the main way a scenario
++    checks manner as well as correctness -- e.g. asserting a photo-only
++    ask's reply does NOT contain "Want to know about delivery" is
++    exactly the caption-mismatch class of failure the intent/
++    presentation audit flagged (2026-09-01).
++
++    manner_note: not machine-checked. A short description of what a
++    natural response SHOULD read like, carried through into the report
++    for a human reviewer (or a future LLM-judge pass, not built yet) to
++    score against -- see Webb's four-way correct/wrong x natural/robotic
++    split. Leaving this unscored rather than faking an automated pass/
++    fail for something this evaluator cannot actually judge yet."""
++
++    message: str
++    expected_tool: str | tuple[str, ...] | None = None
++    expected_fields: dict | None = None
++    expected_contains: list[str] = field(default_factory=list)
++    expected_not_contains: list[str] = field(default_factory=list)
++    manner_note: str = ""
++    notes: str = ""
++
++
++@dataclass
++class Scenario:
++    """A full conversation (one or more turns, sharing one session) and
++    what it's meant to prove. `source` is deliberately explicit about
++    provenance -- "confirmed live, 2026-08-20" carries different weight
++    than "designed from category spec, not yet live-tested", and this
++    evaluator should never blur that distinction (see this repo's own
++    standing rule against presenting an inference as a verified fact)."""
++
++    id: str
++    category: str
++    description: str
++    turns: list[Turn]
++    source: str = "designed from category spec, not yet live-tested"
++
++    def __post_init__(self) -> None:
++        if self.category not in CATEGORIES:
++            raise ValueError(f"Unknown category {self.category!r} for scenario {self.id!r}")
++        if not self.turns:
++            raise ValueError(f"Scenario {self.id!r} has no turns")
++
++
++@dataclass
++class CheckResult:
++    label: str
++    passed: bool
++    detail: str = ""
++
++
++@dataclass
++class TurnResult:
++    turn: Turn
++    trace: dict
++    final_text: str
++    checks: list[CheckResult]
++
++    @property
++    def passed(self) -> bool:
++        return all(c.passed for c in self.checks)
++
++
++@dataclass
++class ScenarioResult:
++    scenario: Scenario
++    turn_results: list[TurnResult]
++    error: str | None = None
++
++    @property
++    def passed(self) -> bool:
++        if self.error is not None:
++            return False
++        return all(tr.passed for tr in self.turn_results)
+diff --git a/scripts/run_evaluator.py b/scripts/run_evaluator.py
+new file mode 100755
+index 0000000..abe3068
+--- /dev/null
++++ b/scripts/run_evaluator.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""
++Run the KasaFlow behavioural evaluator (scripts/evaluator/) against the
++real system and report the results.
++
++Requires a real OPENAI_API_KEY (and APP_API_KEY, same as running the
++app itself -- see app/config.py) -- this drives actual LLM tool
++selection for every turn, exactly like a real customer message. There
++is no mock mode for a real scored run; that's the whole point.
++
++Usage (from the repo root -- or set OPENAI_API_KEY/APP_API_KEY in a
++.env file there, same as running the app itself; load_dotenv() picks
++it up automatically):
++    python3 scripts/run_evaluator.py
++    python3 scripts/run_evaluator.py --category "REFERENCES"
++    python3 scripts/run_evaluator.py --id references-04-golden-path-full-journey
++    python3 scripts/run_evaluator.py --json report.json
++
++Exits non-zero if any scenario failed, so this is CI/pre-demo-gate
++friendly if Webb ever wants it wired into GitHub Actions -- not done
++here, since that decision (and what the pass bar should be) is his
++call, not something to assume.
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++# Run as `python scripts/run_evaluator.py`, which only puts this folder
++# on sys.path, not the repo root -- add it explicitly so `from
++# scripts.evaluator...`/`from services...`/`from app...` all resolve,
++# same pattern as this folder's existing manual_*_check.py scripts.
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from dotenv import load_dotenv
++
++load_dotenv()
++
++from scripts.evaluator.report import print_summary, to_json
++from scripts.evaluator.runner import run_all
++from scripts.evaluator.scenarios import SCENARIOS
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--category", help="Only run scenarios in this category (exact match).")
++    parser.add_argument("--id", dest="scenario_id", help="Only run the scenario with this id.")
++    parser.add_argument("--json", dest="json_path", help="Write the full report as JSON to this path.")
++    args = parser.parse_args()
++
++    scenarios = SCENARIOS
++    if args.category:
++        scenarios = [s for s in scenarios if s.category == args.category]
++    if args.scenario_id:
++        scenarios = [s for s in scenarios if s.id == args.scenario_id]
++
++    if not scenarios:
++        print("No scenarios matched --category/--id.", file=sys.stderr)
++        return 2
++
++    results = run_all(scenarios)
++    print_summary(results)
++
++    if args.json_path:
++        with open(args.json_path, "w", encoding="utf-8") as f:
++            f.write(to_json(results))
++        print(f"Full report written to {args.json_path}")
++
++    return 0 if all(r.passed for r in results) else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_evaluator.py b/tests/test_evaluator.py
+new file mode 100755
+index 0000000..0e7fad7
+--- /dev/null
++++ b/tests/test_evaluator.py
+@@ -0,0 +1,299 @@
++"""
++Unit tests for the KasaFlow behavioural evaluator (scripts/evaluator/).
++
++None of these hit the real OpenAI API -- route_customer() is mocked
++throughout, standing in for router.py by logging the same
++KASAFLOW_TURN_TRACE line the real function would, so run_turn()'s
++log-capture wiring is genuinely exercised (not just its comparison
++logic against a hand-built dict). What these tests CANNOT prove is
++whether a real scenario passes against the real model -- that needs a
++real OPENAI_API_KEY and scripts/run_evaluator.py, not this file. See
++scripts/evaluator/runner.py's own module docstring.
++"""
++
++import json
++import logging
++
++import pytest
++
++from scripts.evaluator.report import print_summary, to_json
++from scripts.evaluator.runner import run_scenario, run_turn
++from scripts.evaluator.schema import CATEGORIES, Scenario, Turn
++
++
++def _fake_route_customer(trace_overrides):
++    """Builds a stand-in for services.router.route_customer that logs a
++    KASAFLOW_TURN_TRACE line the same shape router.py's real
++    _log_turn_trace() produces, so run_turn()'s capture handler has
++    something real to catch."""
++    router_logger = logging.getLogger("services.router")
++
++    def _fake(message, session_id):
++        trace = {
++            "session_id": session_id,
++            "customer_message": message,
++            "pre_tool_state": {},
++            "llm_structured_output": {"tool": "get_product_price", "arguments": {"product_name": "Ring"}},
++            "resolved_arguments": {"product_name": "Ring", "material": "18k"},
++            "tool_result": {"product": "Ring", "material": "18k", "price": 1200.0},
++            "final_result": {"product": "Ring", "material": "18k", "price": 1200.0},
++            "post_tool_state": {},
++        }
++        trace.update(trace_overrides)
++        router_logger.info("KASAFLOW_TURN_TRACE %s", json.dumps(trace))
++        return trace["final_result"]
++
++    return _fake
++
++
++# ---------------------------------------------------------------------
++# schema.py
++# ---------------------------------------------------------------------
++
++def test_scenario_rejects_unknown_category():
++    with pytest.raises(ValueError):
++        Scenario(id="x", category="NOT A REAL CATEGORY", description="d", turns=[Turn(message="hi")])
++
++
++def test_scenario_rejects_empty_turns():
++    with pytest.raises(ValueError):
++        Scenario(id="x", category=CATEGORIES[0], description="d", turns=[])
++
++
++def test_scenario_result_passed_is_false_when_error_set():
++    from scripts.evaluator.schema import ScenarioResult
++
++    scenario = Scenario(id="x", category=CATEGORIES[0], description="d", turns=[Turn(message="hi")])
++    result = ScenarioResult(scenario=scenario, turn_results=[], error="boom")
++    assert result.passed is False
++
++
++# ---------------------------------------------------------------------
++# runner.py -- run_turn()'s trace capture
++# ---------------------------------------------------------------------
++
++def test_run_turn_captures_the_logged_trace(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    trace = run_turn("how much is the ring", session_id="test-session")
++    assert trace["customer_message"] == "how much is the ring"
++    assert trace["llm_structured_output"]["tool"] == "get_product_price"
++
++
++def test_run_turn_raises_when_nothing_was_logged(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        lambda message, session_id: {"product": "Ring"},  # never logs a trace
++    )
++    with pytest.raises(RuntimeError, match="No KASAFLOW_TURN_TRACE captured"):
++        run_turn("how much is the ring", session_id="test-session")
++
++
++def test_run_turn_does_not_leak_the_capture_handler(monkeypatch):
++    # A handler left attached after run_turn() returns would silently
++    # accumulate across every subsequent scenario in the same process,
++    # and would keep capturing every REAL route_customer() call this
++    # process ever makes afterwards -- both wrong. Confirm cleanup.
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    router_logger = logging.getLogger("services.router")
++    handlers_before = list(router_logger.handlers)
++    run_turn("hello", session_id="test-session")
++    assert router_logger.handlers == handlers_before
++
++
++# ---------------------------------------------------------------------
++# runner.py -- run_scenario()'s comparison logic
++# ---------------------------------------------------------------------
++
++def test_run_scenario_passes_when_expectations_match(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-01",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_tool="get_product_price", expected_fields={"material": "18k"})],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is True
++    assert result.error is None
++
++
++def test_run_scenario_fails_on_wrong_tool(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-02",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_tool="propose_order")],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is False
++    failing_checks = [c for tr in result.turn_results for c in tr.checks if not c.passed]
++    assert any(c.label == "tool" for c in failing_checks)
++
++
++def test_run_scenario_fails_on_wrong_field(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-03",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_fields={"material": "14k"})],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is False
++
++
++def test_run_scenario_checks_expected_contains_against_formatted_reply(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-04",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_contains=["GH₵1,200.00"])],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is True
++
++
++def test_run_scenario_expected_not_contains_catches_a_bad_reply(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-05",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_not_contains=["GH₵1,200.00"])],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is False
++
++
++def test_run_scenario_records_error_without_raising(monkeypatch):
++    def _boom(message, session_id):
++        raise RuntimeError("simulated LLM failure")
++
++    monkeypatch.setattr("scripts.evaluator.runner.route_customer", _boom)
++    scenario = Scenario(
++        id="unit-06",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring")],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is False
++    assert "simulated LLM failure" in result.error
++
++
++def test_run_scenario_shares_one_session_across_turns(monkeypatch):
++    seen_session_ids = []
++
++    def _fake(message, session_id):
++        seen_session_ids.append(session_id)
++        return _fake_route_customer({})(message, session_id)
++
++    monkeypatch.setattr("scripts.evaluator.runner.route_customer", _fake)
++    scenario = Scenario(
++        id="unit-07",
++        category="REFERENCES",
++        description="unit test",
++        turns=[Turn(message="first"), Turn(message="second")],
++    )
++    run_scenario(scenario)
++    assert len(set(seen_session_ids)) == 1
++
++
++def test_run_scenario_accepts_a_tuple_of_alternative_tools(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-08",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_tool=("propose_order", "get_product_price"))],
++    )
++    result = run_scenario(scenario)
++    assert result.passed is True
++
++
++# ---------------------------------------------------------------------
++# report.py
++# ---------------------------------------------------------------------
++
++def test_to_json_round_trips_and_leaves_manner_rating_unscored(monkeypatch):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-09",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_tool="get_product_price", manner_note="should read naturally")],
++    )
++    result = run_scenario(scenario)
++    payload = json.loads(to_json([result]))
++    assert payload[0]["id"] == "unit-09"
++    assert payload[0]["passed"] is True
++    turn_payload = payload[0]["turns"][0]
++    assert turn_payload["manner_note"] == "should read naturally"
++    # Never fabricate an automated manner verdict -- see schema.py.
++    assert turn_payload["manner_rating"] is None
++
++
++def test_print_summary_does_not_raise(monkeypatch, capsys):
++    monkeypatch.setattr(
++        "scripts.evaluator.runner.route_customer",
++        _fake_route_customer({}),
++    )
++    scenario = Scenario(
++        id="unit-10",
++        category="PRICE",
++        description="unit test",
++        turns=[Turn(message="how much is the ring", expected_tool="propose_order")],
++    )
++    result = run_scenario(scenario)
++    print_summary([result])
++    captured = capsys.readouterr()
++    assert "unit-10" in captured.out
++    assert "FAIL" in captured.out
++
++
++# ---------------------------------------------------------------------
++# scenarios.py -- the corpus itself is well-formed
++# ---------------------------------------------------------------------
++
++def test_scenario_corpus_covers_every_category_and_has_no_duplicate_ids():
++    from scripts.evaluator.scenarios import SCENARIOS
++
++    seen_categories = {s.category for s in SCENARIOS}
++    assert seen_categories == set(CATEGORIES)
++
++    ids = [s.id for s in SCENARIOS]
++    assert len(ids) == len(set(ids))
++
++    for scenario in SCENARIOS:
++        assert scenario.source, f"{scenario.id} has no source"
++        for turn in scenario.turns:
++            assert turn.message.strip(), f"{scenario.id} has an empty turn message"
+-- 
+2.34.1
+

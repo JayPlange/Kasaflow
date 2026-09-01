@@ -6,7 +6,11 @@ tools can produce gets exercised directly against the real formatter,
 no mocking needed.
 """
 
-from services.response_formatter import format_for_customer, select_presented_groups
+from services.response_formatter import (
+    format_for_customer,
+    format_recommendation_caption,
+    select_presented_groups,
+)
 
 
 def test_formats_no_match():
@@ -549,6 +553,52 @@ def test_formats_recommendations_keeps_variants_with_different_prices_separate()
     assert formatted.count("*") % 2 == 0
     assert "\n   * " not in formatted
 
+
+
+# ---------------------------------------------------------------------
+# format_recommendation_caption() -- the per-item caption sent alongside
+# its own WhatsApp image message when a browse returns more than one
+# product (Webb, 2026-09-01: "visual browsing is part of the jewellery
+# experience"), and the same text shown under each /demo card.
+# ---------------------------------------------------------------------
+
+def test_format_recommendation_caption_single_variant():
+    caption = format_recommendation_caption(
+        "Custom Leaf White Gold Necklace, 20g", [{"material": "14k", "price": 30000.0}]
+    )
+    assert caption == "*Custom Leaf White Gold Necklace, 20g*\n14k: GH₵30,000.00"
+
+
+def test_format_recommendation_caption_lists_each_karat_and_price():
+    variants = [
+        {"material": "12k", "price": 26000.0},
+        {"material": "14k", "price": 30000.0},
+        {"material": "18k", "price": 34000.0},
+    ]
+    caption = format_recommendation_caption("Solid Cross Chains White Gold Necklace, 20g", variants)
+    assert caption == (
+        "*Solid Cross Chains White Gold Necklace, 20g*\n"
+        "12k · GH₵26,000.00 | 14k · GH₵30,000.00 | 18k · GH₵34,000.00"
+    )
+
+
+def test_format_recommendation_caption_collapses_same_price_variants():
+    variants = [{"material": "12k", "price": 8000.0}, {"material": "14k", "price": 8000.0}]
+    caption = format_recommendation_caption("Plain Band", variants)
+    assert caption == "*Plain Band*\n12k | 14k: GH₵8,000.00"
+
+
+def test_format_recommendation_caption_collapses_to_a_range_past_the_variant_cap():
+    # A sized ring can have dozens of karat+size combinations -- past
+    # _MAX_VARIANTS_LISTED, listing every one in a single caption line
+    # is unreadable, same cut-off the multi-line text formatter uses.
+    variants = [{"material": f"{k}k / Women US {s}", "price": 100.0 * i} for i, (k, s) in enumerate(
+        [(12, 7), (12, 8), (14, 7), (14, 8), (18, 7)], start=1
+    )]
+    caption = format_recommendation_caption("Big White Crown Stone Gold Ring, 14g", variants)
+    assert caption.startswith("*Big White Crown Stone Gold Ring, 14g*\n")
+    assert "options" in caption
+    assert "·" not in caption.split("\n", 1)[1]
 
 # ---------------------------------------------------------------------
 # The additive "results" (plural) shape -- router.py's answer to a

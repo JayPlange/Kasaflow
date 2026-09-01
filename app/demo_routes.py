@@ -34,7 +34,12 @@ from app.config import settings
 from services.memory import remember_context
 from services.photo_match_tool import identify_product_from_photo
 from services.product_tool import get_product_karat_options
-from services.response_formatter import _group_by_product, _select_diverse_groups, format_for_customer
+from services.response_formatter import (
+    _group_by_product,
+    _select_diverse_groups,
+    format_for_customer,
+    format_recommendation_caption,
+)
 from services.router import route_customer
 from services.vision_tool import VisionServiceError, describe_product_image
 from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
@@ -128,9 +133,11 @@ def demo_dashboard() -> str:
 
 def _build_recommendation_cards(result: dict) -> list[dict]:
     """One photo card per distinct product in a recommendations reply --
-    answers "can I see pictures" for a browse-style query directly,
-    rather than needing the assistant to remember what it just listed
-    and handle a separate follow-up request for photos."""
+    mirrors the one-image-per-product WhatsApp reply whatsapp_routes.py
+    sends for the same result shape (see that module's browse branch),
+    using the exact same format_recommendation_caption() text, so what
+    Webb sees testing here in /demo is what a real customer gets on
+    WhatsApp, not a mockup of it (see this module's own docstring)."""
     items = result.get("recommendations") or []
     # Same category-diversified selection as the text reply (see
     # response_formatter._select_diverse_groups) -- without this, an
@@ -141,9 +148,12 @@ def _build_recommendation_cards(result: dict) -> list[dict]:
     cards = []
     for name, variants in groups:
         with_photo = next((v for v in variants if v.get("image_url")), variants[0])
-        prices = [v["price"] for v in variants]
-        low, high = min(prices), max(prices)
-        price_label = f"GH₵{low:,.2f}" if low == high else f"GH₵{low:,.2f}-GH₵{high:,.2f}"
+        # format_recommendation_caption() returns "*name*\ndetail" --
+        # the dashboard already renders the name in its own bold CSS
+        # class (see demo_dashboard.html's .pc-name), so only the detail
+        # line (the part after the newline) is needed as price_label;
+        # the name itself still comes from the existing `product` field.
+        _, _, price_label = format_recommendation_caption(name, variants).partition("\n")
         cards.append({
             "product": name,
             "image_url": _proxied_image_url(with_photo.get("image_url")),

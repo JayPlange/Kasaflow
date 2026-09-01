@@ -1,0 +1,407 @@
+From 90d97ce0091f9767c3d72a1785728803e4037b53 Mon Sep 17 00:00:00 2001
+From: unknown <jayplange07@gmail.com>
+Date: Tue, 1 Sep 2026 07:46:49 +0000
+Subject: [PATCH] Send one WhatsApp image message per product for
+ recommend_products browses (task #214)
+
+- Add format_recommendation_caption() to response_formatter.py: a
+  compact two-line caption (name, then karat/price pairs joined with
+  ' | ', collapsing to a price range past the existing 3-variant cap)
+  shared by both the WhatsApp send path and the /demo cards.
+- whatsapp_routes.py: a genuine browse (recommend_products returning
+  more than one product) now sends one image+caption message per
+  product, capped at 4, using the same category-diversified selection
+  already used for last_presented_products. Items without a photo, or
+  a failed send, fall back to one trailing text message rather than
+  being dropped. Audio input is unaffected -- still one spoken reply.
+  Previously this path sent text only, zero photos, for every browse.
+- demo_routes.py: _build_recommendation_cards() now reuses the same
+  caption formatter so /demo mirrors the real WhatsApp reply exactly.
+- Tests for the new formatter and the new WhatsApp branch (multi-image
+  send, cap at 4, no-photo fallback, send-failure fallback, audio
+  priority unaffected). Full suite: 703 passed, 29 skipped.
+---
+ app/demo_routes.py               |  24 ++++--
+ app/whatsapp_routes.py           |  47 +++++++++++-
+ services/response_formatter.py   |  40 ++++++++++
+ tests/test_response_formatter.py |  52 ++++++++++++-
+ tests/test_whatsapp_routes.py    | 121 +++++++++++++++++++++++++++++++
+ 5 files changed, 275 insertions(+), 9 deletions(-)
+
+diff --git a/app/demo_routes.py b/app/demo_routes.py
+index 31a160f..8fce488 100644
+--- a/app/demo_routes.py
++++ b/app/demo_routes.py
+@@ -34,7 +34,12 @@ from app.config import settings
+ from services.memory import remember_context
+ from services.photo_match_tool import identify_product_from_photo
+ from services.product_tool import get_product_karat_options
+-from services.response_formatter import _group_by_product, _select_diverse_groups, format_for_customer
++from services.response_formatter import (
++    _group_by_product,
++    _select_diverse_groups,
++    format_for_customer,
++    format_recommendation_caption,
++)
+ from services.router import route_customer
+ from services.vision_tool import VisionServiceError, describe_product_image
+ from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
+@@ -128,9 +133,11 @@ def demo_dashboard() -> str:
+ 
+ def _build_recommendation_cards(result: dict) -> list[dict]:
+     """One photo card per distinct product in a recommendations reply --
+-    answers "can I see pictures" for a browse-style query directly,
+-    rather than needing the assistant to remember what it just listed
+-    and handle a separate follow-up request for photos."""
++    mirrors the one-image-per-product WhatsApp reply whatsapp_routes.py
++    sends for the same result shape (see that module's browse branch),
++    using the exact same format_recommendation_caption() text, so what
++    Webb sees testing here in /demo is what a real customer gets on
++    WhatsApp, not a mockup of it (see this module's own docstring)."""
+     items = result.get("recommendations") or []
+     # Same category-diversified selection as the text reply (see
+     # response_formatter._select_diverse_groups) -- without this, an
+@@ -141,9 +148,12 @@ def _build_recommendation_cards(result: dict) -> list[dict]:
+     cards = []
+     for name, variants in groups:
+         with_photo = next((v for v in variants if v.get("image_url")), variants[0])
+-        prices = [v["price"] for v in variants]
+-        low, high = min(prices), max(prices)
+-        price_label = f"GH₵{low:,.2f}" if low == high else f"GH₵{low:,.2f}-GH₵{high:,.2f}"
++        # format_recommendation_caption() returns "*name*\ndetail" --
++        # the dashboard already renders the name in its own bold CSS
++        # class (see demo_dashboard.html's .pc-name), so only the detail
++        # line (the part after the newline) is needed as price_label;
++        # the name itself still comes from the existing `product` field.
++        _, _, price_label = format_recommendation_caption(name, variants).partition("\n")
+         cards.append({
+             "product": name,
+             "image_url": _proxied_image_url(with_photo.get("image_url")),
+diff --git a/app/whatsapp_routes.py b/app/whatsapp_routes.py
+index 0292480..0abadb9 100644
+--- a/app/whatsapp_routes.py
++++ b/app/whatsapp_routes.py
+@@ -21,7 +21,11 @@ import os
+ from fastapi import APIRouter, BackgroundTasks, Request, Response
+ 
+ from app.config import settings
+-from services.response_formatter import format_for_customer
++from services.response_formatter import (
++    format_for_customer,
++    format_recommendation_caption,
++    select_presented_groups,
++)
+ from services.router import route_customer
+ from services.vision_tool import VisionServiceError, describe_product_image
+ from services.voice_tool import VoiceServiceError, synthesize_speech, transcribe_audio
+@@ -137,6 +141,9 @@ def _handle_message(message: dict) -> None:
+         # has a single photo to attach, so only single-product results
+         # get an image reply.
+         image_url = result.get("image_url") if isinstance(result, dict) else None
++        recommendations = (
++            result.get("recommendations") if isinstance(result, dict) else None
++        )
+ 
+         if message_type == "audio":
+             try:
+@@ -145,6 +152,44 @@ def _handle_message(message: dict) -> None:
+             except VoiceServiceError as e:
+                 logger.warning("TTS reply failed, falling back to text: %s", e)
+                 send_text_message(from_number, reply_text)
++        elif recommendations:
++            # A genuine browse ("show me the rings"), not one named
++            # product -- Webb, 2026-09-01: "visual browsing is part of
++            # the jewellery experience", one image message per product
++            # rather than the single price/karat text reply below.
++            # Same grouping/selection (up to 4, category-diversified)
++            # already used to build demo_routes.py's /demo cards and to
++            # persist memory.set_last_presented_products() -- one
++            # function computing the list, every caller sharing it, see
++            # select_presented_groups()'s own docstring.
++            groups = select_presented_groups(recommendations)
++            sent_any = False
++            missing_photo_lines = []
++            for name, variants in groups:
++                photo_variant = next((v for v in variants if v.get("image_url")), None)
++                caption = format_recommendation_caption(name, variants)
++                if photo_variant is None:
++                    missing_photo_lines.append(caption)
++                    continue
++                try:
++                    send_image_message(from_number, photo_variant["image_url"], caption=caption)
++                    sent_any = True
++                except WhatsAppError as e:
++                    logger.warning("Recommendation image failed for %r, sending as text: %s", name, e)
++                    missing_photo_lines.append(caption)
++            if missing_photo_lines:
++                # Catalogue rows without a photo, or a send that failed
++                # mid-list, still need to reach the customer -- one
++                # trailing text message rather than silently dropping
++                # them, same "say what's true, don't just fail quiet"
++                # rule this codebase applies everywhere else.
++                send_text_message(from_number, "\n\n".join(missing_photo_lines))
++            if not sent_any and not missing_photo_lines:
++                # Nothing in the selected groups had an image or a
++                # caption at all (shouldn't happen -- every group
++                # produces a caption above) -- fall back to the
++                # ordinary text reply rather than sending nothing.
++                send_text_message(from_number, reply_text)
+         elif image_url:
+             try:
+                 send_image_message(from_number, image_url, caption=reply_text)
+diff --git a/services/response_formatter.py b/services/response_formatter.py
+index a685c4a..2697e53 100644
+--- a/services/response_formatter.py
++++ b/services/response_formatter.py
+@@ -183,6 +183,46 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
+     )
+ 
+ 
++def format_recommendation_caption(name: str, variants: list[dict]) -> str:
++    """Compact one-image, one-caption summary for a single browsed
++    product -- the caption sent alongside its own WhatsApp image message
++    when recommend_products returns more than one product (see
++    whatsapp_routes.py's browse branch), and the same text shown under
++    each /demo card, so the two surfaces read identically (see
++    demo_routes.py's module docstring: the demo is the real system, not
++    a mockup).
++
++    Deliberately terser than _format_recommendation_group() above: that
++    renders inside one shared text bubble holding several products one
++    after another, so a multi-line "- material: price" block per item
++    reads fine there. Here each caption sits alone under its own photo,
++    so it stays to two lines -- name, then karat/price pairs on one
++    line -- rather than repeating that block's layout (Webb, 2026-09-01:
++    "keep each image message scannable", not a product brochure).
++
++    Same _MAX_VARIANTS_LISTED cut-off as _format_recommendation_group()
++    -- past that many variants a customer can't usefully scan them all
++    in one caption line either, so this collapses to the same price-range
++    treatment rather than a wall of karat/price pairs."""
++    if len(variants) == 1:
++        v = variants[0]
++        return f"*{name}*\n{v['material']}: GH₵{v['price']:,.2f}"
++
++    prices = [v["price"] for v in variants]
++    low, high = min(prices), max(prices)
++
++    if len(variants) <= _MAX_VARIANTS_LISTED:
++        if low == high:
++            options = " | ".join(v["material"] for v in variants)
++            return f"*{name}*\n{options}: GH₵{low:,.2f}"
++        pairs = " | ".join(f"{v['material']} · GH₵{v['price']:,.2f}" for v in variants)
++        return f"*{name}*\n{pairs}"
++
++    if low == high:
++        return f"*{name}*\nGH₵{low:,.2f} -- {len(variants)} options"
++    return f"*{name}*\nGH₵{low:,.2f}-GH₵{high:,.2f} -- {len(variants)} options"
++
++
+ def format_for_customer(result: dict | None) -> str:
+     if result is not None and "correction_note" in result:
+         # router.py's propose_order correction acknowledgement (see
+diff --git a/tests/test_response_formatter.py b/tests/test_response_formatter.py
+index 4b37131..7dbe294 100644
+--- a/tests/test_response_formatter.py
++++ b/tests/test_response_formatter.py
+@@ -6,7 +6,11 @@ tools can produce gets exercised directly against the real formatter,
+ no mocking needed.
+ """
+ 
+-from services.response_formatter import format_for_customer, select_presented_groups
++from services.response_formatter import (
++    format_for_customer,
++    format_recommendation_caption,
++    select_presented_groups,
++)
+ 
+ 
+ def test_formats_no_match():
+@@ -501,6 +505,52 @@ def test_formats_recommendations_keeps_variants_with_different_prices_separate()
+     assert "\n   * " not in formatted
+ 
+ 
++
++# ---------------------------------------------------------------------
++# format_recommendation_caption() -- the per-item caption sent alongside
++# its own WhatsApp image message when a browse returns more than one
++# product (Webb, 2026-09-01: "visual browsing is part of the jewellery
++# experience"), and the same text shown under each /demo card.
++# ---------------------------------------------------------------------
++
++def test_format_recommendation_caption_single_variant():
++    caption = format_recommendation_caption(
++        "Custom Leaf White Gold Necklace, 20g", [{"material": "14k", "price": 30000.0}]
++    )
++    assert caption == "*Custom Leaf White Gold Necklace, 20g*\n14k: GH₵30,000.00"
++
++
++def test_format_recommendation_caption_lists_each_karat_and_price():
++    variants = [
++        {"material": "12k", "price": 26000.0},
++        {"material": "14k", "price": 30000.0},
++        {"material": "18k", "price": 34000.0},
++    ]
++    caption = format_recommendation_caption("Solid Cross Chains White Gold Necklace, 20g", variants)
++    assert caption == (
++        "*Solid Cross Chains White Gold Necklace, 20g*\n"
++        "12k · GH₵26,000.00 | 14k · GH₵30,000.00 | 18k · GH₵34,000.00"
++    )
++
++
++def test_format_recommendation_caption_collapses_same_price_variants():
++    variants = [{"material": "12k", "price": 8000.0}, {"material": "14k", "price": 8000.0}]
++    caption = format_recommendation_caption("Plain Band", variants)
++    assert caption == "*Plain Band*\n12k | 14k: GH₵8,000.00"
++
++
++def test_format_recommendation_caption_collapses_to_a_range_past_the_variant_cap():
++    # A sized ring can have dozens of karat+size combinations -- past
++    # _MAX_VARIANTS_LISTED, listing every one in a single caption line
++    # is unreadable, same cut-off the multi-line text formatter uses.
++    variants = [{"material": f"{k}k / Women US {s}", "price": 100.0 * i} for i, (k, s) in enumerate(
++        [(12, 7), (12, 8), (14, 7), (14, 8), (18, 7)], start=1
++    )]
++    caption = format_recommendation_caption("Big White Crown Stone Gold Ring, 14g", variants)
++    assert caption.startswith("*Big White Crown Stone Gold Ring, 14g*\n")
++    assert "options" in caption
++    assert "·" not in caption.split("\n", 1)[1]
++
+ # ---------------------------------------------------------------------
+ # The additive "results" (plural) shape -- router.py's answer to a
+ # message that contained more than one distinct ask
+diff --git a/tests/test_whatsapp_routes.py b/tests/test_whatsapp_routes.py
+index 8e9771e..a6ffdd7 100644
+--- a/tests/test_whatsapp_routes.py
++++ b/tests/test_whatsapp_routes.py
+@@ -227,6 +227,127 @@ def test_image_message_empty_description_sends_fallback_without_routing(monkeypa
+     assert "couldn't quite tell what that was" in send_text.call_args[0][1]
+ 
+ 
++# ---------------------------------------------------------------------
++# recommendation browse (multi-image) -- Webb, 2026-09-01: "visual
++# browsing is part of the jewellery experience", one WhatsApp image
++# message per recommended product rather than a single text reply.
++# ---------------------------------------------------------------------
++
++def _rings_recommendation():
++    return {
++        "recommendations": [
++            {"product": "Minimal White Stone Gold Ring, 1g", "category": "Rings", "material": "12k",
++             "price": 15127.20, "image_url": "https://example.com/ring1-12k.jpg"},
++            {"product": "Minimal White Stone Gold Ring, 1g", "category": "Rings", "material": "18k",
++             "price": 20628.00, "image_url": "https://example.com/ring1-18k.jpg"},
++            {"product": "Set Multi Stone Gold Ring, 7g", "category": "Rings", "material": "18k",
++             "price": 12033.00, "image_url": "https://example.com/ring2-18k.jpg"},
++        ]
++    }
++
++
++def test_recommendations_result_sends_one_image_message_per_product(monkeypatch):
++    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value=_rings_recommendation()))
++    send_image = MagicMock()
++    send_text = MagicMock()
++    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
++    monkeypatch.setattr(whatsapp_routes, "send_text_message", send_text)
++
++    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "show me the rings"}})
++
++    # Two distinct products in the fixture -- two image messages, not
++    # one text dump of the whole list.
++    assert send_image.call_count == 2
++    send_text.assert_not_called()
++    first_call, second_call = send_image.call_args_list
++    assert first_call.args[0] == "233555000111"
++    assert first_call.args[1] == "https://example.com/ring1-12k.jpg"
++    assert "*Minimal White Stone Gold Ring, 1g*" in first_call.kwargs["caption"]
++    assert "12k · GH₵15,127.20" in first_call.kwargs["caption"]
++    assert second_call.args[1] == "https://example.com/ring2-18k.jpg"
++    assert "*Set Multi Stone Gold Ring, 7g*" in second_call.kwargs["caption"]
++
++
++def test_recommendations_result_caps_at_four_products(monkeypatch):
++    items = [
++        {"product": f"Ring {i}", "category": "Rings", "material": "18k", "price": 100.0 * i,
++         "image_url": f"https://example.com/ring{i}.jpg"}
++        for i in range(1, 6)
++    ]
++    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value={"recommendations": items}))
++    send_image = MagicMock()
++    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
++    monkeypatch.setattr(whatsapp_routes, "send_text_message", MagicMock())
++
++    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "what rings do you have"}})
++
++    assert send_image.call_count == 4
++
++
++def test_recommendations_without_photos_falls_back_to_one_text_message(monkeypatch):
++    items = [
++        {"product": "Ring 1", "category": "Rings", "material": "18k", "price": 100.0},
++        {"product": "Ring 2", "category": "Rings", "material": "18k", "price": 200.0},
++    ]
++    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value={"recommendations": items}))
++    send_image = MagicMock()
++    send_text = MagicMock()
++    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
++    monkeypatch.setattr(whatsapp_routes, "send_text_message", send_text)
++
++    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "show me the rings"}})
++
++    # No item had an image_url -- nothing to send a photo for, so this
++    # falls back to one text message listing both, not silence.
++    send_image.assert_not_called()
++    send_text.assert_called_once()
++    body = send_text.call_args[0][1]
++    assert "Ring 1" in body and "Ring 2" in body
++
++
++def test_recommendations_image_send_failure_falls_back_to_text_for_that_item(monkeypatch):
++    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value=_rings_recommendation()))
++    send_image = MagicMock(side_effect=WhatsAppError("Meta rejected it"))
++    send_text = MagicMock()
++    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
++    monkeypatch.setattr(whatsapp_routes, "send_text_message", send_text)
++
++    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "show me the rings"}})
++
++    # Both sends were attempted and both failed -- both captions still
++    # reach the customer, as one trailing text message rather than
++    # silence.
++    assert send_image.call_count == 2
++    send_text.assert_called_once()
++    body = send_text.call_args[0][1]
++    assert "Minimal White Stone Gold Ring, 1g" in body
++    assert "Set Multi Stone Gold Ring, 7g" in body
++
++
++def test_recommendations_audio_message_still_gets_a_single_spoken_reply(monkeypatch):
++    # A voice note that resolves to a browse still gets one synthesized
++    # reply, not several -- audio takes priority over the new multi-image
++    # branch, unchanged from before this feature existed.
++    monkeypatch.setattr(whatsapp_routes, "download_media", MagicMock(return_value=b"raw-audio"))
++    monkeypatch.setattr(whatsapp_routes, "transcribe_audio", MagicMock(return_value="show me the rings"))
++    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value=_rings_recommendation()))
++    monkeypatch.setattr(
++        whatsapp_routes, "format_for_customer", MagicMock(return_value="Here's what I found for you: ...")
++    )
++    monkeypatch.setattr(whatsapp_routes, "synthesize_speech", MagicMock(return_value=b"reply-audio"))
++    send_audio = MagicMock()
++    send_image = MagicMock()
++    monkeypatch.setattr(whatsapp_routes, "send_audio_message", send_audio)
++    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
++    monkeypatch.setattr(whatsapp_routes, "send_text_message", MagicMock())
++
++    _handle_message({"from": "233555000111", "type": "audio", "audio": {"id": "media-1"}})
++
++    send_audio.assert_called_once()
++    send_image.assert_not_called()
++
++
++
+ # ---------------------------------------------------------------------
+ # unhandled message types / unexpected failures
+ # ---------------------------------------------------------------------
+-- 
+2.34.1
+

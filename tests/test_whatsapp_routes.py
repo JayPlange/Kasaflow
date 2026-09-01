@@ -228,6 +228,127 @@ def test_image_message_empty_description_sends_fallback_without_routing(monkeypa
 
 
 # ---------------------------------------------------------------------
+# recommendation browse (multi-image) -- Webb, 2026-09-01: "visual
+# browsing is part of the jewellery experience", one WhatsApp image
+# message per recommended product rather than a single text reply.
+# ---------------------------------------------------------------------
+
+def _rings_recommendation():
+    return {
+        "recommendations": [
+            {"product": "Minimal White Stone Gold Ring, 1g", "category": "Rings", "material": "12k",
+             "price": 15127.20, "image_url": "https://example.com/ring1-12k.jpg"},
+            {"product": "Minimal White Stone Gold Ring, 1g", "category": "Rings", "material": "18k",
+             "price": 20628.00, "image_url": "https://example.com/ring1-18k.jpg"},
+            {"product": "Set Multi Stone Gold Ring, 7g", "category": "Rings", "material": "18k",
+             "price": 12033.00, "image_url": "https://example.com/ring2-18k.jpg"},
+        ]
+    }
+
+
+def test_recommendations_result_sends_one_image_message_per_product(monkeypatch):
+    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value=_rings_recommendation()))
+    send_image = MagicMock()
+    send_text = MagicMock()
+    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", send_text)
+
+    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "show me the rings"}})
+
+    # Two distinct products in the fixture -- two image messages, not
+    # one text dump of the whole list.
+    assert send_image.call_count == 2
+    send_text.assert_not_called()
+    first_call, second_call = send_image.call_args_list
+    assert first_call.args[0] == "233555000111"
+    assert first_call.args[1] == "https://example.com/ring1-12k.jpg"
+    assert "*Minimal White Stone Gold Ring, 1g*" in first_call.kwargs["caption"]
+    assert "12k · GH₵15,127.20" in first_call.kwargs["caption"]
+    assert second_call.args[1] == "https://example.com/ring2-18k.jpg"
+    assert "*Set Multi Stone Gold Ring, 7g*" in second_call.kwargs["caption"]
+
+
+def test_recommendations_result_caps_at_four_products(monkeypatch):
+    items = [
+        {"product": f"Ring {i}", "category": "Rings", "material": "18k", "price": 100.0 * i,
+         "image_url": f"https://example.com/ring{i}.jpg"}
+        for i in range(1, 6)
+    ]
+    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value={"recommendations": items}))
+    send_image = MagicMock()
+    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", MagicMock())
+
+    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "what rings do you have"}})
+
+    assert send_image.call_count == 4
+
+
+def test_recommendations_without_photos_falls_back_to_one_text_message(monkeypatch):
+    items = [
+        {"product": "Ring 1", "category": "Rings", "material": "18k", "price": 100.0},
+        {"product": "Ring 2", "category": "Rings", "material": "18k", "price": 200.0},
+    ]
+    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value={"recommendations": items}))
+    send_image = MagicMock()
+    send_text = MagicMock()
+    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", send_text)
+
+    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "show me the rings"}})
+
+    # No item had an image_url -- nothing to send a photo for, so this
+    # falls back to one text message listing both, not silence.
+    send_image.assert_not_called()
+    send_text.assert_called_once()
+    body = send_text.call_args[0][1]
+    assert "Ring 1" in body and "Ring 2" in body
+
+
+def test_recommendations_image_send_failure_falls_back_to_text_for_that_item(monkeypatch):
+    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value=_rings_recommendation()))
+    send_image = MagicMock(side_effect=WhatsAppError("Meta rejected it"))
+    send_text = MagicMock()
+    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", send_text)
+
+    _handle_message({"from": "233555000111", "type": "text", "text": {"body": "show me the rings"}})
+
+    # Both sends were attempted and both failed -- both captions still
+    # reach the customer, as one trailing text message rather than
+    # silence.
+    assert send_image.call_count == 2
+    send_text.assert_called_once()
+    body = send_text.call_args[0][1]
+    assert "Minimal White Stone Gold Ring, 1g" in body
+    assert "Set Multi Stone Gold Ring, 7g" in body
+
+
+def test_recommendations_audio_message_still_gets_a_single_spoken_reply(monkeypatch):
+    # A voice note that resolves to a browse still gets one synthesized
+    # reply, not several -- audio takes priority over the new multi-image
+    # branch, unchanged from before this feature existed.
+    monkeypatch.setattr(whatsapp_routes, "download_media", MagicMock(return_value=b"raw-audio"))
+    monkeypatch.setattr(whatsapp_routes, "transcribe_audio", MagicMock(return_value="show me the rings"))
+    monkeypatch.setattr(whatsapp_routes, "route_customer", MagicMock(return_value=_rings_recommendation()))
+    monkeypatch.setattr(
+        whatsapp_routes, "format_for_customer", MagicMock(return_value="Here's what I found for you: ...")
+    )
+    monkeypatch.setattr(whatsapp_routes, "synthesize_speech", MagicMock(return_value=b"reply-audio"))
+    send_audio = MagicMock()
+    send_image = MagicMock()
+    monkeypatch.setattr(whatsapp_routes, "send_audio_message", send_audio)
+    monkeypatch.setattr(whatsapp_routes, "send_image_message", send_image)
+    monkeypatch.setattr(whatsapp_routes, "send_text_message", MagicMock())
+
+    _handle_message({"from": "233555000111", "type": "audio", "audio": {"id": "media-1"}})
+
+    send_audio.assert_called_once()
+    send_image.assert_not_called()
+
+
+
+# ---------------------------------------------------------------------
 # unhandled message types / unexpected failures
 # ---------------------------------------------------------------------
 

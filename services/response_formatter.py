@@ -183,6 +183,46 @@ def _format_recommendation_group(name: str, variants: list[dict]) -> str:
     )
 
 
+def format_recommendation_caption(name: str, variants: list[dict]) -> str:
+    """Compact one-image, one-caption summary for a single browsed
+    product -- the caption sent alongside its own WhatsApp image message
+    when recommend_products returns more than one product (see
+    whatsapp_routes.py's browse branch), and the same text shown under
+    each /demo card, so the two surfaces read identically (see
+    demo_routes.py's module docstring: the demo is the real system, not
+    a mockup).
+
+    Deliberately terser than _format_recommendation_group() above: that
+    renders inside one shared text bubble holding several products one
+    after another, so a multi-line "- material: price" block per item
+    reads fine there. Here each caption sits alone under its own photo,
+    so it stays to two lines -- name, then karat/price pairs on one
+    line -- rather than repeating that block's layout (Webb, 2026-09-01:
+    "keep each image message scannable", not a product brochure).
+
+    Same _MAX_VARIANTS_LISTED cut-off as _format_recommendation_group()
+    -- past that many variants a customer can't usefully scan them all
+    in one caption line either, so this collapses to the same price-range
+    treatment rather than a wall of karat/price pairs."""
+    if len(variants) == 1:
+        v = variants[0]
+        return f"*{name}*\n{v['material']}: GH₵{v['price']:,.2f}"
+
+    prices = [v["price"] for v in variants]
+    low, high = min(prices), max(prices)
+
+    if len(variants) <= _MAX_VARIANTS_LISTED:
+        if low == high:
+            options = " | ".join(v["material"] for v in variants)
+            return f"*{name}*\n{options}: GH₵{low:,.2f}"
+        pairs = " | ".join(f"{v['material']} · GH₵{v['price']:,.2f}" for v in variants)
+        return f"*{name}*\n{pairs}"
+
+    if low == high:
+        return f"*{name}*\nGH₵{low:,.2f} -- {len(variants)} options"
+    return f"*{name}*\nGH₵{low:,.2f}-GH₵{high:,.2f} -- {len(variants)} options"
+
+
 def format_for_customer(result: dict | None) -> str:
     if result is not None and "correction_note" in result:
         # router.py's propose_order correction acknowledgement (see

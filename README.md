@@ -94,6 +94,19 @@ pytest --run-regression       # + prompt regression tests against the real OpenA
 
 Regression tests are opt-in by design — the everyday test loop stays fast, offline, and free, while still allowing a real-API accuracy check when it's actually wanted.
 
+### Behavioural evaluator
+
+`scripts/evaluator/` is a separate, heavier tool from the pytest suite above: scenario-based, multi-turn conversations run against the real `route_customer()` pipeline (real OpenAI calls, real cost), checked against an expected tool/fields/response per turn across fifteen categories (product discovery, price, weight, karat, delivery, photo, orders, corrections, references, ambiguity, confirmation, post-confirmation, global delivery, Ghanaian language, social/reactive). Built to answer one question pytest can't: not just "does the code do what the code is supposed to do", but "does a real conversation actually resolve the way a customer would expect it to".
+
+```bash
+python3 scripts/run_evaluator.py                                        # every scenario
+python3 scripts/run_evaluator.py --category "REFERENCES"                # one category
+python3 scripts/run_evaluator.py --id references-04-golden-path-full-journey
+python3 scripts/run_evaluator.py --json report.json                     # full detail, incl. actual LLM output per turn
+```
+
+The scenario corpus (`scripts/evaluator/scenarios.py`) is a starting point, not a finished suite — extend it turn by turn as real live failures turn up, the same way `llm.py`'s own prompt already carries dated, confirmed-live examples. Correctness (right tool/fields/facts) and manner (does the reply actually read like a natural answer to what was asked) are checked separately on purpose — see `schema.py`'s `Turn.manner_note`: this evaluator does not auto-score manner, that's flagged for a human (or a future LLM-judge pass) to read off the JSON report's `manner_rating` field, left `null`.
+
 ## Running Locally
 
 ```bash
