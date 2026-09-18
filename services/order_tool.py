@@ -664,7 +664,7 @@ def confirm_order(session_id: str, confirmation_allowed: bool = True) -> dict:
     _store.set(session_id, _PENDING_ORDER_KEY, pending)
 
     try:
-        order = _create_woocommerce_order(pending)
+        order = _create_woocommerce_order(session_id, pending)
     except requests.exceptions.Timeout:
         # Genuinely ambiguous, unlike every other failure below: the POST
         # may have reached WooCommerce and created the order before the
@@ -746,7 +746,7 @@ def cancel_order(session_id: str, order_id=None) -> dict:
         }
 
     try:
-        order = _get_woocommerce_order(resolved_id)
+        order = _get_woocommerce_order(resolved_id, session_id)
     except _OrderNotFound:
         return {"error": f"I couldn't find order #{resolved_id} -- could you double-check the number?"}
     except Exception:
@@ -838,7 +838,7 @@ def get_order_status(session_id: str, order_id=None) -> dict:
         }
 
     try:
-        order = _get_woocommerce_order(resolved_id)
+        order = _get_woocommerce_order(resolved_id, session_id)
     except _OrderNotFound:
         return {"error": f"I couldn't find order #{resolved_id} -- could you double-check the number?"}
     except Exception:
@@ -898,7 +898,27 @@ def _resolve_order_id(session_id: str, order_id) -> int | None:
     return last["order_id"] if last else None
 
 
-def _get_woocommerce_order(order_id: int) -> dict:
+def _order_belongs_to_session(order: dict, session_id: str) -> bool:
+    """SECURITY (2026-09-05): _resolve_order_id() above will happily
+    resolve to ANY order number a customer's message contains -- it was
+    never checked that the order actually belongs to whoever is asking.
+    That meant any WhatsApp user could read another customer's delivery
+    address and order contents, or cancel their order outright, just by
+    guessing/trying a plausible order number (order IDs are small
+    sequential integers). _create_woocommerce_order() now stamps
+    billing.phone with the customer's WhatsApp number (= session_id) at
+    creation time; this checks that stamp on every lookup/cancel before
+    acting.
+
+    Orders placed before this change have no billing.phone and will fail
+    this check for everyone, including their real customer -- a real,
+    known gap for pre-existing open orders, not a bug in this check.
+    Backfill billing.phone on any currently open orders directly in
+    WooCommerce if that matters for orders in flight right now."""
+    return order.get("billing", {}).get("phone") == session_id
+
+
+def _get_woocommerce_order(order_id: int, session_id: str) -> dict:
     _require_orders_config()
     auth = (settings.woocommerce_orders_consumer_key, settings.woocommerce_orders_consumer_secret)
     response = requests.get(
@@ -909,7 +929,21 @@ def _get_woocommerce_order(order_id: int) -> dict:
     if response.status_code == 404:
         raise _OrderNotFound(order_id)
     response.raise_for_status()
-    return response.json()
+    order = response.json()
+
+    if not _order_belongs_to_session(order, session_id):
+        # Same exception, same customer-facing "couldn't find it" message
+        # as a genuinely nonexistent order -- deliberately NOT a distinct
+        # "not yours" error, so this can't be used as an oracle to confirm
+        # a guessed order number is real but belongs to someone else.
+        logger.warning(
+            "Order #%s requested by session %s does not belong to that session -- refusing",
+            order_id,
+            session_id,
+        )
+        raise _OrderNotFound(order_id)
+
+    return order
 
 
 def _cancel_woocommerce_order(order_id: int) -> None:
@@ -1068,7 +1102,7 @@ def _require_orders_config() -> None:
         )
 
 
-def _create_woocommerce_order(pending: dict) -> dict:
+def _create_woocommerce_order(session_id: str, pending: dict) -> dict:
     _require_orders_config()
 
     line_item = {"product_id": pending["product_id"], "quantity": pending["quantity"]}
@@ -1082,6 +1116,14 @@ def _create_woocommerce_order(pending: dict) -> dict:
         # in this file has collected payment yet.
         "status": "on-hold",
         "line_items": [line_item],
+        # SECURITY (2026-09-05): stamping the customer's WhatsApp number
+        # here (the same value used as session_id throughout this module,
+        # see whatsapp_routes.py's module docstring) is what lets
+        # get_order_status()/cancel_order() below verify an order actually
+        # belongs to whoever is asking, instead of trusting any order
+        # number a message happens to contain. Orders created before this
+        # change won't have this field -- see _order_belongs_to_session().
+        "billing": {"phone": session_id},
         "shipping": {"address_1": pending["delivery_address"]},
         # Delivery isn't priced/arranged automatically (see
         # delivery_tool.py) -- the chosen option is written onto the

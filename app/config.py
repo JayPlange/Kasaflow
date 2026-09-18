@@ -65,6 +65,14 @@ class Settings:
     whatsapp_access_token: str | None
     whatsapp_phone_number_id: str | None
 
+    # SECURITY (2026-09-05): the app secret Meta uses to sign every webhook
+    # delivery (X-Hub-Signature-256 header). Without checking this, the
+    # POST /webhook/whatsapp handler had no way to tell a real WhatsApp
+    # delivery apart from a forged request to the same URL -- required
+    # whenever WhatsApp is actually wired up (see load_settings below),
+    # optional otherwise, same pattern as the other WhatsApp settings.
+    whatsapp_app_secret: str | None
+
     # The rider coordinator's WhatsApp number -- delivery isn't priced or
     # scheduled automatically (see services/delivery_tool.py's module
     # docstring), so once a customer confirms an order, a human needs to
@@ -82,6 +90,18 @@ class Settings:
     # customers send just won't get exact-item identification without
     # it. See services/image_embed_tool.py.
     cohere_api_key: str | None
+
+    # SECURITY (2026-09-05): app/demo_routes.py's own module docstring
+    # already says "do not expose this route publicly as-is" -- it's
+    # unauthenticated by design and has no upload size/type limits. That
+    # was fine when nothing outside localhost could reach it, but the
+    # WhatsApp webhook is now routinely exposed to the internet during
+    # local testing (an ngrok tunnel forwards the WHOLE app, not just
+    # /webhook/whatsapp). Defaults to False so the demo dashboard simply
+    # doesn't exist as a mounted route unless explicitly turned on for a
+    # local demo session. Set ENABLE_DEMO_DASHBOARD=true in .env when you
+    # actually want it.
+    enable_demo_dashboard: bool
 
     # Optional, like cohere_api_key above: services/geocoding_tool.py
     # falls back to delivery_tool.delivery_option_matches_address()'s
@@ -112,6 +132,16 @@ def load_settings() -> Settings:
             "-- this is the shared secret clients must send in the X-API-Key header."
         )
 
+    whatsapp_access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+    whatsapp_app_secret = os.getenv("WHATSAPP_APP_SECRET")
+    if whatsapp_access_token and not whatsapp_app_secret:
+        raise RuntimeError(
+            "WHATSAPP_ACCESS_TOKEN is set but WHATSAPP_APP_SECRET is not. "
+            "WhatsApp is wired up, so the webhook must be able to verify Meta's "
+            "X-Hub-Signature-256 header -- find the app secret in the Meta "
+            "developer console (App settings -> Basic) and add it to .env."
+        )
+
     return Settings(
         openai_api_key=api_key,
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
@@ -138,11 +168,13 @@ def load_settings() -> Settings:
         khaya_api_key=os.getenv("KHAYA_API_KEY"),
         khaya_api_base=os.getenv("KHAYA_API_BASE", "https://translation-api.ghananlp.org"),
         whatsapp_verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN"),
-        whatsapp_access_token=os.getenv("WHATSAPP_ACCESS_TOKEN"),
+        whatsapp_access_token=whatsapp_access_token,
         whatsapp_phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID"),
+        whatsapp_app_secret=whatsapp_app_secret,
         staff_notification_phone=os.getenv("STAFF_NOTIFICATION_PHONE"),
         cohere_api_key=os.getenv("COHERE_API_KEY"),
         google_maps_api_key=os.getenv("GOOGLE_MAPS_API_KEY"),
+        enable_demo_dashboard=os.getenv("ENABLE_DEMO_DASHBOARD", "false").strip().lower() == "true",
     )
 
 

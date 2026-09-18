@@ -67,9 +67,20 @@ app = FastAPI(title="KasaFlow", version="0.1.0", lifespan=_lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(whatsapp_router)
-# Local demo dashboard only -- unauthenticated by design, see
-# demo_routes.py's module docstring. Never expose this publicly as-is.
-app.include_router(demo_router)
+# SECURITY (2026-09-05): local demo dashboard only -- unauthenticated by
+# design, see demo_routes.py's module docstring, which already warned
+# "never expose this publicly as-is." Now only mounted at all when
+# explicitly turned on (ENABLE_DEMO_DASHBOARD=true in .env), since an
+# ngrok tunnel used to test the WhatsApp webhook forwards this entire
+# app, not just /webhook/whatsapp -- previously that meant the
+# unauthenticated, upload-uncapped /demo/* routes were reachable by
+# anyone who found the tunnel URL, with no relation to the webhook fix
+# at all. Off by default; the demo path still works exactly as before
+# once explicitly enabled for an actual local demo session.
+if settings.enable_demo_dashboard:
+    app.include_router(demo_router)
+else:
+    logger.info("Demo dashboard disabled (ENABLE_DEMO_DASHBOARD is not set to true) -- /demo/* routes not mounted")
 
 
 class ProcessRequest(BaseModel):

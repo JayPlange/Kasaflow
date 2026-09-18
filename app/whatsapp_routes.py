@@ -15,6 +15,9 @@ Meta goes out immediately, the customer's actual reply follows once
 processing finishes.
 """
 
+import hashlib
+import hmac
+import json
 import logging
 import os
 
@@ -63,9 +66,44 @@ def verify_webhook(request: Request):
     return Response(status_code=403)
 
 
+def _signature_is_valid(raw_body: bytes, signature_header: str | None) -> bool:
+    """Verify Meta's X-Hub-Signature-256 header against the raw request body.
+
+    SECURITY (2026-09-05): previously this endpoint trusted any POST body
+    that merely parsed as JSON in the expected shape -- no check that it
+    actually came from Meta. Anyone who found the webhook URL could post a
+    fabricated "customer message" and trigger a real (paid) LLM call and
+    order flow. Meta signs every real delivery with HMAC-SHA256 over the
+    exact raw body, keyed with the app secret from the developer console;
+    this recomputes that and compares in constant time.
+    """
+    if not settings.whatsapp_app_secret:
+        # load_settings() already refuses to start if WHATSAPP_ACCESS_TOKEN
+        # is set without an app secret, so reaching here with no secret
+        # configured means WhatsApp isn't actually wired up at all -- fail
+        # closed rather than silently accepting unverifiable input.
+        logger.error("WhatsApp webhook called but WHATSAPP_APP_SECRET is not configured")
+        return False
+
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+
+    expected = hmac.new(
+        settings.whatsapp_app_secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    provided = signature_header.removeprefix("sha256=")
+    return hmac.compare_digest(expected, provided)
+
+
 @router.post("/webhook/whatsapp")
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
-    payload = await request.json()
+    raw_body = await request.body()
+
+    if not _signature_is_valid(raw_body, request.headers.get("X-Hub-Signature-256")):
+        logger.warning("Rejected WhatsApp webhook POST with invalid or missing signature")
+        return Response(status_code=403)
+
+    payload = json.loads(raw_body)
 
     try:
         messages = (
