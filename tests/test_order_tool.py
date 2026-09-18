@@ -1626,11 +1626,22 @@ def test_confirm_order_does_not_renotify_staff_on_a_duplicate_confirm(monkeypatc
 # than trusting what this session last knew about it.
 # ---------------------------------------------------------------------
 
-def _mock_get_order(monkeypatch, status="on-hold", order_id=6846, status_code=200, extra=None):
+def _mock_get_order(
+    monkeypatch, status="on-hold", order_id=6846, status_code=200, extra=None,
+    owner_session_id="session-1",
+):
+    # owner_session_id defaults to "session-1" -- the session_id every
+    # existing test in this file calls get_order_status/cancel_order with
+    # -- because _get_woocommerce_order() now refuses to return an order
+    # whose billing.phone doesn't match the requesting session (see
+    # order_tool._order_belongs_to_session(), 2026-09-05 IDOR fix). Pass
+    # owner_session_id=None to simulate a pre-fix order with no
+    # billing.phone at all, or a different string to simulate a genuine
+    # ownership mismatch.
     fake_response = MagicMock()
     fake_response.status_code = status_code
     fake_response.raise_for_status.return_value = None
-    body = {"id": order_id, "status": status}
+    body = {"id": order_id, "status": status, "billing": {"phone": owner_session_id}}
     if extra:
         body.update(extra)
     fake_response.json.return_value = body
@@ -1727,6 +1738,44 @@ def test_cancel_order_reports_not_found_for_a_404(monkeypatch, fresh_session_sto
     assert "9999" in result["error"]
 
 
+def test_cancel_order_refuses_an_order_belonging_to_a_different_session(monkeypatch, fresh_session_store):
+    # SECURITY (2026-09-05) regression test: before this fix, any
+    # WhatsApp user could cancel a stranger's order just by naming its
+    # order number -- _resolve_order_id() never checked ownership. This
+    # order's billing.phone is stamped as "+233-other-customer", not the
+    # requesting session, so it must be refused exactly like a genuinely
+    # nonexistent order (same message, no "not yours" oracle).
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846, owner_session_id="+233-other-customer")
+    fake_put = _mock_put(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert: refused, worded identically to a 404, and never reached the
+    # actual cancel call
+    assert "error" in result
+    assert "6846" in result["error"]
+    fake_put.assert_not_called()
+
+
+def test_cancel_order_refuses_a_pre_fix_order_with_no_billing_phone_at_all(monkeypatch, fresh_session_store):
+    # Orders placed before the 2026-09-05 fix have no billing.phone at
+    # all (order_tool.py only started stamping it then) -- must fail
+    # closed, the same as a genuine ownership mismatch, not be treated as
+    # an automatic pass because there's nothing to compare against.
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846, owner_session_id=None)
+    fake_put = _mock_put(monkeypatch)
+
+    # Act
+    result = order_tool.cancel_order("session-1", order_id="6846")
+
+    # Assert
+    assert "error" in result
+    fake_put.assert_not_called()
+
+
 def test_cancel_order_is_idempotent_when_already_cancelled(monkeypatch, fresh_session_store):
     # Arrange: a duplicated "cancel" message, most likely -- same
     # WhatsApp-delivery-duplication rationale as confirm_order()'s own
@@ -1747,7 +1796,7 @@ def test_cancel_order_escalates_a_non_cancellable_status_and_notifies_staff(monk
     # Arrange: e.g. already shipped/completed/refunded -- not a status
     # this tool will touch automatically (see _CANCELLABLE_STATUSES)
     _woocommerce_settings(monkeypatch, staff_notification_phone="233509764406")
-    _mock_get_order(monkeypatch, status="completed", order_id=6846)
+    _mock_get_order(monkeypatch, status="completed", order_id=6846, owner_session_id="session-233500000000")
     fake_put = _mock_put(monkeypatch)
     send_mock = MagicMock()
     monkeypatch.setattr(order_tool, "send_text_message", send_mock)
@@ -1921,6 +1970,23 @@ def test_get_order_status_reports_not_found_for_a_404(monkeypatch, fresh_session
     # Assert
     assert "error" in result
     assert "9999" in result["error"]
+
+
+def test_get_order_status_refuses_an_order_belonging_to_a_different_session(monkeypatch, fresh_session_store):
+    # SECURITY (2026-09-05) regression test: before this fix, any
+    # WhatsApp user could read a stranger's order status, delivery
+    # address, and item contents just by naming its order number. Same
+    # ownership check as cancel_order() -- see
+    # order_tool._order_belongs_to_session().
+    _woocommerce_settings(monkeypatch)
+    _mock_get_order(monkeypatch, status="on-hold", order_id=6846, owner_session_id="+233-other-customer")
+
+    # Act
+    result = order_tool.get_order_status("session-1", order_id="6846")
+
+    # Assert: refused, worded identically to a 404 (no "not yours" oracle)
+    assert "error" in result
+    assert "6846" in result["error"]
 
 
 def test_get_order_status_reports_a_clean_error_when_the_lookup_fails(monkeypatch, fresh_session_store):
