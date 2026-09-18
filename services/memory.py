@@ -683,6 +683,39 @@ def get_awaiting_field(session_id: str) -> str | None:
     return _store.get(session_id, _AWAITING_FIELD_KEY)
 
 
+_PENDING_CLARIFICATION_DETAILS_KEY = "pending_clarification_details"
+
+
+def set_pending_clarification_details(session_id: str, payload: dict | None) -> None:
+    """Webb, 2026-09-02: when router.py's ambiguity guard forces a
+    clarification ("the ring" / "that one" after a multi-item list, with
+    product_name still "unknown"), the customer may have already stated
+    OTHER real details in the same breath ("that one, in 14k, two
+    pieces"). Throwing those away and re-asking for them once the
+    customer names which item they meant would be exactly the kind of
+    repeat-yourself friction this whole engine exists to avoid.
+
+    `payload` is None (clear) or {"generation": int, "details": {field:
+    value, ...}}. The generation is last_presented_products' own
+    monotonic counter (see set_last_presented_products()), stashed
+    alongside the details specifically so a later turn can only ever
+    consume this against the SAME list it was raised for -- if the
+    customer browses a fresh list before answering, a stale stash can
+    never leak its old details into an unrelated new resolution.
+
+    Same lifetime discipline as awaiting_field: reset to None
+    unconditionally at the top of every turn in router.py's
+    _execute_single(), only reasserted when THIS turn's own ambiguity
+    guard just raised a new clarification. Does not survive an
+    unrelated turn in between, same reasoning as every other
+    single-slot "last thing that happened" field in this module."""
+    _store.set(session_id, _PENDING_CLARIFICATION_DETAILS_KEY, payload)
+
+
+def get_pending_clarification_details(session_id: str) -> dict | None:
+    return _store.get(session_id, _PENDING_CLARIFICATION_DETAILS_KEY)
+
+
 def get_session_store() -> SessionStore:
     """Exposed so tests (and, later, a healthcheck or admin endpoint) can
     inspect the store without reaching into the module-level `_store`

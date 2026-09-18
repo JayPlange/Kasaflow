@@ -2214,3 +2214,441 @@ def test_route_customer_passes_awaiting_field_through_to_understand_customer(mon
     router.route_customer("Big White Crown Stone Gold Ring, 14g", "awaiting-field-passthrough-session")
 
     assert understand_customer_mock.call_args.kwargs["awaiting_field"] == "product_name"
+
+
+# ---------------------------------------------------------------------
+# Ambiguous-reference guard (Webb, 2026-09-01): a post-hoc check on the
+# LLM's own answer, not a fast path like the awaiting_field short-circuit
+# above. Evaluator run (real system, --repeat 6) found three phrasings
+# of the same failure fully reproducible at 0/6 each: "the ring" (bare
+# category matching two shown items), "I'll take that one" (bare
+# demonstrative after a multi-item list), and "that one, in 14k, two
+# pieces" (demonstrative plus details). In all three the model picks a
+# correct-looking TOOL and then guesses WHICH product from the list
+# instead of asking. See router._override_unresolved_ambiguous_reference()'s
+# docstring for the full reasoning.
+#
+# Pure-function tests first (no session state, no LLM), then one
+# integration test proving route_customer actually applies the override
+# instead of the LLM's own guessed tool call.
+# ---------------------------------------------------------------------
+
+_TWO_ITEM_LIST = {
+    "generation": 1,
+    "items": [
+        {"position": 1, "product_name": "Gye Nyame White Necklace with Earrings, 30g", "category": "Necklaces"},
+        {"position": 2, "product_name": "Big White Crown Stone Gold Ring, 14g", "category": "Rings"},
+    ],
+}
+_ONE_ITEM_LIST = {
+    "generation": 1,
+    "items": [{"position": 1, "product_name": "Big White Crown Stone Gold Ring, 14g", "category": "Rings"}],
+}
+
+
+def test_ambiguous_reference_guard_returns_none_when_nothing_was_presented():
+    tool_request = {"tool": "propose_order", "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g"}}
+    assert router._override_unresolved_ambiguous_reference(tool_request, "I'll take that one", None) is None
+    assert router._override_unresolved_ambiguous_reference(tool_request, "I'll take that one", {"items": []}) is None
+
+
+def test_ambiguous_reference_guard_returns_none_when_only_one_item_was_shown():
+    # Nothing to be ambiguous between -- a single active product is
+    # already handled correctly by the existing "this"/"that one"
+    # context-fill path (fill_missing_context()), not this guard.
+    tool_request = {"tool": "propose_order", "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g"}}
+    assert router._override_unresolved_ambiguous_reference(tool_request, "I'll take that one", _ONE_ITEM_LIST) is None
+
+
+@pytest.mark.parametrize("tool", ["converse", "recommend_products", "confirm_order", "cancel_order"])
+def test_ambiguous_reference_guard_returns_none_for_non_product_tools(tool):
+    tool_request = {"tool": tool, "arguments": {}}
+    assert router._override_unresolved_ambiguous_reference(tool_request, "I'll take that one", _TWO_ITEM_LIST) is None
+
+
+def test_ambiguous_reference_guard_returns_none_for_a_fast_path_result():
+    # A tool_request carrying "_source" came from _try_resolve_awaiting_field()
+    # above, never from a guess against last_presented_products -- this
+    # guard only ever second-guesses the real LLM path.
+    tool_request = {
+        "tool": "propose_order",
+        "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g"},
+        "_source": "awaiting_field:material",
+    }
+    assert router._override_unresolved_ambiguous_reference(tool_request, "14k", _TWO_ITEM_LIST) is None
+
+
+@pytest.mark.parametrize("message", [
+    "tell me more about the second one",
+    "I want the first ring",
+    "number 2 please",
+    "just 2",
+])
+def test_ambiguous_reference_guard_returns_none_when_message_has_an_ordinal_or_number(message):
+    # A real position reference is let straight through, untouched --
+    # this guard only ever fires on a message with NOTHING pointing at
+    # a specific item.
+    tool_request = {"tool": "propose_order", "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g"}}
+    assert router._override_unresolved_ambiguous_reference(tool_request, message, _TWO_ITEM_LIST) is None
+
+
+def test_ambiguous_reference_guard_returns_none_when_the_guess_matches_nothing_shown():
+    # The LLM named something that isn't actually in the list just
+    # shown -- not the failure mode this guard targets (see
+    # ambiguity-02-category-not-in-list-not-flagged's own scenario:
+    # nothing to disambiguate when the reference was never in the list
+    # to begin with).
+    tool_request = {"tool": "get_product_price", "arguments": {"product_name": "Some Other Chain"}}
+    assert router._override_unresolved_ambiguous_reference(tool_request, "the chain", _TWO_ITEM_LIST) is None
+
+
+@pytest.mark.parametrize("tool", ["propose_order", "get_product_price", "get_product_karat_options", "get_product_weight", "generate_quote"])
+def test_ambiguous_reference_guard_fires_for_every_product_specific_tool(tool):
+    # The actual bug: the LLM picked a correct-looking tool for "I'll
+    # take that one" and then guessed the first/most-recent item from
+    # the list as product_name, rather than asking which one -- fully
+    # reproducible 0/6 live (references-02-bare-demonstrative-after-multi-item-list).
+    tool_request = {
+        "tool": tool,
+        "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g", "material": "unknown"},
+    }
+    result = router._override_unresolved_ambiguous_reference(tool_request, "I'll take that one", _TWO_ITEM_LIST)
+    assert result is not None
+    assert result["tool"] == "converse"
+    # _TWO_ITEM_LIST is a mixed-category list (one Necklace, one Ring) --
+    # per Webb's own wording spec (2026-09-02) a mixed list gets the
+    # generic "which piece" question, not a list of the actual catalogue
+    # names (that's the SAME-category wording instead, see
+    # _build_ambiguity_clarification_reply()'s own tests below).
+    assert result["arguments"]["reply"] == "Sure. Which piece do you mean?"
+    assert result["_source"] == "ambiguous_reference_guard"
+
+
+def test_ambiguous_reference_guard_matches_case_insensitively():
+    # The LLM's own restated product_name doesn't always match the
+    # catalogue string's exact casing -- the guard's job here is only to
+    # recognise "this is one of the items just shown", not to enforce
+    # exact-match pricing integrity (that's get_product_price's own,
+    # separate, deliberately stricter exact-match guard).
+    tool_request = {"tool": "propose_order", "arguments": {"product_name": "big white crown stone gold ring, 14g"}}
+    result = router._override_unresolved_ambiguous_reference(tool_request, "that one", _TWO_ITEM_LIST)
+    assert result is not None
+
+
+def test_route_customer_applies_ambiguous_reference_guard_instead_of_the_llms_guess(monkeypatch):
+    # Integration-level proof, 2026-09-01: route_customer() must return
+    # the clarifying converse reply, and must NOT execute the LLM's
+    # guessed propose_order call at all -- this is the actual live
+    # failure (a silent wrong-product order draft) the guard exists to
+    # prevent, not just a unit-level property of the pure function above.
+    understand_customer_mock = MagicMock(
+        return_value={
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "Big White Crown Stone Gold Ring, 14g", "material": "unknown",
+                "quantity": "unknown", "delivery_address": "unknown", "delivery_option": "unknown",
+            },
+        }
+    )
+    execute_tool_mock = MagicMock()
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_TWO_ITEM_LIST))
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    result = router.route_customer("I'll take that one", "ambiguous-reference-guard-session")
+
+    assert "conversation_reply" in result
+    assert result["conversation_reply"] == "Sure. Which piece do you mean?"
+    execute_tool_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# Guard extension, 2026-09-02 (Webb): live evaluator finding on
+# ambiguity-01 showed "the ring" doesn't always reach this guard as a
+# confident wrong guess -- the LLM often correctly returns product_name
+# "unknown" instead, and the guard above (as originally built) let that
+# case straight through to get_product_price's own safe-but-poor
+# "couldn't find that one" reply, throwing away the fact that an active,
+# ambiguous list was right there. Webb's explicit spec (2026-09-02):
+# extend the guard to ALSO fire on unknown + a message that plausibly
+# refers back to the list (see _looks_like_ambiguous_list_reference()),
+# NOT on every unknown product regardless of the message (too broad,
+# would hijack a genuinely unrelated/unresolvable product into a
+# clarification about the wrong list). And preserve any other detail
+# already given in the same breath ("that one, in 14k, two pieces")
+# across the round trip via pending_clarification_details.
+#
+# Test cases below are Webb's own regression list, verbatim:
+#   show me the rings -> the ring          -> converse clarification
+#   show me the rings -> that one          -> converse clarification
+#   show me the rings -> this one          -> converse clarification
+#   show me the rings -> the second one    -> resolve product #2
+#   show me the rings -> that one in 14k, 2 pieces -> clarification
+#     -> the second one -> product #2 + 14k + quantity 2
+# ---------------------------------------------------------------------
+
+_FOUR_RING_LIST = {
+    "generation": 7,
+    "items": [
+        {"position": 1, "product_name": "Slim Gold Band, 3g", "category": "Rings"},
+        {"position": 2, "product_name": "Big White Crown Stone Gold Ring, 14g", "category": "Rings"},
+        {"position": 3, "product_name": "Twist Signet Ring, 8g", "category": "Rings"},
+        {"position": 4, "product_name": "Halo Cluster Ring, 6g", "category": "Rings"},
+    ],
+}
+
+
+def test_build_ambiguity_clarification_reply_two_items_same_category():
+    items = [
+        {"position": 1, "product_name": "A", "category": "Rings"},
+        {"position": 2, "product_name": "B", "category": "Rings"},
+    ]
+    assert router._build_ambiguity_clarification_reply(items) == "Sure. Do you mean the first or second one?"
+
+
+def test_build_ambiguity_clarification_reply_four_items_same_category():
+    assert router._build_ambiguity_clarification_reply(_FOUR_RING_LIST["items"]) == (
+        "Sure. Which ring do you mean, the first, second, third or fourth?"
+    )
+
+
+def test_build_ambiguity_clarification_reply_mixed_category():
+    items = [
+        {"position": 1, "product_name": "A", "category": "Rings"},
+        {"position": 2, "product_name": "B", "category": "Necklaces"},
+    ]
+    assert router._build_ambiguity_clarification_reply(items) == "Sure. Which piece do you mean?"
+
+
+@pytest.mark.parametrize("message", ["the ring", "rings", "I want a ring", "that one", "this one", "it"])
+def test_looks_like_ambiguous_list_reference_true_cases(message):
+    assert router._looks_like_ambiguous_list_reference(message, _FOUR_RING_LIST["items"]) is True
+
+
+@pytest.mark.parametrize("message", ["the unicorn pendant", "how much is a necklace", "yes"])
+def test_looks_like_ambiguous_list_reference_false_cases(message):
+    assert router._looks_like_ambiguous_list_reference(message, _FOUR_RING_LIST["items"]) is False
+
+
+@pytest.mark.parametrize("message", ["the ring", "that one", "this one"])
+def test_ambiguous_reference_guard_clarifies_on_unknown_product_after_a_list(monkeypatch, message):
+    # The actual live gap: the LLM honestly abstains (product_name
+    # "unknown") rather than guessing, but the system still needs to use
+    # the fact that a multi-item list was just shown instead of falling
+    # through to a generic not-found reply.
+    monkeypatch.setattr(
+        router, "understand_customer",
+        MagicMock(return_value={
+            "tool": "get_product_price",
+            "arguments": {"product_name": "unknown", "material": "unknown"},
+        }),
+    )
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_FOUR_RING_LIST))
+    execute_tool_mock = MagicMock()
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    result = router.route_customer(message, f"clarify-unknown-{message.replace(' ', '-')}")
+
+    assert result["conversation_reply"] == "Sure. Which ring do you mean, the first, second, third or fourth?"
+    execute_tool_mock.assert_not_called()
+
+
+def test_ambiguous_reference_guard_does_not_fire_on_an_unrelated_unknown_product(monkeypatch):
+    # Webb's explicit exclusion: "unknown product = always converse" is
+    # too broad. A product name that has nothing to do with the list
+    # just shown (no demonstrative, no mention of the list's own
+    # category) must NOT get hijacked into "did you mean one of these
+    # rings?" -- it falls straight through to the existing, unrelated
+    # not-found handling.
+    monkeypatch.setattr(
+        router, "understand_customer",
+        MagicMock(return_value={
+            "tool": "get_product_price",
+            "arguments": {"product_name": "unknown", "material": "unknown"},
+        }),
+    )
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_FOUR_RING_LIST))
+    execute_tool_mock = MagicMock(return_value=None)
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    result = router.route_customer("how much is the unicorn pendant?", "clarify-unrelated-unknown")
+
+    # Guard stayed out of the way -- the existing tool call ran, with
+    # get_product_price's own bare-None "couldn't find that" shape (see
+    # test_route_customer_does_not_remember_a_product_price_lookup_that_found_nothing
+    # above for the same shape), not a clarification about the ring list.
+    execute_tool_mock.assert_called_once()
+    assert result is None
+
+
+def test_ambiguous_reference_guard_does_not_fire_when_an_ordinal_is_present(monkeypatch):
+    # "the second one" resolves against the list's own position context
+    # (already the LLM's job, given last_presented_products in its
+    # prompt) -- this guard must stay out of the way whenever a real
+    # position reference is in the message, per _ORDINAL_OR_NUMBER_RE.
+    monkeypatch.setattr(
+        router, "understand_customer",
+        MagicMock(return_value={
+            "tool": "get_product_price",
+            "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g", "material": "unknown"},
+        }),
+    )
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_FOUR_RING_LIST))
+    execute_tool_mock = MagicMock(
+        return_value={"product": "Big White Crown Stone Gold Ring, 14g", "material": "14k", "price": 1500}
+    )
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    result = router.route_customer("the second one", "clarify-ordinal-resolves")
+
+    execute_tool_mock.assert_called_once()
+    assert "conversation_reply" not in result
+    assert result["product"] == "Big White Crown Stone Gold Ring, 14g"
+
+
+def test_clarification_details_are_preserved_across_the_round_trip(monkeypatch):
+    # Webb's own regression case, verbatim (2026-09-02): "that one, in
+    # 14k, two pieces" is forced to clarify; the customer then answers
+    # "the second one" -- product #2 must resolve WITH material=14k and
+    # quantity=2 still applied, not force a repeat.
+    session_id = "clarify-details-preserved"
+
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_FOUR_RING_LIST))
+    understand_customer_mock = MagicMock(side_effect=[
+        {
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "unknown", "material": "14k", "quantity": 2,
+                "delivery_address": "unknown", "delivery_option": "unknown",
+            },
+        },
+        {
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "Big White Crown Stone Gold Ring, 14g", "material": "unknown",
+                "quantity": "unknown", "delivery_address": "unknown", "delivery_option": "unknown",
+            },
+        },
+    ])
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    execute_tool_mock = MagicMock(return_value={
+        "proposal": {
+            "product": "Big White Crown Stone Gold Ring, 14g", "material": "14k",
+            "quantity": 2, "total": 3000.0,
+        },
+    })
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    first = router.route_customer("that one, in 14k, two pieces", session_id)
+    assert first["conversation_reply"] == "Sure. Which ring do you mean, the first, second, third or fourth?"
+    execute_tool_mock.assert_not_called()
+
+    router.route_customer("the second one", session_id)
+
+    execute_tool_mock.assert_called_once()
+    _, kwargs = execute_tool_mock.call_args
+    assert kwargs["product_name"] == "Big White Crown Stone Gold Ring, 14g"
+    assert kwargs["material"] == "14k"
+    assert kwargs["quantity"] == 2
+
+
+def test_clarification_details_only_merge_fields_the_resolved_tool_accepts(monkeypatch):
+    # Live bug, 2026-09-02 (Webb, references-03 --repeat 6, caught from
+    # the evaluator's raw log output, not its pass/fail verdict): a
+    # stashed "quantity" (only meaningful for propose_order) must NOT be
+    # merged into a get_product_price call, which has no such parameter
+    # at all and raised a TypeError inside execute_tool() every time --
+    # see _TOOL_ACCEPTED_DETAIL_FIELDS's docstring. material, which
+    # get_product_price DOES accept, should still merge normally.
+    session_id = "clarify-details-wrong-tool-shape"
+
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_FOUR_RING_LIST))
+    understand_customer_mock = MagicMock(side_effect=[
+        {
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "unknown", "material": "14k", "quantity": 2,
+                "delivery_address": "unknown", "delivery_option": "unknown",
+            },
+        },
+        {
+            "tool": "get_product_price",
+            "arguments": {"product_name": "Big White Crown Stone Gold Ring, 14g", "material": "unknown"},
+        },
+    ])
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+    execute_tool_mock = MagicMock(
+        return_value={"product": "Big White Crown Stone Gold Ring, 14g", "material": "14k", "price": 1500}
+    )
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    router.route_customer("that one, in 14k, two pieces", session_id)
+    execute_tool_mock.assert_not_called()
+
+    router.route_customer("the second one", session_id)
+
+    # Must not raise, and must not have forwarded "quantity" at all --
+    # get_product_price()'s real signature has no such parameter.
+    execute_tool_mock.assert_called_once()
+    _, kwargs = execute_tool_mock.call_args
+    assert "quantity" not in kwargs
+    assert kwargs["material"] == "14k"
+
+
+def test_clarification_stash_does_not_leak_into_a_later_unrelated_list(monkeypatch):
+    # Generation guard, Webb's own closing constraint ("no bigger
+    # architecture" -- this is the narrow safety property that actually
+    # matters): if the customer browses a genuinely NEW list before ever
+    # answering the clarification, the old stash must not leak its
+    # details into a resolution against the new list.
+    session_id = "clarify-stash-stale-generation"
+
+    understand_customer_mock = MagicMock(side_effect=[
+        {
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "unknown", "material": "14k", "quantity": 2,
+                "delivery_address": "unknown", "delivery_option": "unknown",
+            },
+        },
+        {
+            "tool": "propose_order",
+            "arguments": {
+                "product_name": "Slim Gold Band, 3g", "material": "unknown",
+                "quantity": "unknown", "delivery_address": "unknown", "delivery_option": "unknown",
+            },
+        },
+    ])
+    monkeypatch.setattr(router, "understand_customer", understand_customer_mock)
+
+    execute_tool_mock = MagicMock(return_value={
+        "proposal": {"product": "Slim Gold Band, 3g", "material": "18k", "quantity": 1, "total": 900.0},
+    })
+    monkeypatch.setattr(router, "execute_tool", execute_tool_mock)
+
+    # get_last_presented_products() is read several times per turn (the
+    # override check, plus pre/post turn-trace snapshots) -- pinned via
+    # return_value for the whole of each turn, and reassigned BETWEEN
+    # turns, rather than a short side_effect list that would run out
+    # mid-turn.
+    monkeypatch.setattr(router, "get_last_presented_products", MagicMock(return_value=_FOUR_RING_LIST))
+    router.route_customer("that one, in 14k, two pieces", session_id)
+    execute_tool_mock.assert_not_called()
+
+    # A fresh recommend_products (generation bumped to 8) came back
+    # between the clarification and the customer's next message -- the
+    # stash from generation 7 must not apply here. "the first one" (an
+    # ordinal) is used deliberately so this second call bypasses the
+    # override guard entirely (see _ORDINAL_OR_NUMBER_RE) and goes
+    # straight to _apply_pending_clarification_details() -- the actual
+    # thing this test is checking.
+    monkeypatch.setattr(
+        router, "get_last_presented_products",
+        MagicMock(return_value={**_FOUR_RING_LIST, "generation": 8}),
+    )
+    router.route_customer("the first one", session_id)
+
+    execute_tool_mock.assert_called_once()
+    _, kwargs = execute_tool_mock.call_args
+    assert kwargs["material"] == "unknown"
+    assert kwargs["quantity"] == "unknown"

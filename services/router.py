@@ -17,6 +17,7 @@ from services.memory import (
     get_last_presented_products,
     get_last_priced_product,
     get_order_draft,
+    get_pending_clarification_details,
     get_pending_intent,
     get_session_store,
     increment_weight_ask_count,
@@ -25,6 +26,7 @@ from services.memory import (
     set_awaiting_confirmation,
     set_awaiting_field,
     set_just_confirmed_order,
+    set_pending_clarification_details,
     set_last_action_outcome,
     set_last_presented_products,
     set_last_priced_product,
@@ -183,6 +185,83 @@ _BARE_CONFIRMATION_PHRASES = {
     "ok place it", "yes please", "confirm it", "go for it", "sounds good",
     "yes confirm", "ok confirm", "proceed",
 }
+
+# Tools whose first real argument is a specific product -- exactly the
+# set the ambiguous-reference guard below cares about. Deliberately
+# _PRICING_TOOLS unioned with _ORDER_TOOL rather than a separate literal
+# set, so this can never silently drift out of sync with those two if a
+# new product-specific tool is added later.
+_PRODUCT_SPECIFIC_TOOLS = _PRICING_TOOLS | {_ORDER_TOOL}
+
+# Which non-product_name fields each product-specific tool's underlying
+# function actually accepts as a **kwarg -- see product_tool.py's
+# get_product_price()/get_product_weight()/list_karat_options() and
+# quote_service.generate_quote() and order_tool.propose_order()'s own
+# signatures. Live bug, 2026-09-02 (Webb, references-03 repeat run,
+# 6/6): _apply_pending_clarification_details() below used to merge
+# EVERY stashed detail into whatever tool the customer's clarification
+# answer resolved to, with no regard for whether that tool's function
+# signature actually has a parameter for it -- "that one, in 14k, two
+# pieces" stashes {"material": "14k", "quantity": 2}, and when the
+# resolution turn's own tool was get_product_price (which takes only
+# product_name and material, no quantity at all), the merged quantity
+# reached execute_tool() and blew up as
+# `get_product_price() got an unexpected keyword argument 'quantity'`
+# -- a TypeError inside tool_executor.py, caught there and turned into
+# a generic "Something went wrong" reply to the customer. The evaluator
+# scenario still reported PASS 6/6 because its own check only compares
+# the FINAL conversational outcome, not whether execute_tool() actually
+# ran clean -- a real gap Webb caught by reading the evaluator's raw
+# log output, not something the scenario's own pass/fail alone would
+# ever have surfaced. Fixing this at the merge site (below), rather
+# than papering over it with a broader except in tool_executor.py,
+# keeps tool_executor.py's "a bad-argument TypeError means something
+# upstream got the contract wrong" invariant intact -- see its own
+# comment at the TypeError branch.
+_TOOL_ACCEPTED_DETAIL_FIELDS = {
+    "get_product_price": {"material"},
+    "generate_quote": {"material"},
+    "get_product_karat_options": set(),
+    "get_product_weight": set(),
+    _ORDER_TOOL: {"material", "quantity", "delivery_address", "delivery_option"},
+}
+
+# Anything that looks like the customer actually pointed at a specific
+# position -- an ordinal word, an ordinal number ("2nd"), or a bare
+# digit anywhere in the message. Deliberately broad (matches inside a
+# longer sentence, not just a whole-message fullmatch like the karat/
+# quantity regexes above) and deliberately over-inclusive: this only
+# gates whether the ambiguous-reference guard below is ALLOWED to fire,
+# never forces a read on its own, so a false "yes, there's a number
+# here" just means the guard stays out of the way and today's existing
+# LLM-driven behaviour decides, same as if this guard didn't exist.
+_ORDINAL_OR_NUMBER_RE = re.compile(
+    r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|\d+(?:st|nd|rd|th)?)\b",
+    re.IGNORECASE,
+)
+
+# Words in ordinal order, used to build a proportional clarification
+# ("the first or second one" / "the first, second, third or fourth") --
+# see _build_ambiguity_clarification_reply()'s docstring.
+_ORDINAL_WORDS = [
+    "first", "second", "third", "fourth", "fifth",
+    "sixth", "seventh", "eighth", "ninth", "tenth",
+]
+
+# A bare reference to "it" or "this/that (one)" with nothing else
+# identifying which item -- the second of the two shapes the ambiguity
+# guard below treats as "plausibly talking about the list just shown"
+# (the first shape is a bare mention of one of the list's own
+# categories, checked directly against last_presented_products in
+# _looks_like_ambiguous_list_reference() since it depends on what was
+# actually shown, not a fixed word list). Deliberately narrow: matches
+# the exact regression cases ("that one", "this one", "I'll take that
+# one", bare "it"), not "this"/"that" used as a determiner in front of a
+# noun ("this order", "that address"), which already carry their own
+# meaning and aren't what this guard is for.
+_DEMONSTRATIVE_RE = re.compile(
+    r"\b(this one|that one|the same one|it)\b", re.IGNORECASE,
+)
 
 
 def _normalize_for_confirmation_check(stripped_message: str) -> str:
@@ -436,6 +515,220 @@ def _try_resolve_awaiting_field(awaiting_field: str | None, message: str) -> dic
     return None
 
 
+def _looks_like_ambiguous_list_reference(message: str, items: list[dict]) -> bool:
+    """Webb, 2026-09-02, extending the ambiguity guard: the live
+    evaluator run showed "the ring" doesn't always come back from the
+    LLM as a guessed catalogue name -- it correctly returned
+    product_name "unknown" (per llm.py's own instruction to do exactly
+    that when it can't tell), and get_product_price then safely replied
+    "couldn't find that one, tell me more". Safe, but poor: the system
+    already knows there's an active, ambiguous list and threw that
+    context away instead of using it.
+
+    The naive fix, "product_name unknown -> always clarify", is too
+    broad (Webb, explicitly): a customer asking about something
+    genuinely unrelated to the list just shown (a stale
+    last_presented_products from many turns ago, a typo'd product name
+    the model also can't resolve) would get hijacked into "did you mean
+    one of these rings?" when they meant neither. This function is the
+    narrower gate: true only when the message itself plausibly refers
+    BACK to the list, not just whenever resolution happens to fail.
+
+    Two shapes count, matching the actual regression cases: a bare
+    demonstrative ("that one", "this one", "it", see _DEMONSTRATIVE_RE),
+    or a bare mention of one of the list's own categories ("the ring",
+    "rings", "a necklace" when Rings/Necklaces items are what's shown).
+    Anything else (a specific but wrong/misspelled product name, an
+    unrelated category, plain small talk) returns False and the
+    existing, unrelated "couldn't find" behaviour is left untouched."""
+    if _DEMONSTRATIVE_RE.search(message):
+        return True
+    categories = {str(item.get("category") or "").strip().lower() for item in items}
+    categories.discard("")
+    lowered = message.lower()
+    for category in categories:
+        singular = category[:-1] if category.endswith("s") else category
+        if not singular:
+            continue
+        if re.search(rf"\b{re.escape(singular)}s?\b", lowered):
+            return True
+    return False
+
+
+def _build_ambiguity_clarification_reply(items: list[dict]) -> str:
+    """Webb, 2026-09-02: "the clarification should be proportional to
+    the ambiguity", not always the same generic sentence. Two items,
+    same category: "do you mean the first or second one?". More than
+    two, same category: name the category and list ordinals up to
+    _ORDINAL_WORDS' length, past that (an unusual case, ten-plus items
+    shown at once) fall back to listing the actual catalogue names
+    rather than run out of ordinal words. A genuinely mixed-category
+    list ("piece" is the only honest generic noun for "a ring and a
+    necklace together") skips ordinals/category naming entirely and
+    just asks which piece, matching Webb's own example verbatim rather
+    than guessing at a mixed-list wording he didn't ask for."""
+    categories = {str(item.get("category") or "").strip() for item in items}
+    categories.discard("")
+    if len(categories) != 1:
+        return "Sure. Which piece do you mean?"
+    category = next(iter(categories))
+    noun = category[:-1].lower() if category.lower().endswith("s") else category.lower()
+    count = len(items)
+    if count == 2:
+        return "Sure. Do you mean the first or second one?"
+    if count <= len(_ORDINAL_WORDS):
+        ordinals = _ORDINAL_WORDS[:count]
+        choices = ", ".join(ordinals[:-1]) + " or " + ordinals[-1]
+        return f"Sure. Which {noun} do you mean, the {choices}?"
+    listed = "\n".join(f"- {item.get('product_name', '')}" for item in items)
+    return f"Sure. Which {noun} do you mean?\n{listed}"
+
+
+def _override_unresolved_ambiguous_reference(
+    tool_request: dict, message: str, last_presented_products: dict | None,
+) -> dict | None:
+    """Evaluator finding, 2026-09-01 (Webb): three phrasings of the same
+    underlying failure -- a bare category name matching two shown items
+    ("the ring"), a bare demonstrative after a multi-item list ("I'll
+    take that one"), and a demonstrative-plus-details opener ("that one,
+    in 14k, two pieces") -- all reproduced at 0/6 across --repeat 6 runs
+    each, fully consistent, not a flaky one-off. The model reliably picks
+    up a strong, correct-looking TOOL signal ("I'll take that one" ->
+    propose_order) and just as reliably fails to then stop and check
+    whether it actually knows WHICH product from the list that tool call
+    should apply to -- it guesses, usually the first or most recent item,
+    instead of asking. A fully reproducible 0/18 across three distinct
+    phrasings is "this basically never happens", not "this sometimes
+    gets missed" -- not a case prompt reinforcement alone is safe to rely
+    on, the same reasoning already applied to _try_resolve_awaiting_field()
+    above for a different reliability-critical decision.
+
+    So: after the LLM has already responded, this checks whether the
+    session was actually showing more than one product (nothing to be
+    ambiguous about otherwise), and the customer's raw message has no
+    ordinal or number anywhere in it (a real position reference is
+    always let through untouched -- see _ORDINAL_OR_NUMBER_RE). Then
+    either of two things counts as "the LLM guessed rather than knew":
+    it returned a product-specific tool call whose product_name matches
+    one of the items from that list (a confident wrong guess), or it
+    honestly returned product_name "unknown" AND the message itself
+    looks like it was talking about that list anyway (see
+    _looks_like_ambiguous_list_reference() -- live evaluator finding,
+    2026-09-02: "the ring" produces this second shape, not the first,
+    the LLM correctly abstained and get_product_price's own "couldn't
+    find" reply covered the danger, but threw away context KasaFlow
+    already had). Either way, override with a converse reply asking
+    which item, proportional to how many are actually ambiguous (see
+    _build_ambiguity_clarification_reply()).
+
+    Any OTHER details the LLM did manage to extract alongside the
+    unresolved product_name (material, quantity, delivery info from
+    "that one, in 14k, two pieces") are stashed via
+    set_pending_clarification_details() so the customer doesn't have to
+    repeat them once they answer -- see that function's docstring and
+    _apply_pending_clarification_details() below for the other half of
+    this round trip.
+
+    Deliberately narrow and one-directional, same posture as
+    _try_resolve_awaiting_field(): on any doubt (fewer than two items
+    shown, an ordinal/number present, a product_name that doesn't match
+    the list AND doesn't look like a list reference either, or a tool
+    outside _PRODUCT_SPECIFIC_TOOLS) this returns None and changes
+    nothing. Worst case if a heuristic here is ever wrong is an
+    unnecessary clarifying question on a message that was actually
+    clear -- a mild annoyance, never worse than today's confirmed 0/6
+    silent-wrong-guess behaviour this exists to replace."""
+    if "_source" in tool_request:
+        return None
+    if tool_request.get("tool") not in _PRODUCT_SPECIFIC_TOOLS:
+        return None
+    if not last_presented_products:
+        return None
+    items = last_presented_products.get("items") or []
+    names = [item["product_name"] for item in items if item.get("product_name")]
+    if len(names) < 2:
+        return None
+    if _ORDINAL_OR_NUMBER_RE.search(message):
+        return None
+    arguments = tool_request.get("arguments") or {}
+    product_name = arguments.get("product_name")
+    if not isinstance(product_name, str):
+        return None
+    normalized = product_name.strip().lower()
+    matches_shown_item = normalized in {n.lower() for n in names}
+    if not matches_shown_item:
+        if normalized != "unknown" or not _looks_like_ambiguous_list_reference(message, items):
+            return None
+    reply = _build_ambiguity_clarification_reply(items)
+    other_details = {
+        key: value for key, value in arguments.items()
+        if key != "product_name" and value not in (None, "unknown", "")
+    }
+    stash = (
+        {"generation": last_presented_products.get("generation"), "details": other_details}
+        if other_details else None
+    )
+    return {
+        "tool": _CONVERSATION_TOOL,
+        "arguments": {"reply": reply},
+        "_source": "ambiguous_reference_guard",
+        "_clarification_stash": stash,
+    }
+
+
+def _apply_pending_clarification_details(
+    tool_request: dict, session_id: str, last_presented_products: dict | None,
+) -> dict:
+    """The other half of the round trip _override_unresolved_ambiguous_
+    reference() above starts: once the customer answers a forced
+    clarification by naming or positioning a specific item from the
+    SAME list ("the second one"), merge back in whatever other details
+    they already stated in the original ambiguous turn ("that one, in
+    14k, two pieces") rather than making them repeat themselves.
+
+    Only ever fills in a field this turn's own resolution left
+    "unknown"/missing -- if the customer restated or changed a detail
+    while answering the clarification, their fresh answer always wins,
+    this never overwrites it. Only consumes the stash when its
+    generation matches the CURRENT last_presented_products exactly, so
+    a stash from an old, superseded list can never leak into a new
+    one -- see set_pending_clarification_details()'s docstring.
+
+    Returns tool_request unchanged (same object) whenever there is
+    nothing to apply, so callers can use the return value unconditionally
+    without a None check."""
+    if tool_request.get("tool") not in _PRODUCT_SPECIFIC_TOOLS:
+        return tool_request
+    stash = get_pending_clarification_details(session_id)
+    if not stash or not last_presented_products:
+        return tool_request
+    if stash.get("generation") != last_presented_products.get("generation"):
+        return tool_request
+    items = last_presented_products.get("items") or []
+    names = {str(item.get("product_name") or "").strip().lower() for item in items}
+    arguments = tool_request.get("arguments") or {}
+    product_name = arguments.get("product_name")
+    if not isinstance(product_name, str) or product_name.strip().lower() not in names:
+        return tool_request
+    # Only ever merge a field the RESOLVED tool's own function actually
+    # takes -- see _TOOL_ACCEPTED_DETAIL_FIELDS's docstring for the live
+    # bug this closes (a stashed "quantity" reaching get_product_price(),
+    # which has no such parameter at all). The stash can carry details
+    # that belonged to a different tool than the one this clarification
+    # answer happens to resolve to (the customer could, in principle,
+    # ask a plain price question -- get_product_price -- to answer a
+    # clarification that was originally raised by a propose_order call),
+    # so this is a real filter, not a defensive no-op.
+    accepted_fields = _TOOL_ACCEPTED_DETAIL_FIELDS.get(tool_request.get("tool"), set())
+    merged = dict(arguments)
+    for key, value in (stash.get("details") or {}).items():
+        if key not in accepted_fields:
+            continue
+        if merged.get(key) in (None, "unknown", ""):
+            merged[key] = value
+    return {**tool_request, "arguments": merged}
+
+
 def route_customer(message: str, session_id: str) -> dict:
     """Public entry point. Holds this session's turn lock for the
     ENTIRE sequence below (read state -> call the LLM -> execute a tool
@@ -544,6 +837,36 @@ def _route_customer_locked(message: str, session_id: str) -> dict:
                 # passing it into the prompt at all.
                 awaiting_field=awaiting_field,
             )
+            # Post-hoc guard, not a fast path: the LLM has already run
+            # here, this only checks its answer against a list it can't
+            # see the ambiguity of reliably. See
+            # _override_unresolved_ambiguous_reference()'s docstring for
+            # the live evaluator evidence this exists to fix (2026-09-01,
+            # ambiguity-01/references-02, 0/6 each, fully reproducible).
+            override = _override_unresolved_ambiguous_reference(
+                tool_request, message, last_presented_products,
+            )
+            if override is not None:
+                tool_request = override
+            else:
+                # The other half of the round trip: this call did NOT get
+                # overridden, meaning the LLM returned (or fill_missing_
+                # context() will shortly resolve) a real, specific
+                # product_name -- exactly the shape a customer's answer to
+                # a forced clarification takes ("the second one" resolves
+                # against last_presented_products' own position context
+                # already passed into understand_customer()'s prompt, same
+                # as any other ordinal reference; see _ORDINAL_OR_NUMBER_RE
+                # above). If a clarification is still pending from an
+                # earlier turn in THIS same list, merge its stashed details
+                # back in now. A no-op (returns tool_request unchanged)
+                # whenever there's nothing stashed, the tool isn't
+                # product-specific, or the stash belongs to a different,
+                # superseded list -- see
+                # _apply_pending_clarification_details()'s docstring.
+                tool_request = _apply_pending_clarification_details(
+                    tool_request, session_id, last_presented_products,
+                )
     except ValueError as e:
         error_result = {"error": str(e)}
         _log_turn_trace(
@@ -682,8 +1005,33 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
     # converse reply or a different tool call has since moved past. See
     # memory.set_awaiting_field()'s docstring (Webb, 2026-08-21, P0.4).
     set_awaiting_field(session_id, None)
+    # Identical discipline, identical reason, for the ambiguity guard's
+    # own stash: only ever reflects a clarification THIS turn's own
+    # override just raised (reasserted a few lines below, in the
+    # CONVERSATION_TOOL branch, only when tool_request actually carries a
+    # "_clarification_stash"). Any other turn -- a normal tool call, a
+    # converse reply that wasn't this guard, or simply the turn where the
+    # customer answers the clarification and _apply_pending_clarification_
+    # details() (called from _route_customer_locked()) consumes it -- must
+    # not leave a stale stash sitting there to leak into a later,
+    # unrelated resolution. This is also what makes consumption
+    # single-use: the very turn that reads it also resets it, before
+    # anything below has a chance to reassert it.
+    set_pending_clarification_details(session_id, None)
 
     if tool_request["tool"] == _CONVERSATION_TOOL:
+        stash = tool_request.get("_clarification_stash")
+        if stash is not None:
+            # This converse reply IS the ambiguity guard's own
+            # clarification question (see
+            # _override_unresolved_ambiguous_reference()) -- reassert the
+            # stash the reset above just cleared, so the customer's next
+            # reply naming which item they meant can still recover the
+            # other details ("14k, two pieces") they already gave in the
+            # same breath. Any OTHER converse reply (a genuine question,
+            # small talk) never carries this key at all, so this branch
+            # is a no-op for every converse call except this guard's own.
+            set_pending_clarification_details(session_id, stash)
         result = _handle_conversation(tool_request["arguments"])
         _log_turn_trace(
             session_id, message, pre_state, tool_request,

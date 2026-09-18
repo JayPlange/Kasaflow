@@ -16,6 +16,7 @@ from services.memory import (
     get_last_presented_products,
     get_last_priced_product,
     get_order_draft,
+    get_pending_clarification_details,
     get_pending_intent,
     increment_weight_ask_count,
     is_awaiting_confirmation,
@@ -25,6 +26,7 @@ from services.memory import (
     set_last_action_outcome,
     set_last_presented_products,
     set_last_priced_product,
+    set_pending_clarification_details,
     set_pending_intent,
 )
 
@@ -713,3 +715,51 @@ def test_context_round_trips_across_two_simulated_turns(monkeypatch):
     result = fill_missing_context("session-1", {"product_name": "ring", "material": "unknown"})
 
     assert result["material"] == "gold"
+
+
+# ---------------------------------------------------------------------
+# pending_clarification_details -- Webb, 2026-09-02: the round trip
+# router._override_unresolved_ambiguous_reference() stashes into when a
+# forced clarification ("the ring" -> "which one?") also caught other
+# real details in the same breath ("that one, in 14k, two pieces"), so
+# the customer isn't made to repeat them once they answer. Same lifetime
+# discipline as awaiting_field above: defaults to None, round-trips
+# per-session, isolated across sessions.
+# ---------------------------------------------------------------------
+
+def test_pending_clarification_details_defaults_to_none(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    assert get_pending_clarification_details("session-1") is None
+
+
+def test_pending_clarification_details_round_trips(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    payload = {"generation": 3, "details": {"material": "14k", "quantity": 2}}
+    set_pending_clarification_details("session-1", payload)
+
+    assert get_pending_clarification_details("session-1") == payload
+
+
+def test_pending_clarification_details_can_be_cleared(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_pending_clarification_details("session-1", {"generation": 1, "details": {"material": "18k"}})
+    set_pending_clarification_details("session-1", None)
+
+    assert get_pending_clarification_details("session-1") is None
+
+
+def test_pending_clarification_details_isolated_across_sessions(monkeypatch):
+    from services import memory
+    monkeypatch.setattr(memory, "_store", SessionStore())
+
+    set_pending_clarification_details("session-a", {"generation": 1, "details": {"material": "14k"}})
+    set_pending_clarification_details("session-b", {"generation": 1, "details": {"material": "18k"}})
+
+    assert get_pending_clarification_details("session-a")["details"]["material"] == "14k"
+    assert get_pending_clarification_details("session-b")["details"]["material"] == "18k"
