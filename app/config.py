@@ -113,6 +113,16 @@ class Settings:
     # "Mankessim"), not region names, and no fixed list can cover those.
     google_maps_api_key: str | None
 
+    # Guardrails (services/guardrails.py, services/escalation.py,
+    # order_tool.confirm_order()). The two order limits are off (None)
+    # unless set: above them an order is passed to a person instead of
+    # being placed automatically.
+    order_auto_confirm_max_total: float | None = None
+    order_max_quantity: int | None = None
+    escalation_failure_threshold: int = 3
+    escalation_injection_threshold: int = 2
+    escalation_renotify_seconds: int = 600
+
 
 def load_settings() -> Settings:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -175,7 +185,24 @@ def load_settings() -> Settings:
         cohere_api_key=os.getenv("COHERE_API_KEY"),
         google_maps_api_key=os.getenv("GOOGLE_MAPS_API_KEY"),
         enable_demo_dashboard=os.getenv("ENABLE_DEMO_DASHBOARD", "false").strip().lower() == "true",
+        order_auto_confirm_max_total=_optional_float(os.getenv("ORDER_AUTO_CONFIRM_MAX_TOTAL")),
+        order_max_quantity=_optional_int(os.getenv("ORDER_MAX_QUANTITY")),
+        escalation_failure_threshold=int(os.getenv("ESCALATION_FAILURE_THRESHOLD", "3")),
+        escalation_injection_threshold=int(os.getenv("ESCALATION_INJECTION_THRESHOLD", "2")),
+        escalation_renotify_seconds=int(os.getenv("ESCALATION_RENOTIFY_SECONDS", "600")),
     )
+
+
+def _optional_float(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+    return float(value)
+
+
+def _optional_int(value: str | None) -> int | None:
+    if value is None or not value.strip():
+        return None
+    return int(value)
 
 
 # Loaded once at import time, deliberately. If the config is broken (e.g.

@@ -7,7 +7,22 @@ customer sees when something goes wrong upstream.
 import json
 import logging
 import re
+import threading
+import time
 
+from services import llm_metrics, turn_context
+from services.escalation import (
+    escalate,
+    holding_result,
+    is_escalated,
+    over_failure_threshold,
+    over_flag_threshold,
+    record_failure,
+    record_flagged_message,
+    reset_failures,
+    wants_human,
+)
+from services.guardrails import check_conversation_reply, gate_tool_request, screen_message
 from services.llm import ToolSelectionError, understand_customer
 from services.memory import (
     fill_missing_context,
@@ -47,7 +62,8 @@ logger = logging.getLogger(__name__)
 # by name rather than added to every tool call: passing an unexpected
 # session_id kwarg to any of the other five would raise inside
 # tool_executor.py's TypeError handler.
-_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order", "cancel_order", "get_order_status"}
+_SESSION_AWARE_TOOLS = {"propose_order", "confirm_order", "cancel_order", "get_order_status", "escalate_to_human"}
+_ESCALATE_TOOL = "escalate_to_human"
 
 # converse (services/llm.py) isn't a real registered tool -- there's no
 # deterministic business logic behind it, no lookup, nothing to execute.
@@ -739,10 +755,103 @@ def route_customer(message: str, session_id: str) -> dict:
     later write from the slower request lands after an earlier one
     meant to come first."""
     with get_session_store().session_lock(session_id):
-        return _route_customer_locked(message, session_id)
+        turn_context.begin()
+        started = time.perf_counter()
+        llm_calls: list[dict] = []
+        result = None
+        try:
+            with llm_metrics.collecting() as collected:
+                llm_calls = collected
+                result = _route_customer_locked(message, session_id)
+            return result
+        finally:
+            _record_turn_metrics(session_id, started, llm_calls, result)
+            turn_context.end()
+
+
+_last_turn = threading.local()
+
+
+def get_last_turn_metrics() -> dict | None:
+    """Metrics of the last route_customer() call made on this thread.
+
+    Used by the eval runner (scripts/evalset/run.py) so it can score
+    latency, tokens and guardrail events without parsing log output."""
+    return getattr(_last_turn, "metrics", None)
+
+
+def _record_turn_metrics(session_id: str, started: float, llm_calls: list[dict], result) -> None:
+    """One KASAFLOW_TURN_METRICS log line per customer turn.
+
+    Additive to KASAFLOW_TURN_TRACE: the trace says what was decided, this
+    says what it cost and how long it took, plus any guardrail events.
+    Never contains the customer's message or the model's output."""
+    try:
+        metrics = {
+            "session_id": session_id,
+            "turn_latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "llm_calls": [
+                {k: call.get(k) for k in (
+                    "model", "attempt", "outcome", "latency_ms", "input_tokens",
+                    "output_tokens", "cached_tokens", "reasoning_tokens",
+                )}
+                for call in llm_calls
+            ],
+            "guardrail_events": turn_context.events(),
+            "result_kind": next(iter(result), None) if isinstance(result, dict) else None,
+        }
+        _last_turn.metrics = metrics
+        logger.info("KASAFLOW_TURN_METRICS %s", json.dumps(metrics, default=str))
+    except Exception:
+        logger.exception("Failed to record turn metrics for session %s", session_id)
+
+
+def _escalate_turn(session_id: str, message: str, reason: str, detail: str | None = None) -> dict:
+    """Hand the session to a person and log the turn like any other."""
+    pre_state = _snapshot_session_state(session_id)
+    result = escalate(session_id, reason, detail=detail, context={"pending_order": pre_state["pending_order"]})
+    turn_context.add_event("escalated", reason=reason)
+    _log_turn_trace(
+        session_id, message, pre_state, {"tool": "guardrail:escalate", "reason": reason},
+        resolved_arguments=None, tool_result=None, final_result=result,
+        post_state=_snapshot_session_state(session_id),
+    )
+    return result
 
 
 def _route_customer_locked(message: str, session_id: str) -> dict:
+    # GUARDRAILS (2026-11), all before the model runs. See
+    # services/guardrails.py and services/escalation.py.
+    #
+    # 1. A session already handed to a person: no model call, no tools.
+    if is_escalated(session_id):
+        turn_context.add_event("handoff_active")
+        result = holding_result(session_id, message)
+        _log_turn_trace(
+            session_id, message, _snapshot_session_state(session_id), {"tool": "guardrail:handoff_active"},
+            resolved_arguments=None, tool_result=None, final_result=result, post_state=None,
+        )
+        return result
+
+    # 2. Messages that look like attempts to steer the assistant itself.
+    # A flag doesn't stop the turn; it quotes the message as data in the
+    # prompt and blocks write tools (gate_tool_request() below).
+    screen = screen_message(message)
+    if screen.flagged:
+        flagged_count = record_flagged_message(session_id)
+        turn_context.add_event("injection_flagged", flags=list(screen.flags), count=flagged_count)
+        logger.warning("Message flagged by guardrails for session %s: %s", session_id, screen.flags)
+        if over_flag_threshold(flagged_count):
+            return _escalate_turn(
+                session_id, message, "repeated_manipulation",
+                detail=f"{flagged_count} flagged messages; latest: {message[:200]}",
+            )
+
+    # 3. An explicit request for a person never depends on the model
+    # choosing escalate_to_human.
+    if wants_human(message):
+        return _escalate_turn(session_id, message, "customer_request", detail=message[:300])
+
     try:
         # Tells the LLM whether this session actually has anything
         # pending to confirm -- see llm.py's _pending_order_state_line()
@@ -828,6 +937,7 @@ def _route_customer_locked(message: str, session_id: str) -> dict:
                 last_priced_product=last_priced_product,
                 just_confirmed_order=just_confirmed_order,
                 last_presented_products=last_presented_products,
+                **({"untrusted": True} if screen.flagged else {}),
                 # Only reaches here at all when the fast-path check just
                 # above declined to resolve it -- for product_name that's
                 # every time, since it has no fast-path branch (see
@@ -876,12 +986,21 @@ def _route_customer_locked(message: str, session_id: str) -> dict:
         return error_result
     except ToolSelectionError as e:
         logger.error("Tool selection failed: %s", e)
+        failures = record_failure(session_id)
+        if over_failure_threshold(failures):
+            return _escalate_turn(session_id, message, "repeated_failures", detail=f"{failures} failed turns in a row")
         error_result = {"error": "I couldn't understand that request. Could you rephrase it?"}
         _log_turn_trace(
             session_id, message, _snapshot_session_state(session_id), {"error": str(e)},
             resolved_arguments=None, tool_result=None, final_result=error_result, post_state=None,
         )
         return error_result
+
+    # Enforcement half of the screen above: on a flagged turn, the model
+    # may not confirm or cancel an order, whatever it chose.
+    tool_request, blocked_tool = gate_tool_request(tool_request, screen)
+    if blocked_tool:
+        turn_context.add_event("write_blocked", tool=blocked_tool)
 
     # understand_customer() only returns "requests" (plural) when the
     # message genuinely contained more than one distinct ask -- see
@@ -1033,6 +1152,11 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
             # is a no-op for every converse call except this guard's own.
             set_pending_clarification_details(session_id, stash)
         result = _handle_conversation(tool_request["arguments"])
+        checked_reply, replaced = check_conversation_reply(result.get("conversation_reply"))
+        if replaced:
+            turn_context.add_event("reply_replaced")
+            logger.warning("Converse reply replaced by guardrail for session %s", session_id)
+            result = {"conversation_reply": checked_reply}
         _log_turn_trace(
             session_id, message, pre_state, tool_request,
             resolved_arguments=None, tool_result=None, final_result=result,
@@ -1074,6 +1198,9 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
         result = execute_tool(tool_request["tool"], **arguments)
     except ToolExecutionError as e:
         logger.error("Tool execution failed: %s", e)
+        failures = record_failure(session_id)
+        if over_failure_threshold(failures):
+            return _escalate_turn(session_id, message, "repeated_failures", detail=f"{failures} failed turns in a row")
         error_result = {"error": "Something went wrong while processing your request."}
         _log_turn_trace(
             session_id, message, pre_state, tool_request,
@@ -1115,6 +1242,14 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
         # through to converse. See _try_resolve_awaiting_field()'s
         # "delivery_interest" branch for the other half of this.
         set_awaiting_field(session_id, "delivery_interest")
+    elif tool_request["tool"] == _CONFIRM_TOOL and isinstance(result, dict) and "price_changed" in result:
+        # order_tool._reprice_against_catalogue() re-quoted instead of
+        # placing the order. The re-quote is now the latest proposal, so
+        # a plain CONFIRM next turn confirms it at the new total.
+        set_awaiting_confirmation(session_id, True)
+        set_awaiting_field(session_id, "confirmation")
+        turn_context.add_event("price_changed", old_total=result["price_changed"]["old_total"],
+                               new_total=result["price_changed"]["new_total"])
 
     if tool_request["tool"] == _CONFIRM_TOOL and isinstance(result, dict) and "order_confirmation" in result:
         # This turn's confirm_order call actually placed the order --
@@ -1181,6 +1316,24 @@ def _execute_single(tool_request: dict, session_id: str, message: str = "") -> d
     _update_last_priced_product(session_id, tool_request["tool"], result)
     _update_last_presented_products(session_id, tool_request["tool"], result)
     weight_ask_count = _update_weight_ask_count(session_id, tool_request["tool"], result)
+
+    if isinstance(result, dict):
+        if "order_needs_review" in result:
+            turn_context.add_event("escalated", reason="order_review")
+        elif "human_handoff" in result:
+            turn_context.add_event("escalated", reason="model_requested")
+        elif "order_confirmation" in result and result["order_confirmation"].get("total_verified") is False:
+            turn_context.add_event("escalated", reason="total_mismatch")
+
+    # Failure counting for the repeated_failures escalation: a real
+    # business action that failed this turn (last_action_outcome newly
+    # set) counts; asking the customer for a missing detail doesn't.
+    if get_last_action_outcome(session_id) and get_last_action_outcome(session_id) != pre_state["last_action_outcome"]:
+        failures = record_failure(session_id)
+        if over_failure_threshold(failures):
+            return _escalate_turn(session_id, message, "repeated_failures", detail=f"{failures} failed turns in a row")
+    elif _tool_succeeded(result):
+        reset_failures(session_id)
 
     if _tool_succeeded(result):
         # A genuine success means whatever failed before is no longer

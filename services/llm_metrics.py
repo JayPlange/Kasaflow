@@ -54,6 +54,10 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _lock = threading.Lock()
 _in_flight = 0
 _sinks: list[Callable[[dict], None]] = []
+# Per-thread record buffer for collecting(): router.py gathers the model
+# calls of one customer turn this way, so a turn's tokens and latency
+# can be logged next to the turn itself (KASAFLOW_TURN_METRICS).
+_local = threading.local()
 
 
 def _flag_on() -> bool:
@@ -61,7 +65,27 @@ def _flag_on() -> bool:
 
 
 def is_enabled() -> bool:
-    return _flag_on() or bool(_sinks)
+    return _flag_on() or bool(_sinks) or getattr(_local, "buffer", None) is not None
+
+
+class collecting:
+    """Collect this thread's records while the block runs.
+
+        with llm_metrics.collecting() as records:
+            ...  # model calls made here land in `records`
+
+    Nested use is not supported; the inner block takes over the buffer
+    and the outer one sees nothing from it."""
+
+    def __enter__(self) -> list[dict]:
+        self._previous = getattr(_local, "buffer", None)
+        self._records: list[dict] = []
+        _local.buffer = self._records
+        return self._records
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        _local.buffer = self._previous
+        return False
 
 
 def add_sink(sink: Callable[[dict], None]) -> None:
@@ -171,6 +195,9 @@ class _Attempt:
 
         if _flag_on():
             logger.info("KASAFLOW_LLM_METRICS %s", json.dumps(record, separators=(",", ":")))
+        buffer = getattr(_local, "buffer", None)
+        if buffer is not None:
+            buffer.append(record)
         with _lock:
             sinks = list(_sinks)
         for sink in sinks:

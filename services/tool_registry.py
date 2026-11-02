@@ -1,4 +1,5 @@
 from services.delivery_tool import get_delivery_information
+from services.escalation import escalate_to_human
 from services.order_tool import cancel_order, confirm_order, get_order_status, propose_order
 from services.policy_tool import answer_policy_question
 from services.product_tool import get_product_price, get_product_weight, list_karat_options
@@ -31,4 +32,8 @@ TOOLS = {
     # cancel_order immediately above -- same fallback-to-last-order need,
     # just read-only instead of a cancellation.
     "get_order_status": get_order_status,
+    # Hands the conversation to a person (services/escalation.py).
+    # Session-aware: router.py injects session_id, see
+    # _SESSION_AWARE_TOOLS.
+    "escalate_to_human": escalate_to_human,
 }
