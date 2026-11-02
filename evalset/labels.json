@@ -1,0 +1,18 @@
+{
+  "conv-8bda93af10": {
+    "reviewed": false,
+    "expected_order": {
+      "product": "Gye Nyame White Necklace with Earrings, 30g",
+      "material": "14k",
+      "quantity": 2
+    },
+    "expect_handoff": false,
+    "notes": "Pre-filled by Claude from the transcript: the customer chose the necklace, 14k, 2 pieces, East Legon, then said confirm. In the original run the confirm failed. Check, then set reviewed to true."
+  },
+  "conv-67ea884334": {
+    "reviewed": false,
+    "expected_order": null,
+    "expect_handoff": false,
+    "notes": "Pre-filled by Claude from the transcript: the customer changed the karat to 18 after the proposal and never confirmed, so no order should be placed. Check, then set reviewed to true."
+  }
+}
