@@ -23,6 +23,7 @@ import time
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI
 
 from app.config import settings
+from services import llm_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -796,15 +797,17 @@ def _call_llm(
 
     for attempt in range(1, total_attempts + 1):
         try:
-            response = client.responses.create(
-                model=settings.openai_model,
-                input=_build_prompt(
-                    message, pending_order, order_draft, pending_intent, last_action_outcome,
-                    last_priced_product, awaiting_confirmation, just_confirmed_order,
-                    last_presented_products, awaiting_field,
-                ),
-                timeout=settings.llm_timeout_seconds,
-            )
+            with llm_metrics.attempt(attempt, total_attempts, settings.openai_model) as call:
+                response = client.responses.create(
+                    model=settings.openai_model,
+                    input=_build_prompt(
+                        message, pending_order, order_draft, pending_intent, last_action_outcome,
+                        last_priced_product, awaiting_confirmation, just_confirmed_order,
+                        last_presented_products, awaiting_field,
+                    ),
+                    timeout=settings.llm_timeout_seconds,
+                )
+                call.succeeded(response)
             return response.output_text
 
         except (APIConnectionError, APITimeoutError) as e:
