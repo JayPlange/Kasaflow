@@ -299,10 +299,60 @@ def format_for_customer(result: dict | None) -> str:
         # you're actually looking at what state the order is really in.
         c = result["order_confirmation"]
         delivery_label = c.get("delivery_option_label") or "your chosen delivery option"
+        if c.get("total_verified") is False:
+            # Store total differs from the quoted one (see
+            # order_tool._finalize_confirmation()). The order exists but
+            # is unpaid; don't restate a total that may not be what the
+            # store will ask for.
+            return (
+                f"Your order *#{c['order_id']}* has been placed, delivering to "
+                f"{c['delivery_address']} via {delivery_label}. Before you pay anything, a member "
+                f"of our team will confirm the final amount with you here."
+            )
         return (
             f"All set -- *order #{c['order_id']}* has been placed for *GH₵{c['total']:,.2f}*, "
             f"delivering to {c['delivery_address']} via {delivery_label}. Our team will be in "
             f"touch shortly to arrange payment and delivery."
+        )
+
+    if "price_changed" in result:
+        # order_tool._reprice_against_catalogue(): the price moved between
+        # the proposal and the customer's CONFIRM. Nothing was placed.
+        pc = result["price_changed"]
+        p = pc["proposal"]
+        return (
+            f"Quick update before I place this: the price has changed since I quoted it. "
+            f"*{p['quantity']} x {p['material']} {p['product']}* now comes to "
+            f"*GH₵{pc['new_total']:,.2f}* (it was GH₵{pc['old_total']:,.2f}). Nothing has been "
+            f"placed yet. Reply CONFIRM to go ahead at the new total."
+        )
+
+    if "order_needs_review" in result:
+        # order_tool._check_order_limits(): over the auto-confirm limits,
+        # handed to a person instead of placed.
+        r = result["order_needs_review"]
+        summary = f"*{r['quantity']} x {r['material']} {r['product']}*, GH₵{r['total']:,.2f}"
+        if r.get("staff_notified"):
+            return (
+                f"Thanks! For an order of this size ({summary}) a member of our team will confirm "
+                f"the details with you personally before it's placed. They'll reply here shortly."
+            )
+        return (
+            f"Thanks! An order of this size ({summary}) needs to be confirmed by a member of our "
+            f"team before it's placed. Please call or visit the shop to complete it."
+        )
+
+    if "human_handoff" in result:
+        # services/escalation.py. Only promise a reply from the team when
+        # a notification was actually sent.
+        h = result["human_handoff"]
+        if h.get("already_escalated") and h.get("staff_notified"):
+            return "Thanks, I've passed that on too. A member of our team will reply here."
+        if h.get("staff_notified"):
+            return "No problem, I've let a member of our team know. They'll reply to you here shortly."
+        return (
+            "No problem, I'll pass this to a member of our team. If you don't hear back soon, "
+            "please call or visit the shop directly."
         )
 
     if "order_cancellation" in result:

@@ -15,3 +15,7 @@ kasaflow_local_logs.txt
 trace_full.txt
 trace_lines.txt
 data/products.json.bak-*
+
+# Eval run outputs (scripts/evalset/run.py, dashboard.py). Contain
+# anonymised conversation text only, but are regenerated per run.
+eval_reports/

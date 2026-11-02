@@ -94,7 +94,7 @@ Beyond what that document covers: memory is in-process only (no Redis, doesn't s
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest                        # 809 passing, 29 skipped (gated behind --run-regression)
+pytest                        # 937 passing, 29 skipped (gated behind --run-regression)
 pytest --run-regression       # + real-OpenAI-API regression tests (costs money)
 ```
 
@@ -106,6 +106,20 @@ pytest --run-regression       # + real-OpenAI-API regression tests (costs money)
 python3 scripts/run_evaluator.py
 python3 scripts/run_evaluator.py --category "REFERENCES"
 ```
+
+### Conversation eval set
+
+`evalset/` and `scripts/evalset/` turn logged conversations into an anonymised eval set and replay it through the current code, scoring order accuracy, cost per conversation and latency, with a static HTML dashboard per run. A recorded mode replays the model's original answers (free, isolates the application); a live mode calls the model with `--repeat` to expose variance. See `evalset/README.md`. The set currently holds two operator test conversations; there are no real customer conversations yet.
+
+## Guardrails
+
+Deterministic checks around the model's choices, in code rather than the prompt:
+
+- **Totals before committing.** `confirm_order()` re-prices the exact quoted variant against the catalogue and re-quotes if the price moved; compares WooCommerce's order total with the quoted one and hands off on a mismatch; optional `ORDER_AUTO_CONFIRM_MAX_TOTAL` and `ORDER_MAX_QUANTITY` send large orders to a person instead of placing them.
+- **Prompt injection.** `services/guardrails.py` flags messages that try to override instructions, impersonate staff or the system, fake a tool call, set a price or extract the prompt. A flagged message is quoted as data in the prompt and cannot trigger `confirm_order` or `cancel_order` that turn. Converse replies that leak prompt text are replaced.
+- **Human escalation.** `services/escalation.py`. Explicit requests for a person are caught before the model runs; the model can also choose `escalate_to_human`; repeated failures (`ESCALATION_FAILURE_THRESHOLD`, default 3) or repeated manipulation (`ESCALATION_INJECTION_THRESHOLD`, default 2) escalate automatically. An escalated session gets a holding reply and no model or tool calls, and staff are notified on `STAFF_NOTIFICATION_PHONE`.
+
+Every turn logs `KASAFLOW_TURN_METRICS` (latency, tokens per model call, guardrail events) next to the existing `KASAFLOW_TURN_TRACE`.
 
 ## Running Locally
 

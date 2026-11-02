@@ -63,6 +63,7 @@ infrastructure (a public HTTPS endpoint, signature verification), not
 justified for idempotency alone while the fallback above covers it.
 """
 
+import json
 import logging
 import uuid
 
@@ -660,6 +661,16 @@ def confirm_order(session_id: str, confirmation_allowed: bool = True) -> dict:
         # idempotency guarantee, only a same-process race guard.
         return {"error": "Still placing your order, one moment."}
 
+    # GUARDRAIL (totals, 2026-11): the customer agreed to a specific
+    # total when they saw the proposal. Two checks before anything is
+    # written, see _check_order_limits() and _reprice_against_catalogue().
+    review = _check_order_limits(session_id, pending)
+    if review is not None:
+        return review
+    repriced = _reprice_against_catalogue(session_id, pending)
+    if repriced is not None:
+        return repriced
+
     pending["status"] = "submitting"
     _store.set(session_id, _PENDING_ORDER_KEY, pending)
 
@@ -679,7 +690,7 @@ def confirm_order(session_id: str, confirmation_allowed: bool = True) -> dict:
         )
         existing = _find_existing_order_by_token(pending["token"])
         if existing is not None:
-            return _finalize_confirmation(session_id, pending, existing["id"])
+            return _finalize_confirmation(session_id, pending, existing["id"], existing.get("total"))
 
         # Checked and found nothing -- genuinely unresolved, not just
         # unlucky timing. Safe to hand back to "pending" for a real retry.
@@ -698,7 +709,110 @@ def confirm_order(session_id: str, confirmation_allowed: bool = True) -> dict:
         set_last_action_outcome(session_id, _CONFIRM_ORDER_FAILURE_OUTCOME)
         return {"error": "Something went wrong placing your order -- let's try that again."}
 
-    return _finalize_confirmation(session_id, pending, order["id"])
+    return _finalize_confirmation(session_id, pending, order["id"], order.get("total"))
+
+
+def _check_order_limits(session_id: str, pending: dict) -> dict | None:
+    """Orders above the configured limits go to a person, not WooCommerce.
+
+    Both limits are off unless set in the environment
+    (ORDER_AUTO_CONFIRM_MAX_TOTAL, ORDER_MAX_QUANTITY). The proposal is
+    kept so the member of staff who picks it up can see exactly what was
+    quoted."""
+    max_total = settings.order_auto_confirm_max_total
+    max_quantity = settings.order_max_quantity
+    reasons = []
+    if max_total is not None and float(pending["total"]) > max_total:
+        reasons.append(f"total GH₵{float(pending['total']):,.2f} is over the GH₵{max_total:,.2f} limit")
+    if max_quantity is not None and int(pending["quantity"]) > max_quantity:
+        reasons.append(f"quantity {pending['quantity']} is over the limit of {max_quantity}")
+    if not reasons:
+        return None
+
+    # Imported here, not at module level: escalation.py is optional
+    # plumbing for this module and must not become an import-time
+    # dependency of every order_tool import.
+    from services.escalation import escalate
+
+    handoff = escalate(
+        session_id, "order_review", detail="; ".join(reasons),
+        context={"pending_order": get_pending_order_summary(session_id)},
+    )
+    return {"order_needs_review": {
+        "product": pending["product"],
+        "material": pending["material"],
+        "quantity": pending["quantity"],
+        "total": pending["total"],
+        "staff_notified": handoff["human_handoff"]["staff_notified"],
+    }}
+
+
+def _catalogue_unit_price(pending: dict) -> float | None:
+    """Current price of exactly the variant that was quoted, or None.
+
+    Matches on variation_id, not id + karat: one product id has a row per
+    karat AND size, and two of those id+karat pairs carry more than one
+    price, so a looser match could report a price change that never
+    happened. None means "can't verify", never "price changed"."""
+    try:
+        with open(settings.products_path, "r") as file:
+            products = json.load(file)
+    except (OSError, ValueError):
+        logger.warning("Could not read catalogue to re-check price for token=%s", pending.get("token"))
+        return None
+
+    variation_id = pending.get("variation_id")
+    for row in products:
+        if row.get("id") != pending.get("product_id"):
+            continue
+        if variation_id is not None and row.get("variation_id") == variation_id:
+            try:
+                return float(row["price"])
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
+
+
+def _reprice_against_catalogue(session_id: str, pending: dict) -> dict | None:
+    """If the quoted variant's catalogue price changed since the proposal,
+    re-quote instead of writing.
+
+    The catalogue is re-synced from WooCommerce while proposals sit in
+    session memory, and WooCommerce prices the order from its own live
+    price (the order payload carries product and quantity, not a price).
+    Writing anyway would place an order at a total the customer never
+    saw. Instead the proposal is updated to the new price and the
+    customer is asked to confirm again; router.py treats the result like
+    a fresh proposal."""
+    current = _catalogue_unit_price(pending)
+    if current is None:
+        return None
+    quoted = float(pending["unit_price"])
+    if abs(current - quoted) < 0.005:
+        return None
+
+    old_total = float(pending["total"])
+    new_total = round(current * int(pending["quantity"]), 2)
+    pending.update({"unit_price": current, "subtotal": new_total, "total": new_total})
+    _store.set(session_id, _PENDING_ORDER_KEY, pending)
+    logger.warning(
+        "Price changed between proposal and confirmation for token=%s: %.2f -> %.2f",
+        pending.get("token"), old_total, new_total,
+    )
+    return {"price_changed": {"old_total": old_total, "new_total": new_total, "proposal": pending}}
+
+
+def _store_total_matches(expected: float, store_total) -> bool | None:
+    """Compare WooCommerce's order total with the quoted one.
+
+    None when WooCommerce didn't report a usable total (can't verify)."""
+    if store_total is None:
+        return None
+    try:
+        actual = float(store_total)
+    except (TypeError, ValueError):
+        return None
+    return abs(actual - float(expected)) < 0.01
 
 
 _CANCELLABLE_STATUSES = {"pending", "on-hold"}
@@ -996,13 +1110,20 @@ def _notify_staff_of_cancel_request(session_id: str, order_id: int, status: str)
         logger.error("Failed to notify staff about cancel request for order #%s: %s", order_id, e)
 
 
-def _finalize_confirmation(session_id: str, pending: dict, order_id) -> dict:
+def _finalize_confirmation(session_id: str, pending: dict, order_id, store_total=None) -> dict:
+    total_verified = _store_total_matches(pending["total"], store_total)
     confirmation = {
         "order_id": order_id,
         "total": pending["total"],
         "delivery_address": pending["delivery_address"],
         "delivery_option_label": pending.get("delivery_option_label"),
+        # True: WooCommerce's total matches what the customer agreed to.
+        # None: WooCommerce didn't report one (can't verify). False: it
+        # differs; the order stays on-hold and a person takes over.
+        "total_verified": total_verified,
     }
+    if total_verified is False:
+        confirmation["store_total"] = store_total
     _store.set(session_id, _LAST_CONFIRMED_KEY, confirmation)
     _store.set(session_id, _PENDING_ORDER_KEY, None)
     # This order is done -- product/material/quantity/address/delivery
@@ -1011,6 +1132,19 @@ def _finalize_confirmation(session_id: str, pending: dict, order_id) -> dict:
     # docstring (2026-08-20 architecture audit, failure #3).
     clear_order_state(session_id)
     _notify_staff_of_new_order(session_id, pending, order_id)
+    if total_verified is False:
+        logger.error(
+            "Order #%s total mismatch: quoted %.2f, store %s", order_id, float(pending["total"]), store_total,
+        )
+        from services.escalation import escalate
+
+        escalate(
+            session_id, "total_mismatch",
+            detail=(
+                f"Order #{order_id}: customer agreed to GH₵{float(pending['total']):,.2f}, "
+                f"store total is {store_total}. Order is on-hold, unpaid."
+            ),
+        )
     return {"order_confirmation": confirmation}
 
 

@@ -23,6 +23,8 @@ import time
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI
 
 from app.config import settings
+from services import llm_metrics
+from services.guardrails import quote_untrusted_message
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,11 @@ Do NOT use converse when:
 - the customer asks what a specific past/confirmed order actually contains or was placed at ("did you change the karat", "what karat did I order", "was that 14k or 18k") -- even if this conversation's own earlier turns seem to already answer it. That is a fact about a real order, not about what was said in the chat; use get_order_status, never converse, and never your own reconstruction of the conversation so far.
 
 Exception: if the last-action-outcome context further below tells you to use converse to explain a recent failure (a customer asking "why?" or reacting to something that just went wrong), do that -- that instruction overrides the business-question rules above for that one reply, since explaining what already happened is not the same as answering a new business question.
+
+13. escalate_to_human
+Arguments:
+- reason
+Use this when the customer needs a person rather than this assistant: they ask for a human, staff, the owner or a manager; they complain, dispute a charge, or are clearly upset with the shop; or they want something this store's tools can't do (custom designs, repairs, refunds on a paid order, wholesale terms). `reason` is a short plain-English summary of why, for staff to read. Do NOT use it for ordinary questions the tools above can answer, or just because the customer is unsure what to buy.
 
 Examples:
 
@@ -796,15 +803,17 @@ def _call_llm(
 
     for attempt in range(1, total_attempts + 1):
         try:
-            response = client.responses.create(
-                model=settings.openai_model,
-                input=_build_prompt(
-                    message, pending_order, order_draft, pending_intent, last_action_outcome,
-                    last_priced_product, awaiting_confirmation, just_confirmed_order,
-                    last_presented_products, awaiting_field,
-                ),
-                timeout=settings.llm_timeout_seconds,
-            )
+            with llm_metrics.attempt(attempt, total_attempts, settings.openai_model) as call:
+                response = client.responses.create(
+                    model=settings.openai_model,
+                    input=_build_prompt(
+                        message, pending_order, order_draft, pending_intent, last_action_outcome,
+                        last_priced_product, awaiting_confirmation, just_confirmed_order,
+                        last_presented_products, awaiting_field,
+                    ),
+                    timeout=settings.llm_timeout_seconds,
+                )
+                call.succeeded(response)
             return response.output_text
 
         except (APIConnectionError, APITimeoutError) as e:
@@ -881,8 +890,14 @@ def understand_customer(
     just_confirmed_order: dict | None = None,
     last_presented_products: dict | None = None,
     awaiting_field: str | None = None,
+    untrusted: bool = False,
 ) -> dict:
-    """pending_order, when provided, is router.py's read of this
+    """untrusted is set by router.py when guardrails.screen_message()
+    flagged this message: the message is then wrapped as quoted data in
+    the prompt (guardrails.quote_untrusted_message()). Unflagged messages
+    reach the prompt exactly as before.
+
+    pending_order, when provided, is router.py's read of this
     session's pending proposal (see order_tool.get_pending_order_summary)
     -- see _pending_order_state_line()'s docstring for why this needs to
     be passed in explicitly rather than left for the model to infer.
@@ -934,8 +949,9 @@ def understand_customer(
     if not message or not message.strip():
         raise ValueError("message must not be empty")
 
+    prompt_message = quote_untrusted_message(message) if untrusted else message
     raw_text = _call_llm(
-        message, pending_order, order_draft, pending_intent, last_action_outcome,
+        prompt_message, pending_order, order_draft, pending_intent, last_action_outcome,
         last_priced_product, awaiting_confirmation, just_confirmed_order,
         last_presented_products, awaiting_field,
     )

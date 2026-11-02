@@ -1,0 +1,7 @@
+{
+  "_note": "USD per million tokens for the tool-selection model call. Check current prices at https://openai.com/api/pricing before relying on cost figures. Embeddings, vision, voice and geocoding calls are not included in cost per conversation.",
+  "_checked": "OpenAI launch pricing for GPT-4.1 mini, April 2025. Not re-verified since.",
+  "models": {
+    "gpt-4.1-mini": {"input": 0.40, "cached_input": 0.10, "output": 1.60}
+  }
+}
