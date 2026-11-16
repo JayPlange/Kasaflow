@@ -18,44 +18,14 @@ That separation is the core design bet: prompts decide intent, Python executes i
 
 ## Architecture
 
-app/
-├── main.py # FastAPI app: /process endpoint, auth + rate limiting, conditional demo mount
-├── auth.py # Shared-secret API key check (X-API-Key header)
-├── config.py # Centralized, fail-fast settings (env vars validated at startup)
-├── whatsapp_routes.py # WhatsApp Cloud API webhook, HMAC-SHA256 signature verification
-├── demo_routes.py # Local-only demo dashboard, off by default (ENABLE_DEMO_DASHBOARD)
-└── logging_config.py # Structured logging setup
-
-services/
-├── router.py # Orchestration: message -> LLM -> tool execution -> result
-├── llm.py # LLM tool-selection layer (OpenAI Responses API)
-├── memory.py # Per-session state, TTL-based, one lock per session spanning a full turn
-├── tool_registry.py # Maps tool names -> functions (11 tools, 3 of them writes)
-├── tool_executor.py # Calls the selected tool, normalizes failures
-├── order_tool.py # propose_order / confirm_order / cancel_order / get_order_status
-├── woocommerce_sync.py # Live catalogue sync against the real store
-├── whatsapp_client.py # Outbound WhatsApp Cloud API sends
-├── voice_tool.py # Khaya ASR/TTS for English/Twi voice notes
-├── vision_tool.py # Describes a customer's product photo, routes it into the catalogue pipeline
-├── photo_match_tool.py # Cohere image embeddings -- exact-item photo identification
-├── image_search.py, image_embed_tool.py, image_embeddings_sync.py # Supporting image-matching pipeline
-├── geocoding_tool.py # Delivery-zone inference from a free-text address
-├── product_tool.py, product_search.py # Price/weight/karat lookups, semantic + keyword search
-├── quote_service.py # Composes price + delivery into one quote
-├── recommendation_service.py # Catalogue-filtered recommendations
-├── knowledge_base.py, policy_tool.py # RAG-backed policy Q&A
-└── response_formatter.py # Isolates safety-critical facts (price, order ID) from tone-only wording
-
-data/products.json # Product catalogue, synced live from WooCommerce
-data/policies.json # Policy/FAQ documents the RAG tool retrieves from
-data/image_embeddings.json # Precomputed embeddings for photo-based product matching
-
-docs/architecture_audit_2026-08-20.md # Self-authored failure-mode audit: 10 ranked issues,
-# evidence + impact + fix sequence for each. See below.
-
-tests/ # 937 passing, 29 gated behind --run-regression (real-API cost)
-scripts/evaluator/ # Separate behavioural evaluator: real multi-turn conversations, 15 scenario categories
-
+.
+├── app/
+├── services/
+├── data/
+├── docs/
+├── tests/
+├── scripts/
+└── evaluator/
 
 ## Key Engineering Decisions
 
