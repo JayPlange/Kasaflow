@@ -1,13 +1,12 @@
-# KasaFlow — AI Customer Workflow Engine
+# KasaFlow — WhatsApp AI Customer Workflow Engine
 
-> **AI operator for a jewellery retailer, running over WhatsApp.**
-> The LLM decides what to do. Deterministic Python does it — including the money.
+> An AI operator being tested ahead of a pilot with a jewellery retailer. It handles product enquiries, pricing, delivery quotes and order workflows over WhatsApp. The LLM selects the tools; deterministic Python controls pricing, validation and order execution.
 
 [![Python](https://img.shields.io/badge/Python-3.12-blue?style=flat&logo=python&logoColor=white)]()
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white)]()
 [![OpenAI](https://img.shields.io/badge/OpenAI-Responses%20API-black?style=flat&logo=openai&logoColor=white)]()
 [![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED?style=flat&logo=docker&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/tests-809%20passing-brightgreen?style=flat)]()
+[![Tests](https://img.shields.io/badge/tests-937%20passing-brightgreen?style=flat)]()
 
 ---
 
@@ -54,7 +53,7 @@ data/image_embeddings.json # Precomputed embeddings for photo-based product matc
 docs/architecture_audit_2026-08-20.md # Self-authored failure-mode audit: 10 ranked issues,
 # evidence + impact + fix sequence for each. See below.
 
-tests/ # 809 passing, 29 gated behind --run-regression (real-API cost)
+tests/ # 937 passing, 29 gated behind --run-regression (real-API cost)
 scripts/evaluator/ # Separate behavioural evaluator: real multi-turn conversations, 15 scenario categories
 
 
@@ -148,7 +147,7 @@ Visit `http://localhost:8000/docs` for the interactive API.
 | Geocoding | Google Maps API (delivery-zone inference) |
 | Validation | Pydantic |
 | Auth / rate limiting | Custom API key dependency, slowapi |
-| Testing | pytest (809 passing), separate behavioural evaluator |
+| Testing | pytest (937 passing), separate behavioural evaluator |
 | Containerization | Docker (multi-stage, non-root user, healthcheck) |
 
 ## Status
