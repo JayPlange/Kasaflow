@@ -12,7 +12,9 @@
 
 ## What It Does
 
-A customer messages the business on WhatsApp — text, a voice note in English or Twi, or a photo of a piece they like — and KasaFlow turns it into a structured action: a price, a delivery quote, a product recommendation, a policy answer, or a real order against the business's live WooCommerce store. The LLM's only job is deciding *which* tool to call and *what arguments* it needs. It never talks to the customer directly, never prices anything itself, and never writes to WooCommerce directly — those are Python's job.
+A customer messages the business on WhatsApp — text, a voice note in English or Twi, or a photo of a piece they like — and KasaFlow turns it into a structured action: a price, a delivery quote, a product recommendation, a policy answer, or an order proposal that can be confirmed through the business's WooCommerce integration.
+
+The LLM's only job is deciding *which* tool to call and *what arguments* it needs. It never talks to the customer directly, never prices anything itself, and never writes to WooCommerce directly — those are Python's job.
 
 That separation is the core design bet: prompts decide intent, Python executes it. If the model hallucinates or drifts, the blast radius is "picked the wrong tool," not "invented a price" or "created an order that shouldn't exist."
 
