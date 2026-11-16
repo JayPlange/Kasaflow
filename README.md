@@ -47,7 +47,7 @@ Two near-simultaneous messages from the same customer used to be able to race: b
 Eleven tools are registered by name in one dict and dispatched generically. Adding a twelfth means writing the function and registering it — nothing else in the request path changes.
 
 **Retrieval, not a bigger prompt**
-Policy questions are answered by embedding the question and comparing against cached policy-document embeddings, returning only what's above a similarity threshold — a return-policy question genuinely can't get a warranty-policy answer.
+Policy questions are answered by embedding the question and comparing it against cached policy-document embeddings. The system returns only results above a similarity threshold, keeping retrieval focused on relevant policy material rather than stuffing the entire policy set into the prompt.
 
 **Don't retry a failed write blindly**
 WooCommerce's REST API has no idempotency-key support. On a timed-out order-create, the system looks the order up by a token embedded in its own metadata before deciding whether a retry is safe, instead of risking a duplicate.
@@ -57,9 +57,11 @@ Every required environment variable is validated once at import time. A missing 
 
 ## Known Limitations
 
-The honest, current list of this is `docs/architecture_audit_2026-08-20.md` — a self-run audit covering state isolation, conversation continuity, turn concurrency, and order safety, each with evidence and a concrete fix. One item from it (the per-session turn lock above) is confirmed fixed since the audit; the rest are ranked and sequenced there rather than restated here, since this README would just go stale against it again.
+## Known Limitations
 
-Beyond what that document covers: memory is in-process only (no Redis, doesn't survive a restart or a second replica), CI runs tests but there's no deployment pipeline, and RAG is a flat six-document set, not a vector database.
+The architecture audit is documented in `docs/architecture_audit_2026-08-20.md`. It covers state isolation, conversation continuity, turn concurrency, and order safety, with evidence and concrete fixes. The per-session turn lock described above has since been implemented. The remaining findings are ranked and sequenced in the audit.
+
+Other known limitations: memory is in-process only (no Redis, does not survive a restart or support multiple replicas), CI runs tests but there is no deployment pipeline, and RAG uses a flat six-document set rather than a vector database.
 
 ## Testing
 
