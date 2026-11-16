@@ -132,4 +132,4 @@ Visit `http://localhost:8000/docs` for the interactive API.
 
 ## Status
 
-Self-directed, actively developed as the engine behind a real WhatsApp-based customer workflow project for a jewellery retail client. Not yet deployed to a public host.
+KasaFlow is in active development and testing ahead of a pilot with a jewellery retailer. The WhatsApp, WooCommerce and AI integrations have been built and are being tested. The pilot has not yet launched, and the application is not deployed to a public host. The project is being developed as a real customer workflow system, with a focus on reliable pricing, explicit order authorisation and safe tool execution.
