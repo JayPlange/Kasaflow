@@ -63,8 +63,18 @@ Beyond what that document covers: memory is in-process only (no Redis, doesn't s
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest                        # 937 passing, 29 skipped (gated behind --run-regression)
-pytest --run-regression       # + real-OpenAI-API regression tests (costs money)
+```
+
+Run the standard test suite:
+
+```bash
+pytest
+```
+
+Run the regression tests (these make real API calls and may incur costs):
+
+```bash
+pytest --run-regression
 ```
 
 ### Behavioural evaluator
